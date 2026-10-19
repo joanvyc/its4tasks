@@ -17,6 +17,8 @@ const CARD_GLOW_WIDTH: f32 = 16.0;
 const COMMENT_RADIUS: f32 = 4.0;
 const ROW_RADIUS: f32 = 4.0;
 const ROW_GLOW_WIDTH: f32 = 6.0;
+/// Fixed so the comment box doesn't shift when the switch is toggled.
+const BLOCK_SWITCH_WIDTH: f32 = 84.0;
 const COMMENT_GLOW_WIDTH: f32 = 8.0;
 const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
 
@@ -36,6 +38,32 @@ fn blocked_glow_color(visuals: &Visuals) -> Color32 {
     } else {
         Color32::from_rgb(235, 90, 90).gamma_multiply(0.7)
     }
+}
+
+/// An on/off switch; red when on, like the blocking highlights.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = Vec2::new(28.0, 16.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *on, "Blocking")
+    });
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, *on);
+        let visuals = ui.style().interact_selectable(&response, *on);
+        let radius = 0.5 * rect.height();
+        let track = visuals.bg_fill.lerp_to_gamma(BLOCKER_ACCENT, t);
+        ui.painter()
+            .rect(rect, radius, track, visuals.bg_stroke, StrokeKind::Inside);
+        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+        let knob = egui::pos2(x, rect.center().y);
+        let knob_color = visuals.fg_stroke.color.lerp_to_gamma(Color32::WHITE, t);
+        ui.painter().circle_filled(knob, radius - 2.0, knob_color);
+    }
+    response
 }
 
 /// `color` at the rect's edge, fading out to nothing `width` px inside it.
@@ -467,22 +495,28 @@ impl TodoApp {
                     .unwrap_or(min_height);
                 let row = Vec2::new(ui.available_width(), row_height);
                 ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Min), |ui| {
-                    let label = if *blocking {
-                        RichText::new("⛔ Blocking").small().strong()
-                    } else {
-                        RichText::new("Block").small()
-                    };
-                    // Fixed width so the input doesn't shift when toggling.
-                    let toggle = Button::selectable(*blocking, label)
-                        .frame_when_inactive(true)
-                        .min_size(Vec2::new(78.0, 0.0));
-                    if ui
-                        .add(toggle)
-                        .on_hover_text("Post as blocking: the task stays blocked until resolved")
-                        .clicked()
-                    {
-                        *blocking = !*blocking;
-                    }
+                    // Lined up with the comment box's first line of text.
+                    let switch_row =
+                        Vec2::new(BLOCK_SWITCH_WIDTH, line + COMMENT_INPUT_MARGIN.sum().y);
+                    ui.allocate_ui_with_layout(
+                        switch_row,
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            let hint = "Post as blocking: the task stays blocked until resolved";
+                            toggle_switch(ui, blocking).on_hover_text(hint);
+                            let color = if *blocking {
+                                BLOCKER_ACCENT
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            let label = Label::new(RichText::new("Blocking").small().color(color))
+                                .selectable(false)
+                                .sense(Sense::click());
+                            if ui.add(label).on_hover_text(hint).clicked() {
+                                *blocking = !*blocking;
+                            }
+                        },
+                    );
                     let hint = if *blocking {
                         "Describe what you're waiting for… (Enter to post)"
                     } else {

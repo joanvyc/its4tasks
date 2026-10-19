@@ -11,7 +11,7 @@ use eframe::egui::{
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
     Blocker, Board, MessageKind, Note, NoteAction, SLOT_COUNT, Task, TaskState, headline,
-    matches_filter, short_duration, split_title, staleness,
+    short_duration, shown_in_list, split_title, staleness,
 };
 use crate::storage;
 
@@ -555,6 +555,8 @@ pub struct TodoApp {
     view: View,
     log_period: Period,
     log_starred_only: bool,
+    /// Leave done tasks out of the task list.
+    hide_closed: bool,
     dirty: bool,
 }
 
@@ -573,6 +575,7 @@ impl TodoApp {
             view: View::Board,
             log_period: Period::Day,
             log_starred_only: false,
+            hide_closed: false,
             dirty: false,
         }
     }
@@ -669,18 +672,32 @@ impl TodoApp {
             .board
             .tasks
             .iter()
-            .filter(|t| matches_filter(t, &self.filter))
+            .filter(|t| shown_in_list(t, &self.filter, self.hide_closed))
             .map(|t| t.id)
             .collect();
-        ui.label(
-            RichText::new(format!(
-                "{} of {} tasks",
-                shown.len(),
-                self.board.tasks.len()
-            ))
-            .small()
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} of {} tasks",
+                    shown.len(),
+                    self.board.tasks.len()
+                ))
+                .small()
+                .weak(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let hint = "Leave done tasks out of this list";
+                let on = &mut self.hide_closed;
+                let label = Label::new(RichText::new("Hide closed").small())
+                    .selectable(false)
+                    .sense(Sense::click());
+                if ui.add(label).on_hover_text(hint).clicked() {
+                    *on = !*on;
+                }
+                let color = palette(ui.visuals()).resolved;
+                toggle_switch(ui, on, color, "Hide closed").on_hover_text(hint);
+            });
+        });
         ui.separator();
 
         let has_free_slot = self.board.has_free_slot();

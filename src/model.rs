@@ -426,6 +426,12 @@ pub fn matches_filter(task: &Task, filter: &str) -> bool {
             .any(|n| n.text.to_lowercase().contains(&filter))
 }
 
+/// Whether the task list shows this task: it matches the filter, and isn't
+/// closed while closed tasks are hidden.
+pub fn shown_in_list(task: &Task, filter: &str, hide_closed: bool) -> bool {
+    matches_filter(task, filter) && !(hide_closed && task.done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +510,23 @@ mod tests {
         assert!(matches_filter(&t, "report"));
         assert!(matches_filter(&t, "  ALICE "));
         assert!(!matches_filter(&t, "bob"));
+    }
+
+    #[test]
+    fn hide_closed_drops_done_tasks_and_keeps_the_filter() {
+        let mut b = board_with(2);
+        b.task_mut(1).unwrap().set_done(true, Utc::now());
+        let shown = |filter, hide| {
+            b.tasks
+                .iter()
+                .filter(|t| shown_in_list(t, filter, hide))
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown("", false), [0, 1]);
+        assert_eq!(shown("", true), [0]);
+        assert_eq!(shown("task 1", false), [1]);
+        assert_eq!(shown("task 1", true), Vec::<u64>::new());
     }
 
     #[test]

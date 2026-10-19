@@ -1,13 +1,16 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Local, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, Local, TimeDelta, Utc};
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, Frame, Id, Key, Label, Layout, Margin, Modal,
-    Modifiers, Panel, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit,
-    TextStyle, UiBuilder, Vec2, Visuals,
+    self, Align, Button, CentralPanel, Color32, ComboBox, Frame, Id, Key, Label, Layout, Margin,
+    Modal, Modifiers, Panel, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind,
+    TextEdit, TextFormat, TextStyle, UiBuilder, Vec2, Visuals, text::LayoutJob,
 };
 
-use crate::model::{Blocker, Board, Note, SLOT_COUNT, Task, TaskState, matches_filter, staleness};
+use crate::log::{self, EntryKind, LogPage, Period};
+use crate::model::{
+    Blocker, Board, Note, SLOT_COUNT, Task, TaskState, matches_filter, short_duration, staleness,
+};
 use crate::storage;
 
 const CARD_GAP: f32 = 12.0;
@@ -21,10 +24,13 @@ const ROW_GLOW_WIDTH: f32 = 6.0;
 const BLOCK_SWITCH_WIDTH: f32 = 84.0;
 const COMMENT_GLOW_WIDTH: f32 = 8.0;
 const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
+const LOG_TIME_WIDTH: f32 = 64.0;
 
 const FRESH: Color32 = Color32::from_rgb(130, 130, 130);
 const STALE: Color32 = Color32::from_rgb(235, 195, 40);
 const BLOCKER_ACCENT: Color32 = Color32::from_rgb(215, 85, 75);
+const STAR_COLOR: Color32 = Color32::from_rgb(235, 195, 40);
+const RESOLVED_COLOR: Color32 = Color32::from_rgb(110, 180, 110);
 
 /// Gray → yellow by time since the last update.
 fn freshness_color(task: &Task, now: DateTime<Utc>) -> Color32 {
@@ -40,22 +46,26 @@ fn blocked_glow_color(visuals: &Visuals) -> Color32 {
     }
 }
 
-/// An on/off switch; red when on, like the blocking highlights.
-fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+/// An on/off switch whose track turns `on_color` when on.
+fn toggle_switch(
+    ui: &mut egui::Ui,
+    on: &mut bool,
+    on_color: Color32,
+    name: &str,
+) -> egui::Response {
     let size = Vec2::new(28.0, 16.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     if response.clicked() {
         *on = !*on;
         response.mark_changed();
     }
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *on, "Blocking")
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *on, name));
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
         let visuals = ui.style().interact_selectable(&response, *on);
         let radius = 0.5 * rect.height();
-        let track = visuals.bg_fill.lerp_to_gamma(BLOCKER_ACCENT, t);
+        let track = visuals.bg_fill.lerp_to_gamma(on_color, t);
         ui.painter()
             .rect(rect, radius, track, visuals.bg_stroke, StrokeKind::Inside);
         let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
@@ -114,26 +124,69 @@ fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
 }
 
 /// One entry of a card's comment log: timestamp/blocker line, then the text.
-/// `hovered` reveals the "mark as blocking" button on plain comments.
+/// `hovered` reveals the star and "mark as blocking" buttons.
 fn comment(
     ui: &mut egui::Ui,
     note: &Note,
     idx: usize,
     task_id: u64,
     hovered: bool,
+    now: DateTime<Utc>,
     actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(local_time(note.at)).small().weak());
-        match note.blocker {
-            Some(Blocker::Open) => {
+        match (note.blocker, note.blocked_for(now), note.blocked_duration()) {
+            (Some(Blocker::Open), Some(blocked_for), _) => {
                 ui.label(
                     RichText::new("· ⛔ Blocking")
                         .small()
                         .strong()
                         .color(BLOCKER_ACCENT),
                 );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(if blocked_for < TimeDelta::minutes(1) {
+                        "· blocked just now".to_owned()
+                    } else {
+                        format!("· blocked for {}", short_duration(blocked_for))
+                    })
+                    .small()
+                    .color(BLOCKER_ACCENT),
+                )
+                .on_hover_text(format!(
+                    "Blocking since {}",
+                    local_time(note.blocked_since())
+                ));
+            }
+            (Some(Blocker::Resolved { at }), _, Some(took)) => {
+                ui.label(
+                    RichText::new(format!(
+                        "· ✔ Resolved after {} ({})",
+                        short_duration(took),
+                        local_time(at)
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            _ => {}
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // Hover-only buttons are always laid out (just hidden) so the row
+            // height doesn't jump on hover.
+            let star = if note.starred {
+                Button::new(RichText::new("★").color(STAR_COLOR))
+            } else {
+                Button::new(RichText::new("☆").weak())
+            };
+            let star = ui
+                .add_visible(note.starred || hovered, star.frame(false).small())
+                .on_hover_text(if note.starred { "Unstar" } else { "Star" });
+            if star.clicked() {
+                actions.push(Action::ToggleStar(task_id, idx));
+            }
+            match note.blocker {
+                Some(Blocker::Open) => {
                     if ui
                         .small_button("✔ Resolve")
                         .on_hover_text("Mark this blocker as resolved")
@@ -141,29 +194,59 @@ fn comment(
                     {
                         actions.push(Action::Resolve(task_id, idx));
                     }
-                });
-            }
-            Some(Blocker::Resolved { at }) => {
-                ui.label(
-                    RichText::new(format!("· ✔ Resolved {}", local_time(at)))
-                        .small()
-                        .weak(),
-                );
-            }
-            None => {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Always laid out so the row height doesn't jump on hover.
+                }
+                Some(Blocker::Resolved { .. }) => {}
+                None => {
                     let block = ui
                         .add_visible(hovered, Button::new("⛔ Mark blocking").small())
                         .on_hover_text("Turn this comment into a blocker");
                     if block.clicked() {
                         actions.push(Action::MarkBlocking(task_id, idx));
                     }
-                });
+                }
             }
-        }
+        });
     });
     ui.add(Label::new(&note.text).wrap());
+}
+
+fn log_heading(page: &LogPage, period: Period) -> String {
+    match period {
+        Period::Day => page.start.format("%Y-%m-%d · %A").to_string(),
+        Period::Week => format!(
+            "Week {} · {} – {}",
+            page.start.iso_week().week(),
+            page.start.format("%Y-%m-%d"),
+            (page.start + TimeDelta::days(6)).format("%Y-%m-%d"),
+        ),
+    }
+}
+
+/// Marker plus text for one log entry, as a single wrapping paragraph.
+fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
+    let font = TextStyle::Body.resolve(ui.style());
+    let normal = ui.visuals().text_color();
+    let format = |color| TextFormat::simple(font.clone(), color);
+    let mut job = LayoutJob::default();
+    if entry.starred {
+        job.append("★ ", 0.0, format(STAR_COLOR));
+    }
+    let (marker, color) = match &entry.kind {
+        EntryKind::Created => (Some("Created".to_owned()), ui.visuals().weak_text_color()),
+        EntryKind::Comment { blocking: false } => (None, normal),
+        EntryKind::Comment { blocking: true } => (Some("Blocked: ".to_owned()), BLOCKER_ACCENT),
+        EntryKind::MarkedBlocking => (Some("Marked blocking: ".to_owned()), BLOCKER_ACCENT),
+        EntryKind::Unblocked { after } => (
+            Some(format!("Unblocked after {}: ", short_duration(*after))),
+            RESOLVED_COLOR,
+        ),
+        EntryKind::Done => (Some("✔ Marked done".to_owned()), RESOLVED_COLOR),
+    };
+    if let Some(marker) = marker {
+        job.append(&marker, 0.0, format(color));
+    }
+    job.append(&entry.text, 0.0, format(normal));
+    job
 }
 
 #[derive(Default)]
@@ -185,6 +268,13 @@ enum Action {
     MarkBlocking(u64, usize),
     Resolve(u64, usize),
     Unblock(u64, usize),
+    ToggleStar(u64, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Board,
+    Log,
 }
 
 pub struct TodoApp {
@@ -195,6 +285,9 @@ pub struct TodoApp {
     comment_drafts: [String; SLOT_COUNT],
     /// Whether the next comment posted on each card is a blocker.
     comment_blocking: [bool; SLOT_COUNT],
+    view: View,
+    log_period: Period,
+    log_starred_only: bool,
     dirty: bool,
 }
 
@@ -206,6 +299,9 @@ impl TodoApp {
             new_task: None,
             comment_drafts: Default::default(),
             comment_blocking: Default::default(),
+            view: View::Board,
+            log_period: Period::Day,
+            log_starred_only: false,
             dirty: false,
         }
     }
@@ -238,6 +334,11 @@ impl TodoApp {
                 Action::Unblock(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
                         task.unmark_blocking(idx);
+                    }
+                }
+                Action::ToggleStar(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.toggle_star(idx);
                     }
                 }
             }
@@ -330,8 +431,9 @@ impl TodoApp {
                             hover = format!("Blocked: {text}\n{hover}");
                         }
                         bar_response.on_hover_text(hover);
-                        if ui.checkbox(&mut task.done, "").changed() {
-                            task.touch(now);
+                        let mut done = task.done;
+                        if ui.checkbox(&mut done, "").changed() {
+                            task.set_done(done, now);
                             self.dirty = true;
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -429,8 +531,9 @@ impl TodoApp {
                 return;
             };
             ui.horizontal(|ui| {
-                if ui.checkbox(&mut task.done, "").changed() {
-                    task.touch(now);
+                let mut done = task.done;
+                if ui.checkbox(&mut done, "").changed() {
+                    task.set_done(done, now);
                     self.dirty = true;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -503,7 +606,8 @@ impl TodoApp {
                         Layout::left_to_right(Align::Center),
                         |ui| {
                             let hint = "Post as blocking: the task stays blocked until resolved";
-                            toggle_switch(ui, blocking).on_hover_text(hint);
+                            toggle_switch(ui, blocking, BLOCKER_ACCENT, "Blocking")
+                                .on_hover_text(hint);
                             let color = if *blocking {
                                 BLOCKER_ACCENT
                             } else {
@@ -583,7 +687,7 @@ impl TodoApp {
                                         let glow = ui.painter().add(Shape::Noop);
                                         let shown = frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            comment(ui, note, idx, id, hovered, actions);
+                                            comment(ui, note, idx, id, hovered, now, actions);
                                         });
                                         if note.is_open_blocker() {
                                             ui.painter().set(
@@ -622,6 +726,10 @@ impl TodoApp {
                                             }
                                         }
                                     }
+                                    let star = if note.starred { "Unstar" } else { "Star" };
+                                    if ui.button(star).clicked() {
+                                        actions.push(Action::ToggleStar(id, idx));
+                                    }
                                     if ui.button("Delete").clicked() {
                                         actions.push(Action::DeleteNote(id, idx));
                                     }
@@ -653,6 +761,81 @@ impl TodoApp {
         if let Some(id) = dropped {
             actions.push(Action::FocusInto(slot, *id));
         }
+    }
+
+    fn view_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.view, View::Board, "Board");
+            ui.selectable_value(&mut self.view, View::Log, "Log");
+            if self.view == View::Log {
+                ui.separator();
+                ComboBox::from_id_salt("log_period")
+                    .selected_text(self.log_period.label())
+                    .show_ui(ui, |ui| {
+                        for period in [Period::Day, Period::Week] {
+                            ui.selectable_value(&mut self.log_period, period, period.label());
+                        }
+                    });
+                ui.separator();
+                let on = &mut self.log_starred_only;
+                toggle_switch(ui, on, STAR_COLOR, "Starred only");
+                let label = Label::new("Starred only")
+                    .selectable(false)
+                    .sense(Sense::click());
+                if ui.add(label).clicked() {
+                    *on = !*on;
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    fn log_view(&mut self, ui: &mut egui::Ui) {
+        let pages = log::build(&self.board, self.log_period, self.log_starred_only, &Local);
+        let time_format = match self.log_period {
+            Period::Day => "%H:%M",
+            Period::Week => "%a %H:%M",
+        };
+        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if pages.is_empty() {
+                ui.add_space(8.0);
+                ui.weak(if self.log_starred_only {
+                    "No starred comments yet. Star a comment from its card."
+                } else {
+                    "Nothing logged yet."
+                });
+            }
+            for page in &pages {
+                ui.add_space(8.0);
+                ui.label(RichText::new(log_heading(page, self.log_period)).heading());
+                ui.separator();
+                for group in &page.groups {
+                    ui.add_space(6.0);
+                    ui.indent(("log_task", page.start, group.task_id), |ui| {
+                        ui.label(RichText::new(&group.title).strong());
+                        ui.add_space(2.0);
+                        for entry in &group.entries {
+                            ui.horizontal_top(|ui| {
+                                let time = entry.at.with_timezone(&Local).format(time_format);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(
+                                        LOG_TIME_WIDTH,
+                                        ui.text_style_height(&TextStyle::Body),
+                                    ),
+                                    Sense::hover(),
+                                );
+                                ui.put(
+                                    rect,
+                                    Label::new(RichText::new(time.to_string()).small().weak()),
+                                );
+                                ui.add(Label::new(log_entry_job(entry, ui)).wrap());
+                            });
+                        }
+                    });
+                }
+            }
+            ui.add_space(8.0);
+        });
     }
 
     fn new_task_modal(&mut self, ctx: &egui::Context) {
@@ -726,7 +909,13 @@ impl eframe::App for TodoApp {
             .default_size(320.0)
             .min_size(240.0)
             .show(ui, |ui| self.task_list(ui, &mut actions));
-        CentralPanel::default().show(ui, |ui| self.cards(ui, &mut actions));
+        CentralPanel::default().show(ui, |ui| {
+            self.view_bar(ui);
+            match self.view {
+                View::Board => self.cards(ui, &mut actions),
+                View::Log => self.log_view(ui),
+            }
+        });
         self.new_task_modal(&ui.ctx().clone());
         self.apply(actions);
         self.save_if_dirty();

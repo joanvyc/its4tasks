@@ -1,4 +1,5 @@
 mod app;
+mod log;
 mod model;
 mod storage;
 

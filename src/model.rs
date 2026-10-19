@@ -19,11 +19,51 @@ pub struct Note {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<Blocker>,
+    /// When the comment became blocking; `None` in older files, where the
+    /// post time stands in for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starred: bool,
 }
 
 impl Note {
+    fn new(text: String, at: DateTime<Utc>) -> Self {
+        Self {
+            at,
+            text,
+            blocker: None,
+            blocked_at: None,
+            starred: false,
+        }
+    }
+
     pub fn is_open_blocker(&self) -> bool {
         self.blocker == Some(Blocker::Open)
+    }
+
+    pub fn blocked_since(&self) -> DateTime<Utc> {
+        self.blocked_at.unwrap_or(self.at)
+    }
+
+    /// How long an open blocker has been blocking.
+    pub fn blocked_for(&self, now: DateTime<Utc>) -> Option<TimeDelta> {
+        self.is_open_blocker().then(|| now - self.blocked_since())
+    }
+
+    /// How long a resolved blocker was blocking.
+    pub fn blocked_duration(&self) -> Option<TimeDelta> {
+        match self.blocker {
+            Some(Blocker::Resolved { at }) => Some(at - self.blocked_since()),
+            _ => None,
+        }
+    }
+
+    /// Blocking comments are starred so they show up in the starred log.
+    fn block(&mut self, now: DateTime<Utc>) {
+        self.blocker = Some(Blocker::Open);
+        self.blocked_at = Some(now);
+        self.starred = true;
     }
 }
 
@@ -54,11 +94,21 @@ pub struct Task {
     pub done: bool,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<DateTime<Utc>>,
 }
 
 impl Task {
     pub fn touch(&mut self, now: DateTime<Utc>) {
         self.updated_at = now;
+    }
+
+    pub fn set_done(&mut self, done: bool, now: DateTime<Utc>) {
+        self.done = done;
+        self.done_at = done.then_some(now);
+        self.touch(now);
     }
 
     /// Append a comment, optionally as an open blocker. Blank text is ignored.
@@ -67,17 +117,17 @@ impl Task {
         if text.is_empty() {
             return;
         }
-        self.notes.push(Note {
-            at: now,
-            text: text.to_owned(),
-            blocker: blocking.then_some(Blocker::Open),
-        });
+        let mut note = Note::new(text.to_owned(), now);
+        if blocking {
+            note.block(now);
+        }
+        self.notes.push(note);
         self.touch(now);
     }
 
     pub fn set_blocking(&mut self, idx: usize, now: DateTime<Utc>) {
         if let Some(note) = self.notes.get_mut(idx) {
-            note.blocker = Some(Blocker::Open);
+            note.block(now);
             self.touch(now);
         }
     }
@@ -95,6 +145,14 @@ impl Task {
     pub fn unmark_blocking(&mut self, idx: usize) {
         if let Some(note) = self.notes.get_mut(idx) {
             note.blocker = None;
+            note.blocked_at = None;
+        }
+    }
+
+    /// Doesn't count as an update.
+    pub fn toggle_star(&mut self, idx: usize) {
+        if let Some(note) = self.notes.get_mut(idx) {
+            note.starred = !note.starred;
         }
     }
 
@@ -131,13 +189,20 @@ fn legacy_notes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Note>, D::Error> 
     }
     Ok(match Notes::deserialize(d)? {
         Notes::Legacy(text) if text.trim().is_empty() => Vec::new(),
-        Notes::Legacy(text) => vec![Note {
-            at: Utc::now(),
-            text: text.trim().to_owned(),
-            blocker: None,
-        }],
+        Notes::Legacy(text) => vec![Note::new(text.trim().to_owned(), Utc::now())],
         Notes::Log(notes) => notes,
     })
+}
+
+/// Compact duration: `45m`, `5h`, `1d 4h`, `12d`.
+pub fn short_duration(d: TimeDelta) -> String {
+    let (days, hours, minutes) = (d.num_days(), d.num_hours() % 24, d.num_minutes());
+    match days {
+        0 if d.num_hours() == 0 => format!("{}m", minutes.max(0)),
+        0 => format!("{hours}h"),
+        1..7 if hours > 0 => format!("{days}d {hours}h"),
+        _ => format!("{days}d"),
+    }
 }
 
 /// 0.0 for a task updated just now, rising to 1.0 once it is `STALE_AFTER_SECS` old.
@@ -163,6 +228,8 @@ impl Board {
             notes: Vec::new(),
             done: false,
             updated_at: now,
+            created_at: Some(now),
+            done_at: None,
         };
         task.add_note(first_note, false, now);
         self.tasks.push(task);
@@ -322,6 +389,8 @@ mod tests {
             notes: Vec::new(),
             done: false,
             updated_at: Utc::now(),
+            created_at: None,
+            done_at: None,
         };
         t.add_note("send to Alice", false, Utc::now());
         assert!(matches_filter(&t, ""));
@@ -411,6 +480,58 @@ mod tests {
         let t: Task = serde_json::from_str(json).unwrap();
         assert_eq!(t.notes[0].blocker, None);
         assert_eq!(t.state(), TaskState::Active);
+    }
+
+    #[test]
+    fn blocking_stars_and_tracks_durations() {
+        let mut b = board_with(1);
+        let t0 = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.add_note("posted as blocker", true, t0);
+        t.add_note("plain", false, t0);
+        assert!(t.notes[0].starred);
+        assert!(!t.notes[1].starred);
+        assert_eq!(
+            t.notes[0].blocked_for(t0 + TimeDelta::hours(5)),
+            Some(TimeDelta::hours(5))
+        );
+
+        let later = t0 + TimeDelta::hours(2);
+        t.set_blocking(1, later);
+        assert!(t.notes[1].starred);
+        assert_eq!(t.notes[1].blocked_since(), later);
+        t.resolve(1, later + TimeDelta::hours(3));
+        assert_eq!(t.notes[1].blocked_duration(), Some(TimeDelta::hours(3)));
+        assert_eq!(t.notes[1].blocked_for(later), None);
+
+        t.toggle_star(0);
+        assert!(!t.notes[0].starred);
+        t.unmark_blocking(1);
+        assert_eq!(t.notes[1].blocked_at, None);
+    }
+
+    #[test]
+    fn set_done_records_time() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.set_done(true, now);
+        assert_eq!(t.done_at, Some(now));
+        t.set_done(false, now);
+        assert_eq!(t.done_at, None);
+    }
+
+    #[test]
+    fn short_duration_formats() {
+        assert_eq!(short_duration(TimeDelta::minutes(45)), "45m");
+        assert_eq!(short_duration(TimeDelta::hours(5)), "5h");
+        assert_eq!(short_duration(TimeDelta::hours(28)), "1d 4h");
+        assert_eq!(short_duration(TimeDelta::days(3)), "3d");
+        assert_eq!(
+            short_duration(TimeDelta::days(12) + TimeDelta::hours(5)),
+            "12d"
+        );
+        assert_eq!(short_duration(TimeDelta::seconds(-5)), "0m");
     }
 
     #[test]

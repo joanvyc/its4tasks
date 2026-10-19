@@ -4,8 +4,8 @@ use chrono::{DateTime, Datelike, Local, TimeDelta, Utc};
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, ComboBox, FontData, FontDefinitions, FontFamily,
     FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Rect, RichText,
-    ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, TextFormat, TextStyle, UiBuilder, Vec2,
-    Visuals, text::LayoutJob,
+    ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, TextFormat, TextStyle, Theme,
+    UiBuilder, Vec2, Visuals, text::LayoutJob,
 };
 
 use crate::log::{self, EntryKind, LogPage, Period};
@@ -30,11 +30,35 @@ const COMMENT_GLOW_WIDTH: f32 = 8.0;
 const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
 const LOG_TIME_WIDTH: f32 = 64.0;
 
-const FRESH: Color32 = Color32::from_rgb(130, 130, 130);
-const STALE: Color32 = Color32::from_rgb(235, 195, 40);
-const BLOCKER_ACCENT: Color32 = Color32::from_rgb(215, 85, 75);
-const STAR_COLOR: Color32 = Color32::from_rgb(235, 195, 40);
-const RESOLVED_COLOR: Color32 = Color32::from_rgb(110, 180, 110);
+/// Accent colours for each theme. The light ones are darker so they read on white.
+#[derive(Clone, Copy)]
+struct Palette {
+    fresh: Color32,
+    stale: Color32,
+    blocker: Color32,
+    star: Color32,
+    resolved: Color32,
+}
+
+const DARK: Palette = Palette {
+    fresh: Color32::from_rgb(130, 130, 130),
+    stale: Color32::from_rgb(235, 195, 40),
+    blocker: Color32::from_rgb(215, 85, 75),
+    star: Color32::from_rgb(235, 195, 40),
+    resolved: Color32::from_rgb(110, 180, 110),
+};
+
+const LIGHT: Palette = Palette {
+    fresh: Color32::from_rgb(160, 160, 160),
+    stale: Color32::from_rgb(215, 160, 0),
+    blocker: Color32::from_rgb(200, 55, 45),
+    star: Color32::from_rgb(215, 160, 0),
+    resolved: Color32::from_rgb(40, 135, 60),
+};
+
+fn palette(visuals: &Visuals) -> Palette {
+    if visuals.dark_mode { DARK } else { LIGHT }
+}
 
 const HEADING_SIZE: f32 = 18.0;
 
@@ -75,8 +99,10 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 /// Gray → yellow by time since the last update.
-fn freshness_color(task: &Task, now: DateTime<Utc>) -> Color32 {
-    FRESH.lerp_to_gamma(STALE, staleness(now - task.updated_at))
+fn freshness_color(task: &Task, now: DateTime<Utc>, visuals: &Visuals) -> Color32 {
+    let colors = palette(visuals);
+    let t = staleness(now - task.updated_at);
+    colors.fresh.lerp_to_gamma(colors.stale, t)
 }
 
 /// Red glow along the inside edge of a blocked card or blocking comment.
@@ -84,7 +110,17 @@ fn blocked_glow_color(visuals: &Visuals) -> Color32 {
     if visuals.dark_mode {
         Color32::from_rgb(210, 60, 60).gamma_multiply(0.6)
     } else {
-        Color32::from_rgb(235, 90, 90).gamma_multiply(0.7)
+        Color32::from_rgb(230, 80, 80).gamma_multiply(0.45)
+    }
+}
+
+/// The comment box's fill. In light mode `faint_bg_color` barely shows against
+/// the card's white background.
+fn comment_input_bg(visuals: &Visuals) -> Color32 {
+    if visuals.dark_mode {
+        visuals.faint_bg_color
+    } else {
+        Color32::from_gray(238)
     }
 }
 
@@ -145,8 +181,8 @@ fn state_text_color(state: TaskState, visuals: &Visuals) -> Color32 {
 fn kind_color(kind: MessageKind, visuals: &Visuals) -> Color32 {
     match kind {
         MessageKind::Comment => visuals.weak_text_color(),
-        MessageKind::Block => BLOCKER_ACCENT,
-        MessageKind::Unblock | MessageKind::Close => RESOLVED_COLOR,
+        MessageKind::Block => palette(visuals).blocker,
+        MessageKind::Unblock | MessageKind::Close => palette(visuals).resolved,
     }
 }
 
@@ -180,7 +216,7 @@ fn action_job(action: &NoteAction, note: &Note, ui: &egui::Ui) -> LayoutJob {
         _ => "✔ Closed with message: ".to_owned(),
     };
     let mut job = LayoutJob::default();
-    job.append(&marker, 0.0, format(RESOLVED_COLOR));
+    job.append(&marker, 0.0, format(palette(ui.visuals()).resolved));
     job.append(&note.text, 0.0, format(ui.visuals().text_color()));
     job
 }
@@ -219,6 +255,7 @@ fn comment(
     now: DateTime<Utc>,
     actions: &mut Vec<Action>,
 ) {
+    let colors = palette(ui.visuals());
     ui.horizontal(|ui| {
         ui.label(RichText::new(local_time(note.at)).small().weak());
         match (note.blocker, note.blocked_for(now), note.blocked_duration()) {
@@ -227,7 +264,7 @@ fn comment(
                     RichText::new("· ⛔ Blocking")
                         .small()
                         .strong()
-                        .color(BLOCKER_ACCENT),
+                        .color(colors.blocker),
                 );
                 ui.label(
                     RichText::new(if blocked_for < TimeDelta::minutes(1) {
@@ -236,7 +273,7 @@ fn comment(
                         format!("· blocked for {}", short_duration(blocked_for))
                     })
                     .small()
-                    .color(BLOCKER_ACCENT),
+                    .color(colors.blocker),
                 )
                 .on_hover_text(format!(
                     "Blocking since {}",
@@ -260,7 +297,7 @@ fn comment(
             // Hover-only buttons are always laid out (just hidden) so the row
             // height doesn't jump on hover.
             let star = if note.starred {
-                Button::new(RichText::new("★").color(STAR_COLOR))
+                Button::new(RichText::new("★").color(colors.star))
             } else {
                 Button::new(RichText::new("☆").weak())
             };
@@ -315,18 +352,19 @@ fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
     let font = TextStyle::Body.resolve(ui.style());
     let normal = ui.visuals().text_color();
     let format = |color| TextFormat::simple(font.clone(), color);
+    let colors = palette(ui.visuals());
     let mut job = LayoutJob::default();
     if entry.starred {
-        job.append("★ ", 0.0, format(STAR_COLOR));
+        job.append("★ ", 0.0, format(colors.star));
     }
     let (marker, color) = match &entry.kind {
         EntryKind::Created => (Some("Created".to_owned()), ui.visuals().weak_text_color()),
         EntryKind::Comment { blocking: false } => (None, normal),
-        EntryKind::Comment { blocking: true } => (Some("Blocked: ".to_owned()), BLOCKER_ACCENT),
-        EntryKind::MarkedBlocking => (Some("Marked blocking: ".to_owned()), BLOCKER_ACCENT),
+        EntryKind::Comment { blocking: true } => (Some("Blocked: ".to_owned()), colors.blocker),
+        EntryKind::MarkedBlocking => (Some("Marked blocking: ".to_owned()), colors.blocker),
         EntryKind::Unblocked { after } => (
             Some(format!("Unblocked after {}: ", short_duration(*after))),
-            RESOLVED_COLOR,
+            colors.resolved,
         ),
         EntryKind::Resolved { quote, after } => (
             Some(format!(
@@ -334,10 +372,10 @@ fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
                 truncate(quote, QUOTE_CHARS),
                 short_duration(*after)
             )),
-            RESOLVED_COLOR,
+            colors.resolved,
         ),
-        EntryKind::Done => (Some("✔ Marked done".to_owned()), RESOLVED_COLOR),
-        EntryKind::Closed => (Some("✔ Closed with message: ".to_owned()), RESOLVED_COLOR),
+        EntryKind::Done => (Some("✔ Marked done".to_owned()), colors.resolved),
+        EntryKind::Closed => (Some("✔ Closed with message: ".to_owned()), colors.resolved),
     };
     if let Some(marker) = marker {
         job.append(&marker, 0.0, format(color));
@@ -391,6 +429,7 @@ pub struct TodoApp {
 impl TodoApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         install_fonts(&cc.egui_ctx);
+        cc.egui_ctx.set_theme(Theme::Light);
         Self {
             board: storage::load(),
             filter: String::new(),
@@ -519,7 +558,7 @@ impl TodoApp {
                         let color = if task.done {
                             ui.visuals().weak_text_color()
                         } else {
-                            freshness_color(task, now)
+                            freshness_color(task, now, ui.visuals())
                         };
                         let (bar, bar_response) =
                             ui.allocate_exact_size(Vec2::new(4.0, 16.0), Sense::hover());
@@ -605,7 +644,7 @@ impl TodoApp {
         let task_id = self.board.slots[slot];
         let task = task_id.and_then(|id| self.board.task(id));
         let stroke = match task {
-            Some(task) if !task.done => Stroke::new(2.0, freshness_color(task, now)),
+            Some(task) if !task.done => Stroke::new(2.0, freshness_color(task, now, &visuals)),
             _ => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         };
         let blocked = task.is_some_and(|t| t.state() == TaskState::Blocked);
@@ -663,7 +702,7 @@ impl TodoApp {
                 ui.label(RichText::new("·").small().weak());
                 let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                 ui.painter()
-                    .circle_filled(dot.center(), 4.0, freshness_color(task, now));
+                    .circle_filled(dot.center(), 4.0, freshness_color(task, now, &visuals));
                 ui.label(
                     RichText::new(ago_text(now - task.updated_at))
                         .small()
@@ -742,7 +781,7 @@ impl TodoApp {
                                 TextEdit::multiline(draft)
                                     .id(input_id)
                                     .hint_text(hint)
-                                    .background_color(visuals.faint_bg_color)
+                                    .background_color(comment_input_bg(&visuals))
                                     .margin(COMMENT_INPUT_MARGIN)
                                     .desired_rows(2)
                                     .desired_width(f32::INFINITY),
@@ -886,7 +925,7 @@ impl TodoApp {
                     });
                 ui.separator();
                 let on = &mut self.log_starred_only;
-                toggle_switch(ui, on, STAR_COLOR, "Starred only");
+                toggle_switch(ui, on, palette(ui.visuals()).star, "Starred only");
                 let label = Label::new("Starred only")
                     .selectable(false)
                     .sense(Sense::click());
@@ -894,6 +933,17 @@ impl TodoApp {
                     *on = !*on;
                 }
             }
+            // Text rather than egui's ☀/🌙 buttons: drawing those emoji makes
+            // other symbols such as ✔ switch to the colour emoji font.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut theme = ui.ctx().theme();
+                let before = theme;
+                ui.selectable_value(&mut theme, Theme::Dark, "Dark");
+                ui.selectable_value(&mut theme, Theme::Light, "Light");
+                if theme != before {
+                    ui.ctx().set_theme(theme);
+                }
+            });
         });
         ui.add_space(6.0);
     }

@@ -14,6 +14,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "focal",
         options,
-        Box::new(|_cc| Ok(Box::new(app::TodoApp::new()))),
+        Box::new(|cc| Ok(Box::new(app::TodoApp::new(cc)))),
     )
 }

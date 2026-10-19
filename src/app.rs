@@ -1,10 +1,11 @@
-use std::time::Duration;
+use std::{iter, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Datelike, Local, TimeDelta, Utc};
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, ComboBox, Frame, Id, Key, Label, Layout, Margin,
-    Modal, Modifiers, Panel, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind,
-    TextEdit, TextFormat, TextStyle, UiBuilder, Vec2, Visuals, text::LayoutJob,
+    self, Align, Button, CentralPanel, Color32, ComboBox, FontData, FontDefinitions, FontFamily,
+    FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Rect, RichText,
+    ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, TextFormat, TextStyle, UiBuilder, Vec2,
+    Visuals, text::LayoutJob,
 };
 
 use crate::log::{self, EntryKind, LogPage, Period};
@@ -34,6 +35,44 @@ const STALE: Color32 = Color32::from_rgb(235, 195, 40);
 const BLOCKER_ACCENT: Color32 = Color32::from_rgb(215, 85, 75);
 const STAR_COLOR: Color32 = Color32::from_rgb(235, 195, 40);
 const RESOLVED_COLOR: Color32 = Color32::from_rgb(110, 180, 110);
+
+const HEADING_SIZE: f32 = 18.0;
+
+/// Inter Bold, for titles; falls back to the same fonts as body text.
+fn bold() -> FontFamily {
+    FontFamily::Name("bold".into())
+}
+
+/// Inter (the base of GitLab Sans): Medium for body text, Bold for headings.
+/// egui's bundled fonts stay as fallbacks for symbols and emoji Inter lacks.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    for (name, data) in [
+        (
+            "Inter-Medium",
+            &include_bytes!("../assets/fonts/Inter-Medium.ttf")[..],
+        ),
+        (
+            "Inter-Bold",
+            &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..],
+        ),
+    ] {
+        let data = Arc::new(FontData::from_static(data));
+        fonts.font_data.insert(name.to_owned(), data);
+    }
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    let fallbacks = proportional.clone();
+    proportional.insert(0, "Inter-Medium".to_owned());
+    let bold_fonts = iter::once("Inter-Bold".to_owned())
+        .chain(fallbacks)
+        .collect();
+    fonts.families.insert(bold(), bold_fonts);
+    ctx.set_fonts(fonts);
+    ctx.all_styles_mut(|style| {
+        let heading = FontId::new(HEADING_SIZE, bold());
+        style.text_styles.insert(TextStyle::Heading, heading);
+    });
+}
 
 /// Gray → yellow by time since the last update.
 fn freshness_color(task: &Task, now: DateTime<Utc>) -> Color32 {
@@ -350,7 +389,8 @@ pub struct TodoApp {
 }
 
 impl TodoApp {
-    pub fn new() -> Self {
+    pub fn new(cc: &eframe::CreationContext) -> Self {
+        install_fonts(&cc.egui_ctx);
         Self {
             board: storage::load(),
             filter: String::new(),
@@ -880,7 +920,7 @@ impl TodoApp {
                 for group in &page.groups {
                     ui.add_space(6.0);
                     ui.indent(("log_task", page.start, group.task_id), |ui| {
-                        ui.label(RichText::new(&group.title).strong());
+                        ui.label(RichText::new(&group.title).strong().family(bold()));
                         ui.add_space(2.0);
                         for entry in &group.entries {
                             ui.horizontal_top(|ui| {

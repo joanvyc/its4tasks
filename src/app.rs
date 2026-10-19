@@ -9,7 +9,8 @@ use eframe::egui::{
 
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
-    Blocker, Board, Note, SLOT_COUNT, Task, TaskState, matches_filter, short_duration, staleness,
+    Blocker, Board, MessageKind, Note, NoteAction, SLOT_COUNT, Task, TaskState, matches_filter,
+    short_duration, staleness,
 };
 use crate::storage;
 
@@ -20,8 +21,10 @@ const CARD_GLOW_WIDTH: f32 = 16.0;
 const COMMENT_RADIUS: f32 = 4.0;
 const ROW_RADIUS: f32 = 4.0;
 const ROW_GLOW_WIDTH: f32 = 6.0;
-/// Fixed so the comment box doesn't shift when the switch is toggled.
-const BLOCK_SWITCH_WIDTH: f32 = 84.0;
+/// Fixed so the comment box doesn't shift when the message kind changes.
+const KIND_PICKER_WIDTH: f32 = 96.0;
+/// Longest quote of a resolved blocker shown in its Unblock message.
+const QUOTE_CHARS: usize = 60;
 const COMMENT_GLOW_WIDTH: f32 = 8.0;
 const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
 const LOG_TIME_WIDTH: f32 = 64.0;
@@ -98,6 +101,49 @@ fn state_text_color(state: TaskState, visuals: &Visuals) -> Color32 {
         TaskState::Blocked => Color32::from_rgb(170, 40, 40),
         TaskState::Active | TaskState::Done => visuals.weak_text_color(),
     }
+}
+
+fn kind_color(kind: MessageKind, visuals: &Visuals) -> Color32 {
+    match kind {
+        MessageKind::Comment => visuals.weak_text_color(),
+        MessageKind::Block => BLOCKER_ACCENT,
+        MessageKind::Unblock | MessageKind::Close => RESOLVED_COLOR,
+    }
+}
+
+fn kind_hint(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Comment => "Post a plain comment",
+        MessageKind::Block => "Post as blocking: the task stays blocked until resolved",
+        MessageKind::Unblock => "Resolve the blocker, with this as the message",
+        MessageKind::Close => "Mark the task done, with this as the message",
+    }
+}
+
+/// `text` cut to `max` characters, with an ellipsis if anything was cut.
+fn truncate(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", text[..i].trim_end()),
+        None => text.to_owned(),
+    }
+}
+
+/// An Unblock or Close message: a green marker saying what it did, then the text.
+fn action_job(action: &NoteAction, note: &Note, ui: &egui::Ui) -> LayoutJob {
+    let font = TextStyle::Body.resolve(ui.style());
+    let format = |color| TextFormat::simple(font.clone(), color);
+    let marker = match (action, note.unblocked_after()) {
+        (NoteAction::Unblocked { quote, .. }, Some(after)) => format!(
+            "✔ Resolved \"{}\", after {} with message: ",
+            truncate(quote, QUOTE_CHARS),
+            short_duration(after)
+        ),
+        _ => "✔ Closed with message: ".to_owned(),
+    };
+    let mut job = LayoutJob::default();
+    job.append(&marker, 0.0, format(RESOLVED_COLOR));
+    job.append(&note.text, 0.0, format(ui.visuals().text_color()));
+    job
 }
 
 fn local_time(at: DateTime<Utc>) -> String {
@@ -207,7 +253,10 @@ fn comment(
             }
         });
     });
-    ui.add(Label::new(&note.text).wrap());
+    match &note.action {
+        Some(action) => ui.add(Label::new(action_job(action, note, ui)).wrap()),
+        None => ui.add(Label::new(&note.text).wrap()),
+    };
 }
 
 fn log_heading(page: &LogPage, period: Period) -> String {
@@ -240,7 +289,16 @@ fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
             Some(format!("Unblocked after {}: ", short_duration(*after))),
             RESOLVED_COLOR,
         ),
+        EntryKind::Resolved { quote, after } => (
+            Some(format!(
+                "✔ Resolved \"{}\", after {} with message: ",
+                truncate(quote, QUOTE_CHARS),
+                short_duration(*after)
+            )),
+            RESOLVED_COLOR,
+        ),
         EntryKind::Done => (Some("✔ Marked done".to_owned()), RESOLVED_COLOR),
+        EntryKind::Closed => (Some("✔ Closed with message: ".to_owned()), RESOLVED_COLOR),
     };
     if let Some(marker) = marker {
         job.append(&marker, 0.0, format(color));
@@ -283,8 +341,8 @@ pub struct TodoApp {
     new_task: Option<NewTaskDraft>,
     /// Unsent comment text for each focus card.
     comment_drafts: [String; SLOT_COUNT],
-    /// Whether the next comment posted on each card is a blocker.
-    comment_blocking: [bool; SLOT_COUNT],
+    /// What posting from each card's comment box does.
+    comment_kind: [MessageKind; SLOT_COUNT],
     view: View,
     log_period: Period,
     log_starred_only: bool,
@@ -298,7 +356,7 @@ impl TodoApp {
             filter: String::new(),
             new_task: None,
             comment_drafts: Default::default(),
-            comment_blocking: Default::default(),
+            comment_kind: [MessageKind::Comment; SLOT_COUNT],
             view: View::Board,
             log_period: Period::Day,
             log_starred_only: false,
@@ -581,7 +639,11 @@ impl TodoApp {
                 // Enter posts, Shift+Enter adds a newline.
                 let input_id = ui.make_persistent_id(("comment_input", slot));
                 let draft = &mut self.comment_drafts[slot];
-                let blocking = &mut self.comment_blocking[slot];
+                let kinds = task.message_kinds();
+                let kind = &mut self.comment_kind[slot];
+                if !kinds.contains(kind) {
+                    *kind = MessageKind::Comment;
+                }
                 let submit = ui.memory(|m| m.has_focus(input_id))
                     && ui.input_mut(|i| {
                         !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter)
@@ -599,32 +661,38 @@ impl TodoApp {
                 let row = Vec2::new(ui.available_width(), row_height);
                 ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Min), |ui| {
                     // Lined up with the comment box's first line of text.
-                    let switch_row =
-                        Vec2::new(BLOCK_SWITCH_WIDTH, line + COMMENT_INPUT_MARGIN.sum().y);
+                    let picker_row =
+                        Vec2::new(KIND_PICKER_WIDTH, line + COMMENT_INPUT_MARGIN.sum().y);
                     ui.allocate_ui_with_layout(
-                        switch_row,
+                        picker_row,
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            let hint = "Post as blocking: the task stays blocked until resolved";
-                            toggle_switch(ui, blocking, BLOCKER_ACCENT, "Blocking")
-                                .on_hover_text(hint);
-                            let color = if *blocking {
-                                BLOCKER_ACCENT
-                            } else {
-                                ui.visuals().weak_text_color()
-                            };
-                            let label = Label::new(RichText::new("Blocking").small().color(color))
-                                .selectable(false)
-                                .sense(Sense::click());
-                            if ui.add(label).on_hover_text(hint).clicked() {
-                                *blocking = !*blocking;
-                            }
+                            let selected =
+                                RichText::new(kind.label()).color(kind_color(*kind, &visuals));
+                            ComboBox::from_id_salt(("comment_kind", slot))
+                                .selected_text(selected)
+                                .width(KIND_PICKER_WIDTH - ui.spacing().item_spacing.x)
+                                .show_ui(ui, |ui| {
+                                    for &k in &kinds {
+                                        // Weak text is hard to read on the
+                                        // selection highlight.
+                                        let mut text = RichText::new(k.label());
+                                        if k != MessageKind::Comment {
+                                            text = text.color(kind_color(k, &visuals));
+                                        }
+                                        ui.selectable_value(kind, k, text)
+                                            .on_hover_text(kind_hint(k));
+                                    }
+                                })
+                                .response
+                                .on_hover_text(kind_hint(*kind));
                         },
                     );
-                    let hint = if *blocking {
-                        "Describe what you're waiting for… (Enter to post)"
-                    } else {
-                        "Add a comment… (Enter to post)"
+                    let hint = match *kind {
+                        MessageKind::Comment => "Add a comment… (Enter to post)",
+                        MessageKind::Block => "Describe what you're waiting for… (Enter to post)",
+                        MessageKind::Unblock => "What unblocked it?… (Enter to post)",
+                        MessageKind::Close => "Closing note… (Enter to post)",
                     };
                     let edit = ScrollArea::vertical()
                         .id_salt(("comment_input_scroll", slot))
@@ -648,9 +716,9 @@ impl TodoApp {
                     }
                 });
                 if submit && !draft.trim().is_empty() {
-                    task.add_note(draft, *blocking, now);
+                    task.post(draft, *kind, now);
                     draft.clear();
-                    *blocking = false;
+                    *kind = MessageKind::Comment;
                     self.dirty = true;
                 }
                 ui.add_space(4.0);

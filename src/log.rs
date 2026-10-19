@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone, Utc};
 
-use crate::model::{Blocker, Board, Note};
+use crate::model::{Blocker, Board, Note, NoteAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period {
@@ -30,7 +30,14 @@ pub enum EntryKind {
     Unblocked {
         after: TimeDelta,
     },
+    /// Posted with "Unblock": resolved the quoted blocker; the text is the message.
+    Resolved {
+        quote: String,
+        after: TimeDelta,
+    },
     Done,
+    /// Posted with "Close": marked the task done; the text is the message.
+    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +69,14 @@ fn note_entries(note: &Note) -> Vec<Entry> {
         text: note.text.clone(),
         starred: note.starred,
     };
+    match (&note.action, note.unblocked_after()) {
+        (Some(NoteAction::Unblocked { quote, .. }), Some(after)) => {
+            let quote = quote.clone();
+            return vec![entry(note.at, EntryKind::Resolved { quote, after })];
+        }
+        (Some(NoteAction::Closed), _) => return vec![entry(note.at, EntryKind::Closed)],
+        _ => {}
+    }
     let posted_blocking = note.blocker.is_some() && note.blocked_since() == note.at;
     let mut entries = vec![entry(
         note.at,
@@ -111,6 +126,22 @@ pub fn build<Tz: TimeZone>(
             .collect();
         entries.extend(task.notes.iter().flat_map(note_entries));
         entries.extend(task.done_at.map(|at| title_entry(at, EntryKind::Done)));
+        // An Unblock or Close message already says what its plain Unblocked or
+        // Done entry would.
+        let times = |f: fn(&EntryKind) -> bool| -> Vec<DateTime<Utc>> {
+            entries
+                .iter()
+                .filter(|e| f(&e.kind))
+                .map(|e| e.at)
+                .collect()
+        };
+        let resolved = times(|k| matches!(k, EntryKind::Resolved { .. }));
+        let closed = times(|k| matches!(k, EntryKind::Closed));
+        entries.retain(|e| match e.kind {
+            EntryKind::Unblocked { .. } => !resolved.contains(&e.at),
+            EntryKind::Done => !closed.contains(&e.at),
+            _ => true,
+        });
         if starred_only {
             entries.retain(|e| e.starred);
         }
@@ -149,6 +180,7 @@ pub fn build<Tz: TimeZone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MessageKind;
 
     fn at(day: u32, hour: u32) -> DateTime<Utc> {
         // 2026-10-12 is a Monday.
@@ -166,9 +198,9 @@ mod tests {
         let mut b = Board::default();
         let a = b.add_task("A".into(), "", at(12, 9));
         let t = b.task_mut(a).unwrap();
-        t.add_note("waiting on input", true, at(13, 10));
+        t.post("waiting on input", MessageKind::Block, at(13, 10));
         t.resolve(0, at(14, 13));
-        t.add_note("got it", false, at(14, 14));
+        t.post("got it", MessageKind::Comment, at(14, 14));
         t.set_done(true, at(19, 9));
         let c = b.add_task("B".into(), "early note", at(14, 8));
         let t = b.task_mut(c).unwrap();
@@ -243,5 +275,34 @@ mod tests {
             all.iter()
                 .any(|e| matches!(e.kind, EntryKind::Unblocked { .. }))
         );
+    }
+
+    #[test]
+    fn unblock_and_close_messages_replace_their_plain_entries() {
+        let mut b = Board::default();
+        let id = b.add_task("C".into(), "", at(12, 9));
+        let t = b.task_mut(id).unwrap();
+        t.post("need access", MessageKind::Block, at(12, 10));
+        t.post("got access", MessageKind::Unblock, at(12, 15));
+        t.post("shipped", MessageKind::Close, at(12, 16));
+        let pages = build(&b, Period::Day, false, &Utc);
+        let kinds: Vec<_> = pages[0].groups[0].entries.iter().map(|e| &e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EntryKind::Created,
+                &EntryKind::Comment { blocking: true },
+                &EntryKind::Resolved {
+                    quote: "need access".into(),
+                    after: TimeDelta::hours(5)
+                },
+                &EntryKind::Closed,
+            ]
+        );
+        assert_eq!(pages[0].groups[0].entries[2].text, "got access");
+
+        // Starred: the blocker and its Unblock message.
+        let pages = build(&b, Period::Day, true, &Utc);
+        assert_eq!(pages[0].groups[0].entries.len(), 2);
     }
 }

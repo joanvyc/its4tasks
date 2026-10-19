@@ -13,6 +13,39 @@ pub enum Blocker {
     Resolved { at: DateTime<Utc> },
 }
 
+/// What a comment did besides commenting, posted from the comment box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NoteAction {
+    /// Resolved a blocker. Its text and start are copied so this note still
+    /// reads right if the blocker is later edited or deleted.
+    Unblocked {
+        quote: String,
+        blocked_since: DateTime<Utc>,
+    },
+    /// Marked the task done.
+    Closed,
+}
+
+/// What posting from the comment box does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Comment,
+    Block,
+    Unblock,
+    Close,
+}
+
+impl MessageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MessageKind::Comment => "Comment",
+            MessageKind::Block => "Block",
+            MessageKind::Unblock => "Unblock",
+            MessageKind::Close => "Close",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub at: DateTime<Utc>,
@@ -25,6 +58,8 @@ pub struct Note {
     pub blocked_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub starred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<NoteAction>,
 }
 
 impl Note {
@@ -35,6 +70,7 @@ impl Note {
             blocker: None,
             blocked_at: None,
             starred: false,
+            action: None,
         }
     }
 
@@ -55,6 +91,14 @@ impl Note {
     pub fn blocked_duration(&self) -> Option<TimeDelta> {
         match self.blocker {
             Some(Blocker::Resolved { at }) => Some(at - self.blocked_since()),
+            _ => None,
+        }
+    }
+
+    /// How long the blocker this note resolved had been blocking.
+    pub fn unblocked_after(&self) -> Option<TimeDelta> {
+        match &self.action {
+            Some(NoteAction::Unblocked { blocked_since, .. }) => Some(self.at - *blocked_since),
             _ => None,
         }
     }
@@ -111,18 +155,52 @@ impl Task {
         self.touch(now);
     }
 
-    /// Append a comment, optionally as an open blocker. Blank text is ignored.
-    pub fn add_note(&mut self, text: &str, blocking: bool, now: DateTime<Utc>) {
+    /// Post a comment from the comment box. Blank text is ignored.
+    /// - `Block` posts it as an open blocker.
+    /// - `Unblock` resolves the oldest open blocker, with this as the message
+    ///   (a plain comment if nothing is blocking).
+    /// - `Close` marks the task done, with this as the message.
+    pub fn post(&mut self, text: &str, kind: MessageKind, now: DateTime<Utc>) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
         let mut note = Note::new(text.to_owned(), now);
-        if blocking {
-            note.block(now);
+        match kind {
+            MessageKind::Comment => {}
+            MessageKind::Block => note.block(now),
+            MessageKind::Unblock => {
+                if let Some(idx) = self.notes.iter().position(Note::is_open_blocker) {
+                    let blocker = &self.notes[idx];
+                    note.action = Some(NoteAction::Unblocked {
+                        quote: blocker.text.clone(),
+                        blocked_since: blocker.blocked_since(),
+                    });
+                    note.starred = true;
+                    self.resolve(idx, now);
+                }
+            }
+            MessageKind::Close => {
+                note.action = Some(NoteAction::Closed);
+                self.set_done(true, now);
+            }
         }
         self.notes.push(note);
         self.touch(now);
+    }
+
+    /// What the comment box offers for this task, the default first.
+    pub fn message_kinds(&self) -> Vec<MessageKind> {
+        let mut kinds = vec![MessageKind::Comment];
+        kinds.push(if self.open_blocker().is_some() {
+            MessageKind::Unblock
+        } else {
+            MessageKind::Block
+        });
+        if !self.done {
+            kinds.push(MessageKind::Close);
+        }
+        kinds
     }
 
     pub fn set_blocking(&mut self, idx: usize, now: DateTime<Utc>) {
@@ -231,7 +309,7 @@ impl Board {
             created_at: Some(now),
             done_at: None,
         };
-        task.add_note(first_note, false, now);
+        task.post(first_note, MessageKind::Comment, now);
         self.tasks.push(task);
         id
     }
@@ -392,7 +470,7 @@ mod tests {
             created_at: None,
             done_at: None,
         };
-        t.add_note("send to Alice", false, Utc::now());
+        t.post("send to Alice", MessageKind::Comment, Utc::now());
         assert!(matches_filter(&t, ""));
         assert!(matches_filter(&t, "report"));
         assert!(matches_filter(&t, "  ALICE "));
@@ -422,14 +500,14 @@ mod tests {
     }
 
     #[test]
-    fn add_note_touches_and_skips_blank() {
+    fn post_touches_and_skips_blank() {
         let mut b = board_with(1);
         let t = b.task_mut(0).unwrap();
         let later = t.updated_at + TimeDelta::hours(3);
-        t.add_note("   ", false, later);
+        t.post("   ", MessageKind::Comment, later);
         assert!(t.notes.is_empty());
         assert!(t.updated_at < later);
-        t.add_note("hi", false, later);
+        t.post("hi", MessageKind::Comment, later);
         assert_eq!(t.notes.len(), 1);
         assert_eq!(t.updated_at, later);
         t.delete_note(5);
@@ -443,9 +521,9 @@ mod tests {
         let now = Utc::now();
         let t = b.task_mut(0).unwrap();
         assert_eq!(t.state(), TaskState::Active);
-        t.add_note("waiting on new input case", true, now);
-        t.add_note("plain comment", false, now);
-        t.add_note("also need access", false, now);
+        t.post("waiting on new input case", MessageKind::Block, now);
+        t.post("plain comment", MessageKind::Comment, now);
+        t.post("also need access", MessageKind::Comment, now);
         t.set_blocking(2, now);
         assert_eq!(t.state(), TaskState::Blocked);
 
@@ -469,8 +547,8 @@ mod tests {
     fn blockers_round_trip_and_old_notes_load() {
         let mut b = board_with(1);
         let t = b.task_mut(0).unwrap();
-        t.add_note("open", true, Utc::now());
-        t.add_note("resolved", true, Utc::now());
+        t.post("open", MessageKind::Block, Utc::now());
+        t.post("resolved", MessageKind::Block, Utc::now());
         t.resolve(1, Utc::now());
         let json = serde_json::to_string(&b).unwrap();
         let back: Board = serde_json::from_str(&json).unwrap();
@@ -487,8 +565,8 @@ mod tests {
         let mut b = board_with(1);
         let t0 = Utc::now();
         let t = b.task_mut(0).unwrap();
-        t.add_note("posted as blocker", true, t0);
-        t.add_note("plain", false, t0);
+        t.post("posted as blocker", MessageKind::Block, t0);
+        t.post("plain", MessageKind::Comment, t0);
         assert!(t.notes[0].starred);
         assert!(!t.notes[1].starred);
         assert_eq!(
@@ -508,6 +586,69 @@ mod tests {
         assert!(!t.notes[0].starred);
         t.unmark_blocking(1);
         assert_eq!(t.notes[1].blocked_at, None);
+    }
+
+    #[test]
+    fn unblock_resolves_oldest_blocker_with_a_message() {
+        let mut b = board_with(1);
+        let t0 = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        assert_eq!(
+            t.message_kinds(),
+            [MessageKind::Comment, MessageKind::Block, MessageKind::Close]
+        );
+        t.post("need access", MessageKind::Block, t0);
+        t.post("need data", MessageKind::Block, t0 + TimeDelta::hours(1));
+        assert_eq!(
+            t.message_kinds(),
+            [
+                MessageKind::Comment,
+                MessageKind::Unblock,
+                MessageKind::Close
+            ]
+        );
+
+        let later = t0 + TimeDelta::hours(5);
+        t.post("got access", MessageKind::Unblock, later);
+        assert_eq!(t.notes[0].blocker, Some(Blocker::Resolved { at: later }));
+        assert!(t.notes[1].is_open_blocker());
+        let msg = &t.notes[2];
+        assert_eq!(
+            msg.action,
+            Some(NoteAction::Unblocked {
+                quote: "need access".into(),
+                blocked_since: t0
+            })
+        );
+        assert_eq!(msg.unblocked_after(), Some(TimeDelta::hours(5)));
+        assert!(msg.starred);
+
+        t.post("got data", MessageKind::Unblock, later);
+        assert_eq!(t.state(), TaskState::Active);
+        // Nothing left to resolve: a plain comment.
+        t.post("extra", MessageKind::Unblock, later);
+        assert_eq!(t.notes[4].action, None);
+    }
+
+    #[test]
+    fn close_marks_done_with_a_message() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.post("   ", MessageKind::Close, now);
+        assert!(!t.done);
+        t.post("shipped", MessageKind::Close, now);
+        assert_eq!(t.state(), TaskState::Done);
+        assert_eq!(t.done_at, Some(now));
+        assert_eq!(t.notes[0].action, Some(NoteAction::Closed));
+        assert_eq!(
+            t.message_kinds(),
+            [MessageKind::Comment, MessageKind::Block]
+        );
+
+        let json = serde_json::to_string(&b).unwrap();
+        let back: Board = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
     }
 
     #[test]

@@ -6,10 +6,42 @@ pub const SLOT_COUNT: usize = 4;
 /// How long without updates before a task is shown fully red.
 const STALE_AFTER_SECS: f32 = 7.0 * 24.0 * 3600.0;
 
+/// A comment that needs someone else to act before the task can move on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Blocker {
+    Open,
+    Resolved { at: DateTime<Utc> },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub at: DateTime<Utc>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<Blocker>,
+}
+
+impl Note {
+    pub fn is_open_blocker(&self) -> bool {
+        self.blocker == Some(Blocker::Open)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Active,
+    Blocked,
+    Done,
+}
+
+impl TaskState {
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskState::Active => "Active",
+            TaskState::Blocked => "Blocked",
+            TaskState::Done => "Done",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,8 +61,8 @@ impl Task {
         self.updated_at = now;
     }
 
-    /// Append a comment. Blank text is ignored.
-    pub fn add_note(&mut self, text: &str, now: DateTime<Utc>) {
+    /// Append a comment, optionally as an open blocker. Blank text is ignored.
+    pub fn add_note(&mut self, text: &str, blocking: bool, now: DateTime<Utc>) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -38,8 +70,47 @@ impl Task {
         self.notes.push(Note {
             at: now,
             text: text.to_owned(),
+            blocker: blocking.then_some(Blocker::Open),
         });
         self.touch(now);
+    }
+
+    pub fn set_blocking(&mut self, idx: usize, now: DateTime<Utc>) {
+        if let Some(note) = self.notes.get_mut(idx) {
+            note.blocker = Some(Blocker::Open);
+            self.touch(now);
+        }
+    }
+
+    pub fn resolve(&mut self, idx: usize, now: DateTime<Utc>) {
+        if let Some(note) = self.notes.get_mut(idx)
+            && note.is_open_blocker()
+        {
+            note.blocker = Some(Blocker::Resolved { at: now });
+            self.touch(now);
+        }
+    }
+
+    /// Undo a blocking mark (e.g. a mis-click); doesn't count as an update.
+    pub fn unmark_blocking(&mut self, idx: usize) {
+        if let Some(note) = self.notes.get_mut(idx) {
+            note.blocker = None;
+        }
+    }
+
+    pub fn open_blocker(&self) -> Option<&Note> {
+        self.notes.iter().find(|n| n.is_open_blocker())
+    }
+
+    /// Derived from `done` and the comments, never stored.
+    pub fn state(&self) -> TaskState {
+        if self.done {
+            TaskState::Done
+        } else if self.open_blocker().is_some() {
+            TaskState::Blocked
+        } else {
+            TaskState::Active
+        }
     }
 
     pub fn delete_note(&mut self, idx: usize) {
@@ -63,6 +134,7 @@ fn legacy_notes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Note>, D::Error> 
         Notes::Legacy(text) => vec![Note {
             at: Utc::now(),
             text: text.trim().to_owned(),
+            blocker: None,
         }],
         Notes::Log(notes) => notes,
     })
@@ -92,7 +164,7 @@ impl Board {
             done: false,
             updated_at: now,
         };
-        task.add_note(first_note, now);
+        task.add_note(first_note, false, now);
         self.tasks.push(task);
         id
     }
@@ -251,7 +323,7 @@ mod tests {
             done: false,
             updated_at: Utc::now(),
         };
-        t.add_note("send to Alice", Utc::now());
+        t.add_note("send to Alice", false, Utc::now());
         assert!(matches_filter(&t, ""));
         assert!(matches_filter(&t, "report"));
         assert!(matches_filter(&t, "  ALICE "));
@@ -285,15 +357,60 @@ mod tests {
         let mut b = board_with(1);
         let t = b.task_mut(0).unwrap();
         let later = t.updated_at + TimeDelta::hours(3);
-        t.add_note("   ", later);
+        t.add_note("   ", false, later);
         assert!(t.notes.is_empty());
         assert!(t.updated_at < later);
-        t.add_note("hi", later);
+        t.add_note("hi", false, later);
         assert_eq!(t.notes.len(), 1);
         assert_eq!(t.updated_at, later);
         t.delete_note(5);
         t.delete_note(0);
         assert!(t.notes.is_empty());
+    }
+
+    #[test]
+    fn blockers_drive_state() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        assert_eq!(t.state(), TaskState::Active);
+        t.add_note("waiting on new input case", true, now);
+        t.add_note("plain comment", false, now);
+        t.add_note("also need access", false, now);
+        t.set_blocking(2, now);
+        assert_eq!(t.state(), TaskState::Blocked);
+
+        t.resolve(0, now);
+        assert_eq!(t.state(), TaskState::Blocked);
+        assert_eq!(t.notes[0].blocker, Some(Blocker::Resolved { at: now }));
+        t.resolve(1, now); // not a blocker: stays untouched
+        assert_eq!(t.notes[1].blocker, None);
+        t.resolve(2, now);
+        assert_eq!(t.state(), TaskState::Active);
+
+        t.set_blocking(1, now);
+        t.done = true;
+        assert_eq!(t.state(), TaskState::Done);
+        t.done = false;
+        t.unmark_blocking(1);
+        assert_eq!(t.state(), TaskState::Active);
+    }
+
+    #[test]
+    fn blockers_round_trip_and_old_notes_load() {
+        let mut b = board_with(1);
+        let t = b.task_mut(0).unwrap();
+        t.add_note("open", true, Utc::now());
+        t.add_note("resolved", true, Utc::now());
+        t.resolve(1, Utc::now());
+        let json = serde_json::to_string(&b).unwrap();
+        let back: Board = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
+
+        let json = r#"{"id":0,"title":"t","notes":[{"at":"2026-10-01T10:00:00Z","text":"x"}]}"#;
+        let t: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(t.notes[0].blocker, None);
+        assert_eq!(t.state(), TaskState::Active);
     }
 
     #[test]

@@ -1,33 +1,65 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, TimeDelta, Utc};
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, Frame, Id, Key, Label, Layout, Margin, Modal,
-    Modifiers, Panel, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, UiBuilder,
-    Vec2,
+    Modifiers, Panel, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit,
+    TextStyle, UiBuilder, Vec2, Visuals,
 };
 
-use crate::model::{Board, SLOT_COUNT, Task, matches_filter, staleness};
+use crate::model::{Blocker, Board, Note, SLOT_COUNT, Task, TaskState, matches_filter, staleness};
 use crate::storage;
 
 const CARD_GAP: f32 = 12.0;
 const CARD_MARGIN: i8 = 14;
+const CARD_RADIUS: f32 = 10.0;
+const CARD_GLOW_WIDTH: f32 = 16.0;
+const COMMENT_RADIUS: f32 = 4.0;
+const ROW_RADIUS: f32 = 4.0;
+const ROW_GLOW_WIDTH: f32 = 6.0;
+const COMMENT_GLOW_WIDTH: f32 = 8.0;
+const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
 
-const FRESH: Color32 = Color32::from_rgb(76, 175, 80);
-const AGING: Color32 = Color32::from_rgb(230, 190, 40);
-const STALE: Color32 = Color32::from_rgb(220, 70, 60);
+const FRESH: Color32 = Color32::from_rgb(130, 130, 130);
+const STALE: Color32 = Color32::from_rgb(235, 195, 40);
+const BLOCKER_ACCENT: Color32 = Color32::from_rgb(215, 85, 75);
 
-/// Green → yellow → red by time since the last update; `None` for finished tasks.
-fn freshness_color(task: &Task, now: DateTime<Utc>) -> Option<Color32> {
-    if task.done {
-        return None;
-    }
-    let t = staleness(now - task.updated_at);
-    Some(if t < 0.5 {
-        FRESH.lerp_to_gamma(AGING, t * 2.0)
+/// Gray → yellow by time since the last update.
+fn freshness_color(task: &Task, now: DateTime<Utc>) -> Color32 {
+    FRESH.lerp_to_gamma(STALE, staleness(now - task.updated_at))
+}
+
+/// Red glow along the inside edge of a blocked card or blocking comment.
+fn blocked_glow_color(visuals: &Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(210, 60, 60).gamma_multiply(0.6)
     } else {
-        AGING.lerp_to_gamma(STALE, (t - 0.5) * 2.0)
-    })
+        Color32::from_rgb(235, 90, 90).gamma_multiply(0.7)
+    }
+}
+
+/// `color` at the rect's edge, fading out to nothing `width` px inside it.
+/// Drawn as 1px rounded outlines, each one inset a pixel further and fainter.
+fn inner_glow(rect: Rect, corner_radius: f32, width: f32, color: Color32) -> Shape {
+    let rings = (0..width.ceil() as usize).map(|i| {
+        let inset = i as f32;
+        let fade = (1.0 - inset / width).powi(2);
+        Shape::rect_stroke(
+            rect.shrink(inset),
+            (corner_radius - inset).max(0.0),
+            Stroke::new(1.0, color.gamma_multiply(fade)),
+            StrokeKind::Inside,
+        )
+    });
+    Shape::Vec(rings.collect())
+}
+
+fn state_text_color(state: TaskState, visuals: &Visuals) -> Color32 {
+    match state {
+        TaskState::Blocked if visuals.dark_mode => Color32::from_rgb(255, 150, 140),
+        TaskState::Blocked => Color32::from_rgb(170, 40, 40),
+        TaskState::Active | TaskState::Done => visuals.weak_text_color(),
+    }
 }
 
 fn local_time(at: DateTime<Utc>) -> String {
@@ -36,15 +68,74 @@ fn local_time(at: DateTime<Utc>) -> String {
         .to_string()
 }
 
-fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
-    let age = now - task.updated_at;
-    let ago = match (age.num_days(), age.num_hours(), age.num_minutes()) {
+fn ago_text(age: TimeDelta) -> String {
+    match (age.num_days(), age.num_hours(), age.num_minutes()) {
         (d, _, _) if d >= 1 => format!("{d} day{} ago", if d == 1 { "" } else { "s" }),
         (_, h, _) if h >= 1 => format!("{h} hour{} ago", if h == 1 { "" } else { "s" }),
         (_, _, m) if m >= 1 => format!("{m} min ago"),
         _ => "just now".to_owned(),
-    };
-    format!("Updated {ago} · {}", local_time(task.updated_at))
+    }
+}
+
+fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
+    format!(
+        "Updated {} · {}",
+        ago_text(now - task.updated_at),
+        local_time(task.updated_at)
+    )
+}
+
+/// One entry of a card's comment log: timestamp/blocker line, then the text.
+/// `hovered` reveals the "mark as blocking" button on plain comments.
+fn comment(
+    ui: &mut egui::Ui,
+    note: &Note,
+    idx: usize,
+    task_id: u64,
+    hovered: bool,
+    actions: &mut Vec<Action>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(local_time(note.at)).small().weak());
+        match note.blocker {
+            Some(Blocker::Open) => {
+                ui.label(
+                    RichText::new("· ⛔ Blocking")
+                        .small()
+                        .strong()
+                        .color(BLOCKER_ACCENT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("✔ Resolve")
+                        .on_hover_text("Mark this blocker as resolved")
+                        .clicked()
+                    {
+                        actions.push(Action::Resolve(task_id, idx));
+                    }
+                });
+            }
+            Some(Blocker::Resolved { at }) => {
+                ui.label(
+                    RichText::new(format!("· ✔ Resolved {}", local_time(at)))
+                        .small()
+                        .weak(),
+                );
+            }
+            None => {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Always laid out so the row height doesn't jump on hover.
+                    let block = ui
+                        .add_visible(hovered, Button::new("⛔ Mark blocking").small())
+                        .on_hover_text("Turn this comment into a blocker");
+                    if block.clicked() {
+                        actions.push(Action::MarkBlocking(task_id, idx));
+                    }
+                });
+            }
+        }
+    });
+    ui.add(Label::new(&note.text).wrap());
 }
 
 #[derive(Default)]
@@ -63,6 +154,9 @@ enum Action {
     Unfocus(usize),
     Delete(u64),
     DeleteNote(u64, usize),
+    MarkBlocking(u64, usize),
+    Resolve(u64, usize),
+    Unblock(u64, usize),
 }
 
 pub struct TodoApp {
@@ -71,6 +165,8 @@ pub struct TodoApp {
     new_task: Option<NewTaskDraft>,
     /// Unsent comment text for each focus card.
     comment_drafts: [String; SLOT_COUNT],
+    /// Whether the next comment posted on each card is a blocker.
+    comment_blocking: [bool; SLOT_COUNT],
     dirty: bool,
 }
 
@@ -81,11 +177,13 @@ impl TodoApp {
             filter: String::new(),
             new_task: None,
             comment_drafts: Default::default(),
+            comment_blocking: Default::default(),
             dirty: false,
         }
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
+        let now = Utc::now();
         for action in actions {
             match action {
                 Action::Focus(id) => {
@@ -97,6 +195,21 @@ impl TodoApp {
                 Action::DeleteNote(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
                         task.delete_note(idx);
+                    }
+                }
+                Action::MarkBlocking(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.set_blocking(idx, now);
+                    }
+                }
+                Action::Resolve(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.resolve(idx, now);
+                    }
+                }
+                Action::Unblock(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.unmark_blocking(idx);
                     }
                 }
             }
@@ -163,49 +276,79 @@ impl TodoApp {
                 let Some(task) = self.board.task_mut(id) else {
                     continue;
                 };
-                ui.horizontal(|ui| {
-                    let color =
-                        freshness_color(task, now).unwrap_or(ui.visuals().weak_text_color());
-                    let (bar, bar_response) =
-                        ui.allocate_exact_size(Vec2::new(4.0, 16.0), Sense::hover());
-                    ui.painter().rect_filled(bar, 2.0, color);
-                    bar_response.on_hover_text(updated_text(task, now));
-                    if ui.checkbox(&mut task.done, "").changed() {
-                        task.touch(now);
-                        self.dirty = true;
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if slot.is_some() {
-                            ui.label(RichText::new("●").color(ui.visuals().selection.bg_fill))
-                                .on_hover_text("In focus");
+                let blocker = match task.state() {
+                    TaskState::Blocked => task.open_blocker().map(|n| n.text.clone()),
+                    TaskState::Active | TaskState::Done => None,
+                };
+                let glow = ui.painter().add(Shape::Noop);
+                let row = Frame::new()
+                    .corner_radius(ROW_RADIUS)
+                    .inner_margin(Margin::symmetric(6, 2));
+                let shown = row.show(ui, |ui| {
+                    // A fixed row height, unlike `ui.horizontal`'s growing one, gives
+                    // every widget (and the nested layouts) the same center line.
+                    let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y + 4.0);
+                    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+                        let color = if task.done {
+                            ui.visuals().weak_text_color()
                         } else {
-                            let btn = ui
-                                .add_enabled(has_free_slot, Button::new("→").small())
-                                .on_hover_text("Bring into focus")
-                                .on_disabled_hover_text("All 4 focus slots are taken");
-                            if btn.clicked() {
-                                actions.push(Action::Focus(id));
-                            }
+                            freshness_color(task, now)
+                        };
+                        let (bar, bar_response) =
+                            ui.allocate_exact_size(Vec2::new(4.0, 16.0), Sense::hover());
+                        ui.painter().rect_filled(bar, 2.0, color);
+                        let mut hover = updated_text(task, now);
+                        if let Some(text) = &blocker {
+                            hover = format!("Blocked: {text}\n{hover}");
                         }
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            let mut text = RichText::new(&task.title);
-                            if task.done {
-                                text = text.strikethrough().weak();
-                            }
-                            let label = ui
-                                .dnd_drag_source(Id::unique(("task", id)), id, |ui| {
-                                    ui.add(Label::new(text).truncate().selectable(false))
-                                })
-                                .response
-                                .on_hover_text("Drag onto a card to focus");
-                            label.context_menu(|ui| {
-                                if ui.button("Delete").clicked() {
-                                    actions.push(Action::Delete(id));
+                        bar_response.on_hover_text(hover);
+                        if ui.checkbox(&mut task.done, "").changed() {
+                            task.touch(now);
+                            self.dirty = true;
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if slot.is_some() {
+                                // Painted rather than a "●" glyph, which sits on the text
+                                // baseline instead of the row's center.
+                                let (dot, response) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                let color = ui.visuals().selection.bg_fill;
+                                ui.painter().circle_filled(dot.center(), 5.0, color);
+                                response.on_hover_text("In focus");
+                            } else {
+                                let btn = ui
+                                    .add_enabled(has_free_slot, Button::new("→").small())
+                                    .on_hover_text("Bring into focus")
+                                    .on_disabled_hover_text("All 4 focus slots are taken");
+                                if btn.clicked() {
+                                    actions.push(Action::Focus(id));
                                 }
+                            }
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                let mut text = RichText::new(&task.title);
+                                if task.done {
+                                    text = text.strikethrough().weak();
+                                }
+                                let label = ui
+                                    .dnd_drag_source(Id::unique(("task", id)), id, |ui| {
+                                        ui.add(Label::new(text).truncate().selectable(false))
+                                    })
+                                    .response
+                                    .on_hover_text("Drag onto a card to focus");
+                                label.context_menu(|ui| {
+                                    if ui.button("Delete").clicked() {
+                                        actions.push(Action::Delete(id));
+                                    }
+                                });
                             });
                         });
-                    });
+                    })
                 });
+                if blocker.is_some() {
+                    let color = blocked_glow_color(ui.visuals());
+                    let shape = inner_glow(shown.response.rect, ROW_RADIUS, ROW_GLOW_WIDTH, color);
+                    ui.painter().set(glow, shape);
+                }
             }
         });
     }
@@ -232,25 +375,23 @@ impl TodoApp {
         let visuals = ui.visuals().clone();
         let now = Utc::now();
         let task_id = self.board.slots[slot];
-        let stroke = match task_id.and_then(|id| self.board.task(id)) {
-            Some(task) => match freshness_color(task, now) {
-                Some(color) => Stroke::new(2.0, color),
-                None => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
-            },
-            None => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        let task = task_id.and_then(|id| self.board.task(id));
+        let stroke = match task {
+            Some(task) if !task.done => Stroke::new(2.0, freshness_color(task, now)),
+            _ => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         };
+        let blocked = task.is_some_and(|t| t.state() == TaskState::Blocked);
+        let has_task = task.is_some();
+        // The background (and glow) is painted into this slot once the card's rect
+        // is known, so it stays behind the card's contents.
+        let background = ui.painter().add(Shape::Noop);
         let frame = Frame::new()
             .inner_margin(Margin::same(CARD_MARGIN))
-            .corner_radius(10.0)
-            .fill(if task_id.is_some() {
-                visuals.extreme_bg_color
-            } else {
-                Color32::TRANSPARENT
-            })
+            .corner_radius(CARD_RADIUS)
             .stroke(stroke);
         let content = cell - Vec2::splat(2.0 * (f32::from(CARD_MARGIN) + stroke.width));
 
-        let (_, dropped) = ui.dnd_drop_zone::<u64, _>(frame, |ui| {
+        let (zone, dropped) = ui.dnd_drop_zone::<u64, _>(frame, |ui| {
             ui.set_min_size(content);
             ui.set_max_size(content);
             let Some(task) = task_id.and_then(|id| self.board.task_mut(id)) else {
@@ -282,6 +423,25 @@ impl TodoApp {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                let state = task.state();
+                ui.label(
+                    RichText::new(state.label())
+                        .small()
+                        .strong()
+                        .color(state_text_color(state, &visuals)),
+                );
+                ui.label(RichText::new("·").small().weak());
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(dot.center(), 4.0, freshness_color(task, now));
+                ui.label(
+                    RichText::new(ago_text(now - task.updated_at))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text(updated_text(task, now));
+            });
             ui.separator();
 
             // Lay out bottom-up so the comment box stays pinned to the card's
@@ -290,21 +450,69 @@ impl TodoApp {
                 // Enter posts, Shift+Enter adds a newline.
                 let input_id = ui.make_persistent_id(("comment_input", slot));
                 let draft = &mut self.comment_drafts[slot];
+                let blocking = &mut self.comment_blocking[slot];
                 let submit = ui.memory(|m| m.has_focus(input_id))
                     && ui.input_mut(|i| {
                         !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter)
                     });
-                ui.add(
-                    TextEdit::multiline(draft)
-                        .id(input_id)
-                        .hint_text("Add a comment… (Enter to post)")
-                        .background_color(visuals.faint_bg_color)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                );
+                // In a bottom-up layout a row only reserves its initial height and
+                // then grows downward past the card's edge, so reserve the comment
+                // box's height up front: 2 to 6 lines, as measured last frame.
+                let line = ui.text_style_height(&TextStyle::Body);
+                let min_height = 2.0 * line + COMMENT_INPUT_MARGIN.sum().y;
+                let max_height = 6.0 * line + COMMENT_INPUT_MARGIN.sum().y;
+                let height_id = input_id.with("height");
+                let row_height = ui
+                    .data(|d| d.get_temp::<f32>(height_id))
+                    .unwrap_or(min_height);
+                let row = Vec2::new(ui.available_width(), row_height);
+                ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Min), |ui| {
+                    let label = if *blocking {
+                        RichText::new("⛔ Blocking").small().strong()
+                    } else {
+                        RichText::new("Block").small()
+                    };
+                    // Fixed width so the input doesn't shift when toggling.
+                    let toggle = Button::selectable(*blocking, label)
+                        .frame_when_inactive(true)
+                        .min_size(Vec2::new(78.0, 0.0));
+                    if ui
+                        .add(toggle)
+                        .on_hover_text("Post as blocking: the task stays blocked until resolved")
+                        .clicked()
+                    {
+                        *blocking = !*blocking;
+                    }
+                    let hint = if *blocking {
+                        "Describe what you're waiting for… (Enter to post)"
+                    } else {
+                        "Add a comment… (Enter to post)"
+                    };
+                    let edit = ScrollArea::vertical()
+                        .id_salt(("comment_input_scroll", slot))
+                        .max_height(max_height)
+                        .show(ui, |ui| {
+                            ui.add(
+                                TextEdit::multiline(draft)
+                                    .id(input_id)
+                                    .hint_text(hint)
+                                    .background_color(visuals.faint_bg_color)
+                                    .margin(COMMENT_INPUT_MARGIN)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        })
+                        .inner;
+                    let height = edit.rect.height().clamp(min_height, max_height);
+                    if (height - row_height).abs() > 0.5 {
+                        ui.data_mut(|d| d.insert_temp(height_id, height));
+                        ui.ctx().request_discard("comment box resized");
+                    }
+                });
                 if submit && !draft.trim().is_empty() {
-                    task.add_note(draft, now);
+                    task.add_note(draft, *blocking, now);
                     draft.clear();
+                    *blocking = false;
                     self.dirty = true;
                 }
                 ui.add_space(4.0);
@@ -319,24 +527,95 @@ impl TodoApp {
                                 ui.weak("No comments yet.");
                             }
                             for (idx, note) in task.notes.iter().enumerate() {
+                                let id = task.id;
+                                let frame = match note.blocker {
+                                    // Highlighted with a glow painted below.
+                                    Some(Blocker::Open) => Frame::new(),
+                                    Some(Blocker::Resolved { .. }) => {
+                                        Frame::new().stroke(Stroke::new(
+                                            1.0,
+                                            visuals.widgets.noninteractive.bg_stroke.color,
+                                        ))
+                                    }
+                                    None => Frame::new(),
+                                }
+                                .corner_radius(COMMENT_RADIUS)
+                                .inner_margin(Margin::symmetric(6, 4));
+                                // The click sense sits below the comment's buttons, so they
+                                // still get their clicks.
                                 let entry = ui
-                                    .scope(|ui| {
-                                        ui.label(RichText::new(local_time(note.at)).small().weak());
-                                        ui.add(Label::new(&note.text).wrap());
+                                    .scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
+                                        let hovered = ui.response().contains_pointer();
+                                        let glow = ui.painter().add(Shape::Noop);
+                                        let shown = frame.show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            comment(ui, note, idx, id, hovered, actions);
+                                        });
+                                        if note.is_open_blocker() {
+                                            ui.painter().set(
+                                                glow,
+                                                inner_glow(
+                                                    shown.response.rect,
+                                                    COMMENT_RADIUS,
+                                                    COMMENT_GLOW_WIDTH,
+                                                    blocked_glow_color(&visuals),
+                                                ),
+                                            );
+                                        }
                                     })
-                                    .response
-                                    .interact(Sense::click());
+                                    .response;
                                 entry.context_menu(|ui| {
+                                    match note.blocker {
+                                        Some(Blocker::Open) => {
+                                            if ui.button("Resolve").clicked() {
+                                                actions.push(Action::Resolve(id, idx));
+                                            }
+                                            if ui.button("Not blocking").clicked() {
+                                                actions.push(Action::Unblock(id, idx));
+                                            }
+                                        }
+                                        Some(Blocker::Resolved { .. }) => {
+                                            if ui.button("Reopen blocker").clicked() {
+                                                actions.push(Action::MarkBlocking(id, idx));
+                                            }
+                                            if ui.button("Not blocking").clicked() {
+                                                actions.push(Action::Unblock(id, idx));
+                                            }
+                                        }
+                                        None => {
+                                            if ui.button("Mark as blocking").clicked() {
+                                                actions.push(Action::MarkBlocking(id, idx));
+                                            }
+                                        }
+                                    }
                                     if ui.button("Delete").clicked() {
-                                        actions.push(Action::DeleteNote(task.id, idx));
+                                        actions.push(Action::DeleteNote(id, idx));
                                     }
                                 });
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
                             }
                         });
                     });
             });
         });
+        if has_task {
+            let rect = zone.response.rect;
+            let mut shapes = vec![Shape::rect_filled(
+                rect,
+                CARD_RADIUS,
+                visuals.extreme_bg_color,
+            )];
+            if blocked {
+                let inside = rect.shrink(stroke.width);
+                shapes.push(inner_glow(
+                    inside,
+                    CARD_RADIUS - stroke.width,
+                    CARD_GLOW_WIDTH,
+                    blocked_glow_color(&visuals),
+                ));
+            }
+            ui.painter().set(background, Shape::Vec(shapes));
+        }
         if let Some(id) = dropped {
             actions.push(Action::FocusInto(slot, *id));
         }

@@ -256,14 +256,17 @@ fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
     )
 }
 
-/// One entry of a card's comment log: timestamp/blocker line, then the text.
-/// `hovered` reveals the star and "mark as blocking" buttons.
+/// One entry of a card's comment log: timestamp/blocker line, then the text,
+/// or a text box while `edit` is being written. `hovered` reveals the star,
+/// edit and "mark as blocking" buttons.
+#[allow(clippy::too_many_arguments)]
 fn comment(
     ui: &mut egui::Ui,
     note: &Note,
     idx: usize,
     task_id: u64,
     hovered: bool,
+    edit: Option<&mut NoteEdit>,
     now: DateTime<Utc>,
     actions: &mut Vec<Action>,
 ) {
@@ -319,6 +322,12 @@ fn comment(
             if star.clicked() {
                 actions.push(Action::ToggleStar(task_id, idx));
             }
+            let edit_button = ui
+                .add_visible(hovered && edit.is_none(), Button::new("Edit").small())
+                .on_hover_text("Edit this comment");
+            if edit_button.clicked() {
+                actions.push(Action::StartEdit(task_id, idx));
+            }
             match note.blocker {
                 Some(Blocker::Open) => {
                     if ui
@@ -341,6 +350,10 @@ fn comment(
             }
         });
     });
+    if let Some(edit) = edit {
+        edit_box(ui, edit, actions);
+        return;
+    }
     let job = match &note.action {
         Some(action) => action_job(action, note, ui),
         None => {
@@ -350,6 +363,46 @@ fn comment(
         }
     };
     ui.add(Label::new(job).wrap());
+}
+
+/// Editing a comment: Enter saves, Shift+Enter adds a newline, Escape cancels.
+fn edit_box(ui: &mut egui::Ui, edit: &mut NoteEdit, actions: &mut Vec<Action>) {
+    let id = ui.make_persistent_id(("edit_note", edit.task_id, edit.idx));
+    let save = ui.memory(|m| m.has_focus(id))
+        && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter));
+    // Checked regardless of focus: egui drops the text box's focus on Escape
+    // before we get to see it. Only one comment is edited at a time.
+    let cancel = ui.input(|i| i.key_pressed(Key::Escape));
+    if save {
+        actions.push(Action::SaveEdit);
+    } else if cancel {
+        actions.push(Action::CancelEdit);
+    }
+    let response = ui.add(
+        TextEdit::multiline(&mut edit.text)
+            .id(id)
+            .background_color(comment_input_bg(ui.visuals()))
+            .margin(COMMENT_INPUT_MARGIN)
+            .desired_rows(1)
+            .desired_width(f32::INFINITY),
+    );
+    if !edit.focus_requested {
+        response.request_focus();
+        edit.focus_requested = true;
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Save").clicked() {
+            actions.push(Action::SaveEdit);
+        }
+        if ui.small_button("Cancel").clicked() {
+            actions.push(Action::CancelEdit);
+        }
+        ui.label(
+            RichText::new("Enter to save · Shift+Enter for a new line")
+                .small()
+                .weak(),
+        );
+    });
 }
 
 fn log_heading(page: &LogPage, period: Period) -> String {
@@ -409,6 +462,14 @@ struct NewTaskDraft {
     focus_requested: bool,
 }
 
+/// A comment being edited in place.
+struct NoteEdit {
+    task_id: u64,
+    idx: usize,
+    text: String,
+    focus_requested: bool,
+}
+
 /// Changes requested while drawing, applied once drawing is done so we don't
 /// mutate the board while iterating over it.
 enum Action {
@@ -421,6 +482,9 @@ enum Action {
     Resolve(u64, usize),
     Unblock(u64, usize),
     ToggleStar(u64, usize),
+    StartEdit(u64, usize),
+    SaveEdit,
+    CancelEdit,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -437,6 +501,7 @@ pub struct TodoApp {
     comment_drafts: [String; SLOT_COUNT],
     /// What posting from each card's comment box does.
     comment_kind: [MessageKind; SLOT_COUNT],
+    editing: Option<NoteEdit>,
     view: View,
     log_period: Period,
     log_starred_only: bool,
@@ -453,6 +518,7 @@ impl TodoApp {
             new_task: None,
             comment_drafts: Default::default(),
             comment_kind: [MessageKind::Comment; SLOT_COUNT],
+            editing: None,
             view: View::Board,
             log_period: Period::Day,
             log_starred_only: false,
@@ -469,11 +535,16 @@ impl TodoApp {
                 }
                 Action::FocusInto(slot, id) => self.board.focus_into(slot, id),
                 Action::Unfocus(slot) => self.board.unfocus(slot),
-                Action::Delete(id) => self.board.delete_task(id),
+                Action::Delete(id) => {
+                    self.board.delete_task(id);
+                    self.editing.take_if(|e| e.task_id == id);
+                }
                 Action::DeleteNote(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
                         task.delete_note(idx);
                     }
+                    // The indices after it have shifted.
+                    self.editing.take_if(|e| e.task_id == id);
                 }
                 Action::MarkBlocking(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
@@ -495,6 +566,23 @@ impl TodoApp {
                         task.toggle_star(idx);
                     }
                 }
+                Action::StartEdit(id, idx) => {
+                    let note = self.board.task(id).and_then(|t| t.notes.get(idx));
+                    self.editing = note.map(|note| NoteEdit {
+                        task_id: id,
+                        idx,
+                        text: note.text.clone(),
+                        focus_requested: false,
+                    });
+                }
+                Action::SaveEdit => {
+                    if let Some(edit) = self.editing.take()
+                        && let Some(task) = self.board.task_mut(edit.task_id)
+                    {
+                        task.edit_note(edit.idx, &edit.text, now);
+                    }
+                }
+                Action::CancelEdit => self.editing = None,
             }
             self.dirty = true;
         }
@@ -830,6 +918,10 @@ impl TodoApp {
                             }
                             for (idx, note) in task.notes.iter().enumerate() {
                                 let id = task.id;
+                                let edit = self
+                                    .editing
+                                    .as_mut()
+                                    .filter(|e| e.task_id == id && e.idx == idx);
                                 let frame = match note.blocker {
                                     // Highlighted with a glow painted below.
                                     Some(Blocker::Open) => Frame::new(),
@@ -851,7 +943,7 @@ impl TodoApp {
                                         let glow = ui.painter().add(Shape::Noop);
                                         let shown = frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            comment(ui, note, idx, id, hovered, now, actions);
+                                            comment(ui, note, idx, id, hovered, edit, now, actions);
                                         });
                                         if note.is_open_blocker() {
                                             ui.painter().set(
@@ -889,6 +981,9 @@ impl TodoApp {
                                                 actions.push(Action::MarkBlocking(id, idx));
                                             }
                                         }
+                                    }
+                                    if ui.button("Edit").clicked() {
+                                        actions.push(Action::StartEdit(id, idx));
                                     }
                                     let star = if note.starred { "Unstar" } else { "Star" };
                                     if ui.button(star).clicked() {

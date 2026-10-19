@@ -189,6 +189,18 @@ impl Task {
         self.touch(now);
     }
 
+    /// Replace a comment's text. Blank text is ignored.
+    pub fn edit_note(&mut self, idx: usize, text: &str, now: DateTime<Utc>) {
+        let text = text.trim();
+        if let Some(note) = self.notes.get_mut(idx)
+            && !text.is_empty()
+            && note.text != text
+        {
+            note.text = text.to_owned();
+            self.touch(now);
+        }
+    }
+
     /// What the comment box offers for this task, the default first.
     pub fn message_kinds(&self) -> Vec<MessageKind> {
         let mut kinds = vec![MessageKind::Comment];
@@ -657,6 +669,23 @@ mod tests {
         );
         assert_eq!(headline("Title\nbody"), "Title");
         assert_eq!(headline("just this"), "just this");
+    }
+
+    #[test]
+    fn edit_note_replaces_text_and_touches() {
+        let mut b = board_with(1);
+        let t0 = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.post("frist", MessageKind::Comment, t0);
+        let later = t0 + TimeDelta::hours(1);
+        t.edit_note(0, "   ", later);
+        t.edit_note(3, "nope", later);
+        assert_eq!(t.notes[0].text, "frist");
+        assert_eq!(t.updated_at, t0);
+        t.edit_note(0, " first\nwith details ", later);
+        assert_eq!(t.notes[0].text, "first\nwith details");
+        assert_eq!(t.notes[0].at, t0);
+        assert_eq!(t.updated_at, later);
     }
 
     #[test]

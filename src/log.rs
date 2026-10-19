@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone, Utc};
 
-use crate::model::{Blocker, Board, Note, NoteAction};
+use crate::model::{Blocker, Board, Note, NoteAction, headline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period {
@@ -71,7 +71,8 @@ fn note_entries(note: &Note) -> Vec<Entry> {
     };
     match (&note.action, note.unblocked_after()) {
         (Some(NoteAction::Unblocked { quote, .. }), Some(after)) => {
-            let quote = quote.clone();
+            // Only a multi-line blocker's title is quoted.
+            let quote = headline(quote).to_owned();
             return vec![entry(note.at, EntryKind::Resolved { quote, after })];
         }
         (Some(NoteAction::Closed), _) => return vec![entry(note.at, EntryKind::Closed)],
@@ -282,7 +283,11 @@ mod tests {
         let mut b = Board::default();
         let id = b.add_task("C".into(), "", at(12, 9));
         let t = b.task_mut(id).unwrap();
-        t.post("need access", MessageKind::Block, at(12, 10));
+        t.post(
+            "need access\nto the prod db",
+            MessageKind::Block,
+            at(12, 10),
+        );
         t.post("got access", MessageKind::Unblock, at(12, 15));
         t.post("shipped", MessageKind::Close, at(12, 16));
         let pages = build(&b, Period::Day, false, &Utc);

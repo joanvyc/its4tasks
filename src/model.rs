@@ -272,6 +272,23 @@ fn legacy_notes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Note>, D::Error> 
     })
 }
 
+/// A multi-line comment's first line is its title: `(Some(title), rest)`.
+/// A single-line comment has no title: `(None, text)`.
+pub fn split_title(text: &str) -> (Option<&str>, &str) {
+    match text.split_once('\n') {
+        Some((title, body)) if !body.trim().is_empty() => (Some(title.trim_end()), body),
+        _ => (None, text.trim_end()),
+    }
+}
+
+/// How a comment is referred to elsewhere: its title, or all of it if it's one line.
+pub fn headline(text: &str) -> &str {
+    match split_title(text) {
+        (Some(title), _) => title,
+        (None, text) => text,
+    }
+}
+
 /// Compact duration: `45m`, `5h`, `1d 4h`, `12d`.
 pub fn short_duration(d: TimeDelta) -> String {
     let (days, hours, minutes) = (d.num_days(), d.num_hours() % 24, d.num_minutes());
@@ -628,6 +645,18 @@ mod tests {
         // Nothing left to resolve: a plain comment.
         t.post("extra", MessageKind::Unblock, later);
         assert_eq!(t.notes[4].action, None);
+    }
+
+    #[test]
+    fn first_line_is_a_title_only_when_more_lines_follow() {
+        assert_eq!(split_title("one line"), (None, "one line"));
+        assert_eq!(split_title("one line\n  \n"), (None, "one line"));
+        assert_eq!(
+            split_title("Title \nbody\nmore"),
+            (Some("Title"), "body\nmore")
+        );
+        assert_eq!(headline("Title\nbody"), "Title");
+        assert_eq!(headline("just this"), "just this");
     }
 
     #[test]

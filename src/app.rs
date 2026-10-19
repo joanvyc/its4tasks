@@ -10,8 +10,8 @@ use eframe::egui::{
 
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
-    Blocker, Board, MessageKind, Note, NoteAction, SLOT_COUNT, Task, TaskState, matches_filter,
-    short_duration, staleness,
+    Blocker, Board, MessageKind, Note, NoteAction, SLOT_COUNT, Task, TaskState, headline,
+    matches_filter, short_duration, split_title, staleness,
 };
 use crate::storage;
 
@@ -203,6 +203,18 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
+/// A comment's text, with the title of a multi-line comment in bold.
+fn append_comment(job: &mut LayoutJob, text: &str, color: Color32, ui: &egui::Ui) {
+    let font = TextStyle::Body.resolve(ui.style());
+    let (title, body) = split_title(text);
+    if let Some(title) = title {
+        let bold_font = FontId::new(font.size, bold());
+        job.append(title, 0.0, TextFormat::simple(bold_font, color));
+        job.append("\n", 0.0, TextFormat::simple(font.clone(), color));
+    }
+    job.append(body, 0.0, TextFormat::simple(font, color));
+}
+
 /// An Unblock or Close message: a green marker saying what it did, then the text.
 fn action_job(action: &NoteAction, note: &Note, ui: &egui::Ui) -> LayoutJob {
     let font = TextStyle::Body.resolve(ui.style());
@@ -210,14 +222,14 @@ fn action_job(action: &NoteAction, note: &Note, ui: &egui::Ui) -> LayoutJob {
     let marker = match (action, note.unblocked_after()) {
         (NoteAction::Unblocked { quote, .. }, Some(after)) => format!(
             "✔ Resolved \"{}\", after {} with message: ",
-            truncate(quote, QUOTE_CHARS),
+            truncate(headline(quote), QUOTE_CHARS),
             short_duration(after)
         ),
         _ => "✔ Closed with message: ".to_owned(),
     };
     let mut job = LayoutJob::default();
     job.append(&marker, 0.0, format(palette(ui.visuals()).resolved));
-    job.append(&note.text, 0.0, format(ui.visuals().text_color()));
+    append_comment(&mut job, &note.text, ui.visuals().text_color(), ui);
     job
 }
 
@@ -329,10 +341,15 @@ fn comment(
             }
         });
     });
-    match &note.action {
-        Some(action) => ui.add(Label::new(action_job(action, note, ui)).wrap()),
-        None => ui.add(Label::new(&note.text).wrap()),
+    let job = match &note.action {
+        Some(action) => action_job(action, note, ui),
+        None => {
+            let mut job = LayoutJob::default();
+            append_comment(&mut job, &note.text, ui.visuals().text_color(), ui);
+            job
+        }
     };
+    ui.add(Label::new(job).wrap());
 }
 
 fn log_heading(page: &LogPage, period: Period) -> String {
@@ -380,7 +397,7 @@ fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
     if let Some(marker) = marker {
         job.append(&marker, 0.0, format(color));
     }
-    job.append(&entry.text, 0.0, format(normal));
+    append_comment(&mut job, &entry.text, normal, ui);
     job
 }
 

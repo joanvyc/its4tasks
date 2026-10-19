@@ -3,7 +3,7 @@ use std::{iter, sync::Arc, time::Duration};
 use chrono::{DateTime, Datelike, Local, TimeDelta, Utc};
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, ComboBox, FontData, FontDefinitions, FontFamily,
-    FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Rect, RichText,
+    FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Popup, Rect, RichText,
     ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, TextFormat, TextStyle, Theme,
     UiBuilder, Vec2, Visuals, text::LayoutJob,
 };
@@ -122,6 +122,53 @@ fn comment_input_bg(visuals: &Visuals) -> Color32 {
     } else {
         Color32::from_gray(238)
     }
+}
+
+/// A "⋯" button opening the task's menu. Shown when `visible` or while the
+/// menu is open; otherwise its space is kept empty so nothing shifts. The dots
+/// are painted so they sit on the row's center line, like the focus dot.
+fn task_menu(ui: &mut egui::Ui, task_id: u64, visible: bool, actions: &mut Vec<Action>) {
+    let id = ui.make_persistent_id(("task_menu", task_id));
+    let open = Popup::is_id_open(ui.ctx(), id.with("popup"));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(20.0, 16.0), Sense::hover());
+    if !visible && !open {
+        return;
+    }
+    let response = ui.interact(rect, id, Sense::click());
+    let visuals = ui.visuals();
+    let active = response.hovered() || open;
+    if active {
+        let fill = visuals.widgets.hovered.weak_bg_fill;
+        ui.painter().rect_filled(rect, 3.0, fill);
+    }
+    let color = if active {
+        visuals.strong_text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    for dx in [-4.0, 0.0, 4.0] {
+        let center = rect.center() + Vec2::new(dx, 0.0);
+        ui.painter().circle_filled(center, 1.5, color);
+    }
+    let response = response.on_hover_text("More");
+    Popup::menu(&response).show(|ui| {
+        if ui.button("Delete…").clicked() {
+            actions.push(Action::Delete(task_id));
+        }
+    });
+}
+
+/// What the delete confirmation says will go.
+fn delete_prompt(task: &Task) -> String {
+    let what = match task.notes.len() {
+        0 => String::new(),
+        1 => " and its comment".to_owned(),
+        n => format!(" and its {n} comments"),
+    };
+    format!(
+        "\"{}\"{what} will be deleted. This can't be undone.",
+        task.title
+    )
 }
 
 /// An on/off switch whose track turns `on_color` when on.
@@ -476,6 +523,7 @@ enum Action {
     Focus(u64),
     FocusInto(usize, u64),
     Unfocus(usize),
+    /// Ask for confirmation, then delete.
     Delete(u64),
     DeleteNote(u64, usize),
     MarkBlocking(u64, usize),
@@ -497,6 +545,8 @@ pub struct TodoApp {
     board: Board,
     filter: String,
     new_task: Option<NewTaskDraft>,
+    /// The task waiting for the user to confirm its deletion.
+    confirm_delete: Option<u64>,
     /// Unsent comment text for each focus card.
     comment_drafts: [String; SLOT_COUNT],
     /// What posting from each card's comment box does.
@@ -516,6 +566,7 @@ impl TodoApp {
             board: storage::load(),
             filter: String::new(),
             new_task: None,
+            confirm_delete: None,
             comment_drafts: Default::default(),
             comment_kind: [MessageKind::Comment; SLOT_COUNT],
             editing: None,
@@ -535,10 +586,7 @@ impl TodoApp {
                 }
                 Action::FocusInto(slot, id) => self.board.focus_into(slot, id),
                 Action::Unfocus(slot) => self.board.unfocus(slot),
-                Action::Delete(id) => {
-                    self.board.delete_task(id);
-                    self.editing.take_if(|e| e.task_id == id);
-                }
+                Action::Delete(id) => self.confirm_delete = Some(id),
                 Action::DeleteNote(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
                         task.delete_note(idx);
@@ -660,6 +708,7 @@ impl TodoApp {
                     // every widget (and the nested layouts) the same center line.
                     let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y + 4.0);
                     ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+                        let row_hovered = ui.rect_contains_pointer(ui.max_rect());
                         let color = if task.done {
                             ui.visuals().weak_text_color()
                         } else {
@@ -696,6 +745,8 @@ impl TodoApp {
                                     actions.push(Action::Focus(id));
                                 }
                             }
+                            // Always laid out, so titles don't reflow on hover.
+                            task_menu(ui, id, row_hovered, actions);
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 let mut text = RichText::new(&task.title);
                                 if task.done {
@@ -708,7 +759,7 @@ impl TodoApp {
                                     .response
                                     .on_hover_text("Drag onto a card to focus");
                                 label.context_menu(|ui| {
-                                    if ui.button("Delete").clicked() {
+                                    if ui.button("Delete…").clicked() {
                                         actions.push(Action::Delete(id));
                                     }
                                 });
@@ -786,6 +837,7 @@ impl TodoApp {
                     {
                         actions.push(Action::Unfocus(slot));
                     }
+                    task_menu(ui, task.id, true, actions);
                     let title = TextEdit::singleline(&mut task.title)
                         .font(TextStyle::Heading)
                         .frame(Frame::NONE)
@@ -1108,6 +1160,42 @@ impl TodoApp {
         });
     }
 
+    fn delete_modal(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.confirm_delete.and_then(|id| self.board.task(id)) else {
+            self.confirm_delete = None;
+            return;
+        };
+        let id = task.id;
+        let prompt = delete_prompt(task);
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = Modal::new(Id::unique("delete_task_modal")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Delete task?");
+            ui.add_space(8.0);
+            ui.add(Label::new(prompt).wrap());
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let text = RichText::new("Delete").color(Color32::WHITE);
+                let delete = Button::new(text).fill(palette(ui.visuals()).blocker);
+                if ui.add(delete).clicked() {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if confirm {
+            self.board.delete_task(id);
+            self.editing.take_if(|e| e.task_id == id);
+            self.confirm_delete = None;
+            self.dirty = true;
+        } else if cancel || modal.should_close() {
+            self.confirm_delete = None;
+        }
+    }
+
     fn new_task_modal(&mut self, ctx: &egui::Context) {
         let has_free_slot = self.board.has_free_slot();
         let Some(draft) = &mut self.new_task else {
@@ -1187,6 +1275,7 @@ impl eframe::App for TodoApp {
             }
         });
         self.new_task_modal(&ui.ctx().clone());
+        self.delete_modal(&ui.ctx().clone());
         self.apply(actions);
         self.save_if_dirty();
         // Keep the freshness colors drifting while the app sits idle.

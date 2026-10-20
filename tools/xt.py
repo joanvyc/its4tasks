@@ -1,4 +1,4 @@
-"""Drive the focal X window: xt.py id | move X Y | click X Y [button] | type TEXT | key NAME [shift] | shot PATH
+"""Drive the its4tasks X window: xt.py id | move X Y | click X Y [button] | type TEXT | key NAME [shift] | shot PATH
 
 Coordinates are relative to the window (same as a `shot` image).
 """
@@ -43,9 +43,9 @@ def find(win, name):
     return None
 
 
-win = find(root, b"focal")
+win = find(root, b"its4tasks")
 if not win:
-    sys.exit("focal window not found")
+    sys.exit("its4tasks window not found")
 
 
 def origin():

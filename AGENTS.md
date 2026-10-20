@@ -1,6 +1,6 @@
-# Agent notes for focal
+# Agent notes for its4tasks
 
-focal is an egui/eframe desktop todo app: four focus cards plus a task list, with a daily/weekly log view. The code is in `src/`:
+its4tasks is an egui/eframe desktop todo app: four focus cards plus a task list, with a daily/weekly log view. The code is in `src/`:
 - `model.rs`: data and rules
 - `log.rs`: log grouping
 - `app.rs`: UI
@@ -18,7 +18,7 @@ Keep logic in `model.rs`/`log.rs`, where it can be unit-tested, rather than in `
 
 Any change that affects what's on screen (layout, colors, new widgets) must be checked by running the app and looking at screenshots. Passing tests is not enough. egui layout bugs only show up on screen, for example a row that grows past its card's edge or widgets that aren't centered. Use the helpers in `tools/`.
 
-1. **Never touch the user's real data.** It lives in `~/.local/share/focal/board.json`. Point `XDG_DATA_HOME` at a temporary directory and seed it with sample data:
+1. **Never touch the user's real data.** It lives in `~/.local/share/its4tasks/board.json` (or in `~/.local/share/focal/board.json` until the first launch after the rename moves it). Point `XDG_DATA_HOME` at a temporary directory and seed it with sample data:
    ```sh
    DATA=$(mktemp -d)
    python3 tools/seed_board.py "$DATA"
@@ -28,7 +28,8 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
 2. **Run the app under XWayland so X11 tools can see it.** `import` and `tools/xt.py` only work with X11 windows.
    ```sh
    cargo build
-   env -u WAYLAND_DISPLAY XDG_DATA_HOME="$DATA" ./target/debug/focal &
+   env -u WAYLAND_DISPLAY XDG_DATA_HOME="$DATA" ./target/debug/its4tasks &
+   APP=$!
    sleep 2.5
    ```
 
@@ -49,7 +50,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    ```
    The first pointer event after launch only tells egui where the pointer is. Move the pointer once before testing hover.
 
-5. **Rebuild before each look, and stop the app when done.** `cargo clippy` doesn't produce a new binary, so run `cargo build` before relaunching. When finished, run `pkill -x focal`.
+5. **Rebuild before each look, and stop the app when done.** `cargo clippy` doesn't produce a new binary, so run `cargo build` before relaunching. When finished, run `kill $APP`. Don't use `pkill`: the user may have their real instance open.
 
 Check for:
 - overlapping or clipped widgets

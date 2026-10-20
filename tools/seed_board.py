@@ -1,6 +1,6 @@
-"""Write a sample focal board for visual testing: seed_board.py DATA_HOME
+"""Write a sample its4tasks board for visual testing: seed_board.py DATA_HOME
 
-Creates DATA_HOME/focal/board.json with ~12 days of history relative to now:
+Creates DATA_HOME/its4tasks/board.json with ~12 days of history relative to now:
 an open blocker, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, a done task closed
 with a message, tasks of different freshness, and subtasks: a parent blocked
@@ -80,7 +80,7 @@ for i, t in enumerate(tasks):
     t["id"] = i
     t.setdefault("done", False)
 
-path = pathlib.Path(sys.argv[1]) / "focal" / "board.json"
+path = pathlib.Path(sys.argv[1]) / "its4tasks" / "board.json"
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps({"tasks": tasks, "slots": [0, 6, 2, 7], "next_id": len(tasks)}, indent=1))
 print(path)

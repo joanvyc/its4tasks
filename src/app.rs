@@ -759,7 +759,7 @@ impl TodoApp {
             return;
         }
         if let Err(e) = storage::save(&self.board) {
-            eprintln!("focal: failed to save: {e}");
+            eprintln!("its4tasks: failed to save: {e}");
         }
         self.dirty = false;
     }

@@ -6,11 +6,15 @@ use its4tasks::api::{ApiError, Change, Outcome};
 use its4tasks::client::{Client, ClientError};
 use its4tasks::model::MessageKind;
 use its4tasks_server::api::Api;
+use its4tasks_server::auth::Auth;
 use its4tasks_server::server::serve;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 const WAIT: Duration = Duration::from_secs(5);
+
+/// The local app's secret, which the test servers trust.
+const SECRET: &str = "test-secret";
 
 /// Serves an unsaved board on a free port, for as long as the test runs.
 fn start() -> String {
@@ -23,7 +27,15 @@ fn start() -> String {
         rt.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(listener.local_addr().unwrap()).unwrap();
-            serve(listener, Api::new()).await.unwrap();
+            serve(
+                listener,
+                Api::new(),
+                Auth::Local {
+                    secret: SECRET.into(),
+                },
+            )
+            .await
+            .unwrap();
         });
     });
     format!("http://{}", rx.recv().unwrap())
@@ -31,7 +43,7 @@ fn start() -> String {
 
 /// A client that has the server's board.
 fn client(url: &str) -> Client {
-    let mut client = Client::new(url, WAIT, || {});
+    let mut client = Client::new(url, Some(SECRET.into()), WAIT, || {});
     assert!(client.flush(WAIT));
     client
 }
@@ -125,7 +137,7 @@ fn a_missing_server_undoes_changes() {
         .local_addr()
         .unwrap()
         .port();
-    let mut a = Client::new(&format!("http://127.0.0.1:{port}"), WAIT, || {});
+    let mut a = Client::new(&format!("http://127.0.0.1:{port}"), None, WAIT, || {});
     assert!(a.flush(WAIT));
     assert!(a.error().is_some());
     let id = add(&mut a, "offline");
@@ -144,7 +156,7 @@ fn a_hanging_server_times_out() {
         let held: Vec<_> = listener.incoming().collect();
         drop(held);
     });
-    let mut a = Client::new(&url, Duration::from_millis(300), || {});
+    let mut a = Client::new(&url, None, Duration::from_millis(300), || {});
     let id = add(&mut a, "slow");
     assert!(a.board().task(id).is_some(), "shown without waiting");
     assert!(a.flush(WAIT));

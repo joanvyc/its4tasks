@@ -18,7 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use web_time::Instant;
 
-use crate::api::{self, ApiError, Applied, Change, Outcome, Rejected, apply_change};
+use crate::api::{self, ApiError, Applied, BoardView, Change, Outcome, Rejected, apply_change};
 use crate::model::Board;
 
 /// Where the native GUI looks for the server unless `$ITS4TASKS_SERVER`
@@ -58,7 +58,7 @@ enum Request {
 enum Response {
     /// The server's answer to a change, or why there was none.
     Sent(u64, Result<Answer, String>),
-    Fetched(Result<Board, ClientError>),
+    Fetched(Result<BoardView, ClientError>),
 }
 
 enum Answer {
@@ -77,6 +77,9 @@ struct Pending {
 pub struct Client {
     /// Where the API is: the server's address, or "" for the page's own.
     url: String,
+    /// Sent as `Authorization: Bearer`. The browser sends its session
+    /// cookie instead.
+    token: Option<String>,
     timeout: Duration,
     /// Called when an answer arrives, for `poll`.
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -91,6 +94,9 @@ pub struct Client {
     pending: VecDeque<Pending>,
     /// `confirmed` with `pending` applied: what the GUI shows.
     board: Board,
+    /// Whether the user has a board yet: new users choose to start one or
+    /// import one.
+    started: bool,
     next_seq: u64,
     fetching: bool,
     fetched: Instant,
@@ -110,15 +116,22 @@ impl Client {
         } else {
             std::env::var("ITS4TASKS_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_owned())
         };
-        Client::new(&url, TIMEOUT, wake)
+        Client::new(&url, None, TIMEOUT, wake)
     }
 
-    /// Connects to the server at `url` and starts fetching the board, which
-    /// is empty until it arrives.
-    pub fn new(url: &str, timeout: Duration, wake: impl Fn() + Send + Sync + 'static) -> Client {
+    /// Connects to the server at `url`, signed in with the bearer `token`
+    /// (the browser signs in with its cookie instead), and starts fetching
+    /// the board, which is empty until it arrives.
+    pub fn new(
+        url: &str,
+        token: Option<String>,
+        timeout: Duration,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Client {
         let (answer_to, answers) = mpsc::channel();
         let mut client = Client {
             url: url.trim_end_matches('/').to_owned(),
+            token,
             timeout,
             wake: Arc::new(wake),
             queue: VecDeque::new(),
@@ -128,6 +141,7 @@ impl Client {
             confirmed: Board::default(),
             pending: VecDeque::new(),
             board: Board::default(),
+            started: true,
             next_seq: 0,
             fetching: false,
             fetched: Instant::now(),
@@ -140,6 +154,11 @@ impl Client {
 
     pub fn board(&self) -> &Board {
         &self.board
+    }
+
+    /// False for a new user, until they start a board or import one.
+    pub fn started(&self) -> bool {
+        self.started
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -164,6 +183,8 @@ impl Client {
             at,
         });
         self.send(Request::Send(seq, change));
+        // The server counts any change as starting the board.
+        self.started = true;
         Ok(outcome)
     }
 
@@ -232,17 +253,17 @@ impl Client {
             let _ = answer_to.send(response);
             wake();
         };
-        let timeout = self.timeout;
+        let (timeout, token) = (self.timeout, self.token.clone());
         match request {
             Request::Fetch => {
                 let url = format!("{}/api/board", self.url);
-                call(url, None, timeout, move |reply| {
+                call(url, None, token, timeout, move |reply| {
                     answer(Response::Fetched(board_from(reply)));
                 });
             }
             Request::Send(seq, change) => {
                 let url = format!("{}/api/changes", self.url);
-                call(url, Some(change), timeout, move |reply| {
+                call(url, Some(change), token, timeout, move |reply| {
                     answer(Response::Sent(seq, answer_from(reply)));
                 });
             }
@@ -280,8 +301,9 @@ impl Client {
             Response::Fetched(result) => {
                 self.fetching = false;
                 match result {
-                    Ok(board) => {
-                        self.confirmed = board;
+                    Ok(view) => {
+                        self.confirmed = view.board;
+                        self.started = view.started || !self.pending.is_empty();
                         self.error = None;
                     }
                     Err(e) => self.error = Some(e.to_string()),
@@ -314,12 +336,13 @@ impl Reply {
     }
 }
 
-/// GETs `url`, or POSTs `change` to it as JSON, and hands the reply to
-/// `done` on another thread.
+/// GETs `url`, or POSTs `change` to it as JSON, with `token` as the bearer
+/// token, and hands the reply to `done` on another thread.
 #[cfg(not(target_arch = "wasm32"))]
 fn call(
     url: String,
     change: Option<Change>,
+    token: Option<String>,
     timeout: Duration,
     done: impl FnOnce(Result<Reply, String>) + Send + 'static,
 ) {
@@ -329,9 +352,22 @@ fn call(
             .http_status_as_error(false)
             .build()
             .into();
+        let bearer = token.map(|t| format!("Bearer {t}"));
         let response = match change {
-            None => agent.get(&url).call(),
-            Some(change) => agent.post(&url).send_json(&change),
+            None => {
+                let request = agent.get(&url);
+                match &bearer {
+                    Some(b) => request.header("Authorization", b).call(),
+                    None => request.call(),
+                }
+            }
+            Some(change) => {
+                let request = agent.post(&url);
+                match &bearer {
+                    Some(b) => request.header("Authorization", b).send_json(&change),
+                    None => request.send_json(&change),
+                }
+            }
         };
         let reply = response.and_then(|mut response| {
             let status = response.status().as_u16();
@@ -343,11 +379,13 @@ fn call(
 }
 
 /// GETs `url`, or POSTs `change` to it as JSON, with the browser's
-/// `fetch()`, and hands the reply to `done` when it arrives.
+/// `fetch()`, and hands the reply to `done` when it arrives. The browser
+/// sends the session cookie, so there's no token.
 #[cfg(target_arch = "wasm32")]
 fn call(
     url: String,
     change: Option<Change>,
+    _token: Option<String>,
     _timeout: Duration,
     done: impl FnOnce(Result<Reply, String>) + Send + 'static,
 ) {
@@ -363,7 +401,7 @@ fn call(
     });
 }
 
-fn board_from(reply: Result<Reply, String>) -> Result<Board, ClientError> {
+fn board_from(reply: Result<Reply, String>) -> Result<BoardView, ClientError> {
     let reply = reply.map_err(ClientError::Http)?;
     if !reply.ok() {
         return Err(ClientError::Http(format!(

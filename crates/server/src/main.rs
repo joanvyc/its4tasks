@@ -2,6 +2,9 @@
 //! SQLite file in the data directory) and serves them, and the web GUI, over
 //! HTTP. Listens on `$ITS4TASKS_ADDR`, by default 127.0.0.1:7878.
 //!
+//! People sign in with an outside authority, set with `$ITS4TASKS_AUTH_*`
+//! and, for the native app, `$ITS4TASKS_OAUTH_*` (see `auth::JwtConfig`).
+//!
 //! For testing, `$ITS4TASKS_DELAY_MS` holds every answer back that long, as
 //! a slow network would.
 
@@ -11,6 +14,7 @@ use std::time::Duration;
 use axum::extract::Request;
 use axum::middleware::{self, Next};
 use its4tasks_server::api::Api;
+use its4tasks_server::auth::{Auth, Jwt, JwtConfig};
 use its4tasks_server::server;
 use tokio::net::TcpListener;
 
@@ -29,6 +33,20 @@ fn database_url() -> Option<String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let addr = std::env::var("ITS4TASKS_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
+    let auth = match JwtConfig::from_env() {
+        Ok(Some(config)) => Auth::Jwt(Box::new(Jwt::new(config))),
+        Ok(None) => {
+            eprintln!(
+                "its4tasks-server: set ITS4TASKS_AUTH_ISSUER and ITS4TASKS_AUTH_SIGN_IN_URL \
+                 to the authority people sign in with (see AGENTS.md)"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("its4tasks-server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Some(url) = database_url() else {
         eprintln!("its4tasks-server: set DATABASE_URL; there's no data directory to default to");
         return ExitCode::FAILURE;
@@ -48,7 +66,7 @@ async fn main() -> ExitCode {
         }
     };
     eprintln!("its4tasks-server: listening on {addr}");
-    let mut router = server::router(api);
+    let mut router = server::router(api, auth);
     let delay = std::env::var("ITS4TASKS_DELAY_MS")
         .ok()
         .and_then(|ms| ms.parse().ok())

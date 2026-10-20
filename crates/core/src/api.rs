@@ -7,6 +7,7 @@
 //! to agree, changes that create a task or comment carry the new ids, picked
 //! by the client.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use chrono::{DateTime, Timelike, Utc};
@@ -104,6 +105,12 @@ pub enum Change {
         note: Uuid,
         to: Uuid,
     },
+    /// Adds another board's tasks: a new user's welcome board, or an
+    /// uploaded `board.json`. Its ids must be new (see `import::fresh_ids`).
+    /// Tasks it had in focus are focused where there's room.
+    Import {
+        board: Board,
+    },
 }
 
 impl Change {
@@ -182,6 +189,14 @@ pub fn now() -> DateTime<Utc> {
     let now = Utc::now();
     now.with_nanosecond(now.nanosecond() / 1000 * 1000)
         .unwrap_or(now)
+}
+
+/// A user's board as `GET /api/board` answers it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardView {
+    /// False for a new user, until they start a board or import one.
+    pub started: bool,
+    pub board: Board,
 }
 
 /// What a change did, and the board after it.
@@ -319,12 +334,50 @@ pub fn apply_change(
             let (t, idx) = note(b, id)?;
             t.toggle_star(idx);
         }
+        Change::Import { board: imported } => import(b, imported)?,
         Change::MoveNote { note: id, to } => {
             let (from, idx) = find(b, id)?;
             b.move_note(from, idx, to).map_err(ApiError::Move)?;
         }
     }
     Ok(Outcome::Done)
+}
+
+fn import(b: &mut Board, imported: Board) -> Result<(), ApiError> {
+    let mut tasks = HashSet::new();
+    let mut notes = HashSet::new();
+    for t in &imported.tasks {
+        unused_task(b, t.id)?;
+        if !tasks.insert(t.id) {
+            return Err(ApiError::Duplicate(t.id));
+        }
+        for n in &t.notes {
+            unused_note(b, n.id)?;
+            if !notes.insert(n.id) {
+                return Err(ApiError::Duplicate(n.id));
+            }
+        }
+    }
+    for mut t in imported.tasks {
+        // A parent outside the imported tasks is gone.
+        t.parent = t.parent.filter(|p| tasks.contains(p));
+        b.tasks.push(t);
+    }
+    // A parent making a cycle (say, in a hand-edited file) is dropped.
+    for &id in &tasks {
+        if let Some(p) = b.task(id).and_then(|t| t.parent)
+            && b.is_descendant(p, id)
+            && let Some(t) = b.task_mut(id)
+        {
+            t.parent = None;
+        }
+    }
+    for &id in imported.slots.iter().flatten() {
+        if tasks.contains(&id) {
+            b.focus(id);
+        }
+    }
+    Ok(())
 }
 
 fn unused_task(b: &Board, id: Uuid) -> Result<(), ApiError> {
@@ -400,5 +453,48 @@ mod tests {
         assert_eq!(a, apply_change(&mut there, promote, now));
         assert!(matches!(a, Ok(Outcome::Created(_))));
         assert_eq!(here, there);
+    }
+
+    #[test]
+    fn imports_add_tasks_with_their_shape() {
+        let now = now();
+        let mut b = Board::default();
+        let mine = b.add_task("mine".into(), "", None, now);
+        b.focus(mine);
+        let mut other = crate::welcome::board(now);
+        let sub = other.add_task("sub".into(), "", Some(other.tasks[0].id), now);
+        let other = crate::import::fresh_ids(other);
+        let (first, second) = (other.tasks[0].id, other.tasks[1].id);
+        let import = Change::Import {
+            board: other.clone(),
+        };
+        assert_eq!(apply_change(&mut b, import.clone(), now), Ok(Outcome::Done));
+        assert_eq!(b.tasks.len(), 4);
+        assert_eq!(b.tasks[3].parent, Some(first));
+        assert_ne!(b.tasks[3].id, sub, "fresh ids");
+        // Focused where there was room, after what was already in focus.
+        assert_eq!(b.slots[..3], [Some(mine), Some(first), Some(second)]);
+        // The same board twice clashes.
+        assert_eq!(
+            apply_change(&mut b, import, now),
+            Err(ApiError::Duplicate(first))
+        );
+    }
+
+    #[test]
+    fn imports_drop_parent_cycles_and_outside_parents() {
+        let now = now();
+        let mut other = Board::default();
+        let a = other.add_task("a".into(), "", None, now);
+        let c = other.add_task("c".into(), "", Some(a), now);
+        other.task_mut(a).unwrap().parent = Some(c);
+        let outside = other.add_task("d".into(), "", None, now);
+        other.task_mut(outside).unwrap().parent = Some(Uuid::new_v4());
+        let mut b = Board::default();
+        let import = Change::Import { board: other };
+        apply_change(&mut b, import, now).unwrap();
+        assert!(b.task(outside).unwrap().parent.is_none());
+        let parents = [b.task(a).unwrap().parent, b.task(c).unwrap().parent];
+        assert!(parents.contains(&None), "the cycle is broken");
     }
 }

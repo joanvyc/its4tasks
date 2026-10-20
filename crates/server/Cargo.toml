@@ -15,12 +15,14 @@ its4tasks-core.workspace = true
 axum.workspace = true
 chrono.workspace = true
 directories.workspace = true
+jsonwebtoken.workspace = true
 rust-embed.workspace = true
 sea-orm.workspace = true
 sea-orm-migration.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+ureq.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

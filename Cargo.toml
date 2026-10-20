@@ -10,6 +10,7 @@ edition = "2024"
 its4tasks-core = { path = "crates/core" }
 its4tasks-server = { path = "crates/server" }
 axum = "0.8.9"
+base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 eframe = "0.37.0"
@@ -22,6 +23,7 @@ sea-orm = { version = "2.0.4", default-features = false, features = ["runtime-to
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 tempfile = "3.27.0"
 tower = { version = "0.5.2", features = ["util"] }
 tokio = { version = "1.54.0", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }

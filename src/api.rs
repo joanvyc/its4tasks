@@ -15,7 +15,7 @@ pub enum Change {
     AddTask {
         title: String,
         notes: String,
-        parent: Option<u64>,
+        parent: Option<Uuid>,
         focus: bool,
     },
     /// Turn a next step into a subtask of its task.
@@ -26,36 +26,36 @@ pub enum Change {
         focus: bool,
     },
     Rename {
-        task: u64,
+        task: Uuid,
         title: String,
     },
     SetDone {
-        task: u64,
+        task: Uuid,
         done: bool,
     },
     ToggleFold {
-        task: u64,
+        task: Uuid,
     },
     /// Deletes its subtasks too.
     DeleteTask {
-        task: u64,
+        task: Uuid,
     },
     SetParent {
-        task: u64,
-        parent: Option<u64>,
+        task: Uuid,
+        parent: Option<Uuid>,
     },
     Focus {
-        task: u64,
+        task: Uuid,
     },
     FocusInto {
         slot: usize,
-        task: u64,
+        task: Uuid,
     },
     Unfocus {
         slot: usize,
     },
     Post {
-        task: u64,
+        task: Uuid,
         text: String,
         kind: MessageKind,
     },
@@ -89,19 +89,19 @@ pub enum Change {
     },
     MoveNote {
         note: Uuid,
-        to: u64,
+        to: Uuid,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Done,
-    Created(u64),
+    Created(Uuid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiError {
-    UnknownTask(u64),
+    UnknownTask(Uuid),
     UnknownNote(Uuid),
     Move(MoveError),
     /// The board's rules don't allow it, e.g. a parent that makes a cycle.
@@ -273,12 +273,12 @@ fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Out
     Ok(Outcome::Done)
 }
 
-fn task(b: &mut Board, id: u64) -> Result<&mut Task, ApiError> {
+fn task(b: &mut Board, id: Uuid) -> Result<&mut Task, ApiError> {
     b.task_mut(id).ok_or(ApiError::UnknownTask(id))
 }
 
 /// The task holding a comment, and the comment's index in it.
-fn find(b: &Board, id: Uuid) -> Result<(u64, usize), ApiError> {
+fn find(b: &Board, id: Uuid) -> Result<(Uuid, usize), ApiError> {
     b.find_note(id).ok_or(ApiError::UnknownNote(id))
 }
 
@@ -294,7 +294,7 @@ mod tests {
 
     use super::*;
 
-    fn add(api: &mut Api, title: &str, focus: bool) -> u64 {
+    fn add(api: &mut Api, title: &str, focus: bool) -> Uuid {
         let change = Change::AddTask {
             title: title.into(),
             notes: String::new(),
@@ -355,8 +355,10 @@ mod tests {
             Err(ApiError::Move(MoveError::TargetClosed))
         );
         assert_eq!(
-            api.apply(Change::ToggleFold { task: 99 }),
-            Err(ApiError::UnknownTask(99))
+            api.apply(Change::ToggleFold {
+                task: Uuid::from_u128(99)
+            }),
+            Err(ApiError::UnknownTask(Uuid::from_u128(99)))
         );
         let gone = Uuid::new_v4();
         assert_eq!(
@@ -407,7 +409,7 @@ mod tests {
     #[test]
     fn changes_round_trip_through_json() {
         let change = Change::Post {
-            task: 3,
+            task: Uuid::from_u128(3),
             text: "/block waiting".into(),
             kind: MessageKind::Block,
         };

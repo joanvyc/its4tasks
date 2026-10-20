@@ -145,7 +145,7 @@ fn comment_input_bg(visuals: &Visuals) -> Color32 {
 }
 
 /// The task's menu entries, shared by the "⋯" button and the list's right-click menu.
-fn task_menu_items(ui: &mut egui::Ui, task_id: u64, is_subtask: bool, actions: &mut Vec<Action>) {
+fn task_menu_items(ui: &mut egui::Ui, task_id: Uuid, is_subtask: bool, actions: &mut Vec<Action>) {
     if ui.button("Add subtask…").clicked() {
         actions.push(Action::AddSubtask(task_id, String::new()));
     }
@@ -166,7 +166,7 @@ fn task_menu_items(ui: &mut egui::Ui, task_id: u64, is_subtask: bool, actions: &
 /// The task's "⋯" menu. See `dots_menu`.
 fn task_menu(
     ui: &mut egui::Ui,
-    task_id: u64,
+    task_id: Uuid,
     is_subtask: bool,
     visible: bool,
     actions: &mut Vec<Action>,
@@ -843,7 +843,7 @@ fn log_group(
 #[derive(Default)]
 struct NewTaskDraft {
     /// Creating a subtask of this task.
-    parent: Option<u64>,
+    parent: Option<Uuid>,
     /// Promoting this comment of `parent`, a next step, to the subtask.
     from_step: Option<Uuid>,
     title: String,
@@ -862,7 +862,7 @@ struct NoteEdit {
 /// A comment waiting for the user to pick the task it moves to.
 struct NoteMove {
     note: Uuid,
-    target: Option<u64>,
+    target: Option<Uuid>,
 }
 
 /// What was requested while drawing, done once drawing is done so we don't
@@ -871,9 +871,9 @@ enum Action {
     /// A change to the board, sent to the API.
     Change(Change),
     /// Ask for confirmation, then delete.
-    Delete(u64),
+    Delete(Uuid),
     /// Open the new task dialog for a subtask of this task, with this title.
-    AddSubtask(u64, String),
+    AddSubtask(Uuid, String),
     /// Open the new subtask dialog to turn this next step into a subtask.
     StartPromote(Uuid),
     StartEdit(Uuid),
@@ -901,14 +901,14 @@ pub struct TodoApp {
     filter: String,
     new_task: Option<NewTaskDraft>,
     /// The task waiting for the user to confirm its deletion.
-    confirm_delete: Option<u64>,
+    confirm_delete: Option<Uuid>,
     /// Unsent comment text for each focus card.
     comment_drafts: [String; SLOT_COUNT],
     /// What posting from each card's comment box does.
     comment_kind: [MessageKind; SLOT_COUNT],
     /// Why the last command typed into each card's comment box failed, for
     /// the task it was typed for.
-    comment_error: [Option<(u64, String)>; SLOT_COUNT],
+    comment_error: [Option<(Uuid, String)>; SLOT_COUNT],
     editing: Option<NoteEdit>,
     moving: Option<NoteMove>,
     view: View,
@@ -1070,9 +1070,9 @@ impl TodoApp {
                     .then(|| self.api.board().task(id).map(next_steps_text))
                     .flatten();
                 // Whether a task dragged over this row may become its subtask.
-                let can_adopt = |dragged: u64| self.api.board().can_set_parent(dragged, Some(id));
+                let can_adopt = |dragged: Uuid| self.api.board().can_set_parent(dragged, Some(id));
                 let hovered_payload =
-                    DragAndDrop::payload::<u64>(ui.ctx()).filter(|d| can_adopt(**d));
+                    DragAndDrop::payload::<Uuid>(ui.ctx()).filter(|d| can_adopt(**d));
                 let Some(task) = self.api.board().task(id) else {
                     continue;
                 };
@@ -1200,7 +1200,7 @@ impl TodoApp {
                     ui.painter()
                         .rect_stroke(rect, ROW_RADIUS, stroke, StrokeKind::Inside);
                     if ui.input(|i| i.pointer.any_released())
-                        && let Some(dragged) = DragAndDrop::take_payload::<u64>(ui.ctx())
+                        && let Some(dragged) = DragAndDrop::take_payload::<Uuid>(ui.ctx())
                     {
                         actions.push(Change::SetParent { task: *dragged, parent: Some(id) }.into());
                     }
@@ -1249,7 +1249,7 @@ impl TodoApp {
         let has_task = task.is_some();
         let ready = state == Some(TaskState::Ready);
         // Titles of the subtasks this task's steps were promoted to, by subtask id.
-        let promoted: Vec<(u64, String)> = task
+        let promoted: Vec<(Uuid, String)> = task
             .iter()
             .flat_map(|t| &t.notes)
             .filter_map(|n| match n.next_step {
@@ -1269,7 +1269,7 @@ impl TodoApp {
             .stroke(stroke);
         let content = cell - Vec2::splat(2.0 * (f32::from(CARD_MARGIN) + stroke.width));
 
-        let (zone, dropped) = ui.dnd_drop_zone::<u64, _>(frame, |ui| {
+        let (zone, dropped) = ui.dnd_drop_zone::<Uuid, _>(frame, |ui| {
             ui.set_min_size(content);
             ui.set_max_size(content);
             let Some(task) = task_id.and_then(|id| self.api.board().task(id)) else {

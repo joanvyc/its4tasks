@@ -1,6 +1,7 @@
 //! Daily/weekly history of what happened to each task, built from the board.
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone, Utc};
+use uuid::Uuid;
 
 use crate::model::{Blocker, Board, NextStep, Note, NoteAction, Task, headline};
 
@@ -59,7 +60,7 @@ pub struct Entry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskGroup {
-    pub task_id: u64,
+    pub task_id: Uuid,
     pub title: String,
     /// Empty for a parent that only holds its subtasks' entries on this page.
     pub entries: Vec<Entry>,
@@ -99,7 +100,7 @@ impl TaskGroup {
 fn nest(board: &Board, flat: Vec<TaskGroup>) -> Vec<TaskGroup> {
     let mut groups = flat;
     loop {
-        let missing: Vec<u64> = groups
+        let missing: Vec<Uuid> = groups
             .iter()
             .filter_map(|g| board.task(g.task_id)?.parent)
             .filter(|p| board.task(*p).is_some() && !groups.iter().any(|g| g.task_id == *p))
@@ -117,9 +118,9 @@ fn nest(board: &Board, flat: Vec<TaskGroup>) -> Vec<TaskGroup> {
     }
     let parent_of = |g: &TaskGroup| board.task(g.task_id).and_then(|t| t.parent);
     fn take_children(
-        id: Option<u64>,
+        id: Option<Uuid>,
         groups: &mut Vec<TaskGroup>,
-        parent_of: &dyn Fn(&TaskGroup) -> Option<u64>,
+        parent_of: &dyn Fn(&TaskGroup) -> Option<Uuid>,
     ) -> Vec<TaskGroup> {
         let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(groups)
             .into_iter()

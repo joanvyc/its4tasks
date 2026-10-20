@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::model::{Board, Note, SLOT_COUNT};
 use diff::{Changes, diff};
-use entity::{meta, note, slot, task};
+use entity::{note, slot, task};
 use migration::Migrator;
 
 const DB_FILE: &str = "board.sqlite";
@@ -98,7 +98,7 @@ impl Store {
 }
 
 async fn read(db: &impl ConnectionTrait) -> Result<Board, DbErr> {
-    let mut notes: HashMap<i64, Vec<Note>> = HashMap::new();
+    let mut notes: HashMap<String, Vec<Note>> = HashMap::new();
     for row in note::Entity::find()
         .order_by_asc(note::Column::TaskId)
         .order_by_asc(note::Column::Position)
@@ -106,10 +106,11 @@ async fn read(db: &impl ConnectionTrait) -> Result<Board, DbErr> {
         .await?
     {
         notes
-            .entry(row.task_id)
+            .entry(row.task_id.clone())
             .or_default()
             .push(convert::note_from_row(row)?);
     }
+    // Task ids are UUID v7s, which sort in creation order.
     let tasks = task::Entity::find()
         .order_by_asc(task::Column::Id)
         .all(db)
@@ -117,29 +118,24 @@ async fn read(db: &impl ConnectionTrait) -> Result<Board, DbErr> {
         .into_iter()
         .map(|row| {
             let notes = notes.remove(&row.id).unwrap_or_default();
-            let mut task = convert::task_from_row(row);
+            let mut task = convert::task_from_row(row)?;
             task.notes = notes;
-            task
+            Ok(task)
         })
-        .collect();
+        .collect::<Result<_, DbErr>>()?;
     let mut slots = [None; SLOT_COUNT];
     for row in slot::Entity::find().all(db).await? {
         if let Some(s) = usize::try_from(row.position)
             .ok()
             .and_then(|i| slots.get_mut(i))
         {
-            *s = row.task_id.map(|id| id as u64);
+            *s = row
+                .task_id
+                .map(|id| convert::parse_id(&id, "slot task"))
+                .transpose()?;
         }
     }
-    let next_id = meta::Entity::find_by_id(meta::ID)
-        .one(db)
-        .await?
-        .map_or(0, |m| m.next_id as u64);
-    Ok(Board {
-        tasks,
-        slots,
-        next_id,
-    })
+    Ok(Board { tasks, slots })
 }
 
 async fn write(db: &DatabaseConnection, changes: &Changes<'_>) -> Result<(), DbErr> {
@@ -196,31 +192,18 @@ async fn write(db: &DatabaseConnection, changes: &Changes<'_>) -> Result<(), DbE
     }
     if !changes.deletes.is_empty() {
         task::Entity::delete_many()
-            .filter(task::Column::Id.is_in(changes.deletes.iter().map(|&id| id as i64)))
+            .filter(task::Column::Id.is_in(changes.deletes.iter().map(Uuid::to_string)))
             .exec(&txn)
             .await?;
     }
     for &(i, task_id) in &changes.slots {
         slot::Entity::insert(slot::ActiveModel {
             position: Set(i as i32),
-            task_id: Set(task_id.map(|id| id as i64)),
+            task_id: Set(task_id.map(|id| id.to_string())),
         })
         .on_conflict(
             OnConflict::column(slot::Column::Position)
                 .update_column(slot::Column::TaskId)
-                .to_owned(),
-        )
-        .exec_without_returning(&txn)
-        .await?;
-    }
-    if let Some(next_id) = changes.next_id {
-        meta::Entity::insert(meta::ActiveModel {
-            id: Set(meta::ID),
-            next_id: Set(next_id as i64),
-        })
-        .on_conflict(
-            OnConflict::column(meta::Column::Id)
-                .update_column(meta::Column::NextId)
                 .to_owned(),
         )
         .exec_without_returning(&txn)
@@ -346,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn migrating_gives_old_comments_ids() {
+    fn migrating_gives_old_rows_ids() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join(DB_FILE).display());
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -355,27 +338,48 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let db = Database::connect(url).await.unwrap();
-            // The schema before comments had ids.
+            // The schema before comments and tasks had UUIDs.
             Migrator::up(&db, Some(1)).await.unwrap();
+            // Task 10 is a subtask of 2 and comes after it, though "10" < "2"
+            // as text. One step was promoted to 10, one to a deleted task.
             db.execute_unprepared(
-                "INSERT INTO task (id, title, done, updated_at, folded)
-                     VALUES (0, 'a', false, '2026-10-01 10:00:00+00:00', false);
-                 INSERT INTO note (task_id, position, at, text, starred)
-                     VALUES (0, 0, '2026-10-01 10:00:00+00:00', 'one', false),
-                            (0, 1, '2026-10-01 11:00:00+00:00', 'two', true);
-                 INSERT INTO meta (id, next_id) VALUES (1, 1);",
+                "INSERT INTO task (id, title, done, updated_at, parent_id, folded)
+                     VALUES (2, 'a', false, '2026-10-01 10:00:00+00:00', NULL, false),
+                            (10, 'b', false, '2026-10-01 10:00:00+00:00', 2, true);
+                 INSERT INTO note (task_id, position, at, text, starred,
+                                   next_step_state, next_step_since, next_step_at, next_step_subtask)
+                     VALUES (2, 0, '2026-10-01 10:00:00+00:00', 'one', false,
+                             'promoted', '2026-10-01 10:00:00+00:00', '2026-10-01 12:00:00+00:00', 10),
+                            (2, 1, '2026-10-01 11:00:00+00:00', 'two', true,
+                             'promoted', '2026-10-01 10:00:00+00:00', '2026-10-01 12:00:00+00:00', 99);
+                 INSERT INTO slot (position, task_id) VALUES (0, 10), (1, NULL);
+                 INSERT INTO meta (id, next_id) VALUES (1, 11);",
             )
             .await
             .unwrap();
             db.close().await.unwrap();
         });
         let board = reopen(dir.path());
-        let notes = &board.tasks[0].notes;
+        let titles: Vec<&str> = board.tasks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["a", "b"]);
+        let (a, b) = (&board.tasks[0], &board.tasks[1]);
+        assert!(a.id.get_version_num() == 7 && b.id.get_version_num() == 7);
+        assert_eq!(b.parent, Some(a.id));
+        assert!(b.folded);
+        assert_eq!(board.slots, [Some(b.id), None, None, None]);
+
+        let notes = &a.notes;
         let texts: Vec<&str> = notes.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(texts, ["one", "two"]);
         assert!(notes[1].starred);
         assert_ne!(notes[0].id, notes[1].id);
         assert!(notes.iter().all(|n| n.id.get_version_num() == 4));
+        let subtask = |n: &Note| match n.next_step {
+            Some(NextStep::Promoted { subtask, .. }) => subtask,
+            other => panic!("not promoted: {other:?}"),
+        };
+        assert_eq!(subtask(&notes[0]), b.id);
+        assert!(board.task(subtask(&notes[1])).is_none());
         // The ids are what's stored, not made up on each load.
         assert_eq!(reopen(dir.path()), board);
     }

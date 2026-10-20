@@ -11,15 +11,14 @@ pub struct Changes<'a> {
     /// New or changed task rows (notes aside), parents before their subtasks
     /// so a row's parent is always written first.
     pub upserts: Vec<&'a Task>,
-    pub deletes: Vec<u64>,
+    pub deletes: Vec<Uuid>,
     /// New or changed notes, with their task and position in it. A moved
     /// note is here with its new task.
-    pub note_upserts: Vec<(u64, usize, &'a Note)>,
+    pub note_upserts: Vec<(Uuid, usize, &'a Note)>,
     /// Notes gone from tasks that remain. Those of deleted tasks go with them.
     pub note_deletes: Vec<Uuid>,
     /// Slots whose task changed: `(index, task)`.
-    pub slots: Vec<(usize, Option<u64>)>,
-    pub next_id: Option<u64>,
+    pub slots: Vec<(usize, Option<Uuid>)>,
 }
 
 impl Changes<'_> {
@@ -29,7 +28,7 @@ impl Changes<'_> {
 }
 
 pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
-    let before: HashMap<u64, &Task> = old.tasks.iter().map(|t| (t.id, t)).collect();
+    let before: HashMap<Uuid, &Task> = old.tasks.iter().map(|t| (t.id, t)).collect();
     // New tasks, or ones that changed in any way, notes included.
     let changed: Vec<(Option<&Task>, &Task)> = new
         .tasks
@@ -45,7 +44,7 @@ pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
         .collect();
     upserts.sort_by_key(|t| depth(new, t));
 
-    let notes_before: HashMap<Uuid, (u64, usize, &Note)> = changed
+    let notes_before: HashMap<Uuid, (Uuid, usize, &Note)> = changed
         .iter()
         .filter_map(|(o, _)| *o)
         .flat_map(|o| {
@@ -55,7 +54,7 @@ pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
                 .map(|(i, n)| (n.id, (o.id, i, n)))
         })
         .collect();
-    let note_upserts: Vec<(u64, usize, &Note)> = changed
+    let note_upserts: Vec<(Uuid, usize, &Note)> = changed
         .iter()
         .flat_map(|(_, t)| t.notes.iter().enumerate().map(|(i, n)| (t.id, i, n)))
         .filter(|row| notes_before.get(&row.2.id) != Some(row))
@@ -70,7 +69,7 @@ pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
         .copied()
         .collect();
 
-    let kept: HashSet<u64> = new.tasks.iter().map(|t| t.id).collect();
+    let kept: HashSet<Uuid> = new.tasks.iter().map(|t| t.id).collect();
     Changes {
         upserts,
         deletes: old
@@ -85,7 +84,6 @@ pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
             .filter(|&i| old.slots[i] != new.slots[i])
             .map(|i| (i, new.slots[i]))
             .collect(),
-        next_id: (old.next_id != new.next_id).then_some(new.next_id),
     }
 }
 
@@ -137,7 +135,7 @@ mod tests {
     use super::*;
     use crate::model::MessageKind;
 
-    fn ids(changes: &Changes) -> Vec<u64> {
+    fn ids(changes: &Changes) -> Vec<Uuid> {
         changes.upserts.iter().map(|t| t.id).collect()
     }
 
@@ -160,7 +158,6 @@ mod tests {
         assert_eq!(ids(&c), vec![a]);
         assert!(c.note_upserts.is_empty(), "notes did not change");
         assert!(c.deletes.is_empty());
-        assert_eq!(c.next_id, None);
     }
 
     #[test]
@@ -175,7 +172,6 @@ mod tests {
         new.tasks.reverse();
         let changes = diff(&old, &new);
         assert_eq!(ids(&changes), vec![a, b, c]);
-        assert_eq!(changes.next_id, Some(3));
     }
 
     #[test]

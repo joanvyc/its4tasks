@@ -8,7 +8,7 @@ pub struct Model {
     /// The model's `Note::id`, a UUID as text.
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    pub task_id: i64,
+    pub task_id: String,
     /// Order within the task.
     pub position: i32,
     pub at: DateTimeUtc,
@@ -23,7 +23,7 @@ pub struct Model {
     pub next_step_state: Option<String>,
     pub next_step_since: Option<DateTimeUtc>,
     pub next_step_at: Option<DateTimeUtc>,
-    pub next_step_subtask: Option<i64>,
+    pub next_step_subtask: Option<String>,
     /// `unblocked` or `closed`.
     pub action_kind: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

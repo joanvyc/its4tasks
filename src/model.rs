@@ -31,7 +31,7 @@ pub enum NextStep {
     Promoted {
         since: DateTime<Utc>,
         at: DateTime<Utc>,
-        subtask: u64,
+        subtask: Uuid,
     },
 }
 
@@ -193,7 +193,7 @@ impl TaskState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
-    pub id: u64,
+    pub id: Uuid,
     pub title: String,
     #[serde(default, deserialize_with = "legacy_notes")]
     pub notes: Vec<Note>,
@@ -207,7 +207,7 @@ pub struct Task {
     pub done_at: Option<DateTime<Utc>>,
     /// The task this is a subtask of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<u64>,
+    pub parent: Option<Uuid>,
     /// Its subtasks are hidden in the task list (unless on the board).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folded: bool,
@@ -654,8 +654,7 @@ pub fn staleness(age: TimeDelta) -> f32 {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Board {
     pub tasks: Vec<Task>,
-    pub slots: [Option<u64>; SLOT_COUNT],
-    pub next_id: u64,
+    pub slots: [Option<Uuid>; SLOT_COUNT],
 }
 
 impl Board {
@@ -663,11 +662,11 @@ impl Board {
         &mut self,
         title: String,
         first_note: &str,
-        parent: Option<u64>,
+        parent: Option<Uuid>,
         now: DateTime<Utc>,
-    ) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
+    ) -> Uuid {
+        // Time-ordered, so sorting by id keeps tasks in creation order.
+        let id = Uuid::now_v7();
         let mut task = Task {
             id,
             title,
@@ -691,12 +690,12 @@ impl Board {
     /// pointing at it. `None` if the comment isn't an open step any more.
     pub fn promote_step(
         &mut self,
-        task_id: u64,
+        task_id: Uuid,
         idx: usize,
         title: String,
         first_note: &str,
         now: DateTime<Utc>,
-    ) -> Option<u64> {
+    ) -> Option<Uuid> {
         let note = self.task(task_id)?.notes.get(idx)?;
         let Some(NextStep::Open { since }) = note.next_step else {
             return None;
@@ -720,7 +719,7 @@ impl Board {
     }
 
     /// Delete the task and all its subtasks.
-    pub fn delete_task(&mut self, id: u64) {
+    pub fn delete_task(&mut self, id: Uuid) {
         let mut gone = self.descendants(id);
         gone.push(id);
         self.tasks.retain(|t| !gone.contains(&t.id));
@@ -732,13 +731,13 @@ impl Board {
     }
 
     /// Direct subtasks, in list order.
-    pub fn children(&self, id: u64) -> impl Iterator<Item = &Task> {
+    pub fn children(&self, id: Uuid) -> impl Iterator<Item = &Task> {
         self.tasks.iter().filter(move |t| t.parent == Some(id))
     }
 
     /// Subtasks at any depth.
-    pub fn descendants(&self, id: u64) -> Vec<u64> {
-        let mut found: Vec<u64> = Vec::new();
+    pub fn descendants(&self, id: Uuid) -> Vec<Uuid> {
+        let mut found: Vec<Uuid> = Vec::new();
         let mut next = vec![id];
         while let Some(id) = next.pop() {
             for child in self.children(id) {
@@ -752,7 +751,7 @@ impl Board {
     }
 
     /// Whether `id` sits somewhere below `of`.
-    pub fn is_descendant(&self, id: u64, of: u64) -> bool {
+    pub fn is_descendant(&self, id: Uuid, of: Uuid) -> bool {
         let mut seen = Vec::new();
         let mut current = self.task(id).and_then(|t| t.parent);
         while let Some(p) = current {
@@ -769,7 +768,7 @@ impl Board {
     }
 
     /// Whether `set_parent(id, parent)` would succeed.
-    pub fn can_set_parent(&self, id: u64, parent: Option<u64>) -> bool {
+    pub fn can_set_parent(&self, id: Uuid, parent: Option<Uuid>) -> bool {
         let Some(task) = self.task(id) else {
             return false;
         };
@@ -782,7 +781,7 @@ impl Board {
 
     /// Make the task a subtask of `parent`, or a root task with `None`.
     /// Refuses unknown tasks and anything that would make a cycle.
-    pub fn set_parent(&mut self, id: u64, parent: Option<u64>) -> bool {
+    pub fn set_parent(&mut self, id: Uuid, parent: Option<Uuid>) -> bool {
         if !self.can_set_parent(id, parent) {
             return false;
         }
@@ -793,19 +792,19 @@ impl Board {
     }
 
     /// Subtasks that aren't done.
-    fn open_children(&self, id: u64) -> impl Iterator<Item = &Task> {
+    fn open_children(&self, id: Uuid) -> impl Iterator<Item = &Task> {
         self.children(id).filter(|t| !t.done)
     }
 
     /// At least one subtask is open, and every open one is blocked.
-    pub fn blocked_by_subtasks(&self, id: u64) -> bool {
+    pub fn blocked_by_subtasks(&self, id: Uuid) -> bool {
         let mut open = self.open_children(id).peekable();
         open.peek().is_some() && open.all(|t| self.state(t.id) == TaskState::Blocked)
     }
 
     /// Like `Task::state`, but a task whose open subtasks are all blocked is
     /// blocked too.
-    pub fn state(&self, id: u64) -> TaskState {
+    pub fn state(&self, id: Uuid) -> TaskState {
         match self.task(id).map(Task::state) {
             Some(TaskState::Active | TaskState::Ready) if self.blocked_by_subtasks(id) => {
                 TaskState::Blocked
@@ -818,7 +817,7 @@ impl Board {
     /// When the task became blocked, from its own oldest open blocker or from
     /// its subtasks (when the last open one got blocked, or the last unblocked
     /// one was closed), whichever came first. `None` unless blocked.
-    pub fn blocked_since(&self, id: u64) -> Option<DateTime<Utc>> {
+    pub fn blocked_since(&self, id: Uuid) -> Option<DateTime<Utc>> {
         let task = self.task(id)?;
         if task.done {
             return None;
@@ -841,14 +840,14 @@ impl Board {
         own.into_iter().chain(subtasks).min()
     }
 
-    pub fn blocked_for(&self, id: u64, now: DateTime<Utc>) -> Option<TimeDelta> {
+    pub fn blocked_for(&self, id: Uuid, now: DateTime<Utc>) -> Option<TimeDelta> {
         self.blocked_since(id).map(|since| now - since)
     }
 
     /// The task list: tasks in tree order with their depth. A task shows if it
     /// passes `shown_in_list`, or if one of its subtasks shows. Below a folded
     /// task only subtasks on the board pass; folds don't apply while filtering.
-    pub fn list_rows(&self, filter: &str, hide_closed: bool) -> Vec<(u64, usize)> {
+    pub fn list_rows(&self, filter: &str, hide_closed: bool) -> Vec<(Uuid, usize)> {
         fn visit(
             board: &Board,
             task: &Task,
@@ -856,7 +855,7 @@ impl Board {
             filter: &str,
             hide_closed: bool,
             folded_above: bool,
-            rows: &mut Vec<(u64, usize)>,
+            rows: &mut Vec<(Uuid, usize)>,
         ) {
             let at = rows.len();
             let folded = folded_above || (task.folded && filter.trim().is_empty());
@@ -878,7 +877,7 @@ impl Board {
 
     /// How many subtasks, at any depth, a fold keeps out of `rows` (as built
     /// by `list_rows` with no filter).
-    pub fn hidden_subtasks(&self, id: u64, rows: &[(u64, usize)], hide_closed: bool) -> usize {
+    pub fn hidden_subtasks(&self, id: Uuid, rows: &[(Uuid, usize)], hide_closed: bool) -> usize {
         self.descendants(id)
             .into_iter()
             .filter(|d| {
@@ -893,7 +892,7 @@ impl Board {
     /// comments go with it (see `Task::linked_notes`). One task blocks on one
     /// thing at a time: an open blocker can't join a blocked task, and a
     /// resolved one can't join a task blocked since before it was resolved.
-    pub fn can_move_note(&self, from: u64, idx: usize, to: u64) -> Result<Vec<usize>, MoveError> {
+    pub fn can_move_note(&self, from: Uuid, idx: usize, to: Uuid) -> Result<Vec<usize>, MoveError> {
         let source = self.task(from).ok_or(MoveError::NotFound)?;
         let note = source.notes.get(idx).ok_or(MoveError::NotFound)?;
         let target = self.task(to).ok_or(MoveError::NotFound)?;
@@ -927,7 +926,7 @@ impl Board {
     /// Move the comment, and any tied to it, to another task, keeping the
     /// target's comments in time order. Counts as an update of the target
     /// only as of the moved comments' own times.
-    pub fn move_note(&mut self, from: u64, idx: usize, to: u64) -> Result<(), MoveError> {
+    pub fn move_note(&mut self, from: Uuid, idx: usize, to: Uuid) -> Result<(), MoveError> {
         let linked = self.can_move_note(from, idx, to)?;
         let source = self.task_mut(from).ok_or(MoveError::NotFound)?;
         let moved: Vec<Note> = linked
@@ -944,27 +943,27 @@ impl Board {
     }
 
     /// The task holding a comment, and the comment's index in it.
-    pub fn find_note(&self, id: Uuid) -> Option<(u64, usize)> {
+    pub fn find_note(&self, id: Uuid) -> Option<(Uuid, usize)> {
         self.tasks
             .iter()
             .find_map(|t| t.note_index(id).map(|idx| (t.id, idx)))
     }
 
     /// A comment and the task holding it.
-    pub fn note(&self, id: Uuid) -> Option<(u64, &Note)> {
+    pub fn note(&self, id: Uuid) -> Option<(Uuid, &Note)> {
         let (task, idx) = self.find_note(id)?;
         Some((task, &self.task(task)?.notes[idx]))
     }
 
-    pub fn task(&self, id: u64) -> Option<&Task> {
+    pub fn task(&self, id: Uuid) -> Option<&Task> {
         self.tasks.iter().find(|t| t.id == id)
     }
 
-    pub fn task_mut(&mut self, id: u64) -> Option<&mut Task> {
+    pub fn task_mut(&mut self, id: Uuid) -> Option<&mut Task> {
         self.tasks.iter_mut().find(|t| t.id == id)
     }
 
-    pub fn slot_of(&self, id: u64) -> Option<usize> {
+    pub fn slot_of(&self, id: Uuid) -> Option<usize> {
         self.slots.iter().position(|s| *s == Some(id))
     }
 
@@ -974,7 +973,7 @@ impl Board {
 
     /// Put the task into the first empty slot. Returns false if it is already
     /// focused, doesn't exist, or every slot is taken.
-    pub fn focus(&mut self, id: u64) -> bool {
+    pub fn focus(&mut self, id: Uuid) -> bool {
         if self.slot_of(id).is_some() || self.task(id).is_none() {
             return false;
         }
@@ -989,7 +988,7 @@ impl Board {
 
     /// Put the task into a specific slot, replacing whatever was there and
     /// moving it out of any other slot it occupied.
-    pub fn focus_into(&mut self, slot: usize, id: u64) {
+    pub fn focus_into(&mut self, slot: usize, id: Uuid) {
         if slot >= SLOT_COUNT || self.task(id).is_none() {
             return;
         }
@@ -1016,7 +1015,7 @@ impl Board {
             }
         }
         // A parent that is gone or makes a cycle turns the task into a root.
-        let ids: Vec<u64> = self.tasks.iter().map(|t| t.id).collect();
+        let ids: Vec<Uuid> = self.tasks.iter().map(|t| t.id).collect();
         for id in ids {
             if let Some(p) = self.task(id).and_then(|t| t.parent)
                 && (self.task(p).is_none() || self.is_descendant(p, id))
@@ -1032,8 +1031,6 @@ impl Board {
                 note.id = Uuid::new_v4();
             }
         }
-        let max_id = self.tasks.iter().map(|t| t.id + 1).max().unwrap_or(0);
-        self.next_id = self.next_id.max(max_id);
     }
 }
 
@@ -1058,68 +1055,74 @@ pub fn shown_in_list(task: &Task, filter: &str, hide_closed: bool) -> bool {
 mod tests {
     use super::*;
 
-    fn board_with(n: usize) -> Board {
+    fn board_with(count: usize) -> Board {
         let mut b = Board::default();
-        for i in 0..n {
-            b.add_task(format!("task {i}"), "", None, Utc::now());
+        for i in 0..count {
+            let id = b.add_task(format!("task {i}"), "", None, Utc::now());
+            b.task_mut(id).unwrap().id = n(i as u128);
         }
         b
+    }
+
+    /// The id `board_with` gives its `i`th task.
+    fn n(i: u128) -> Uuid {
+        Uuid::from_u128(i)
     }
 
     #[test]
     fn focus_fills_first_free_slot_until_full() {
         let mut b = board_with(5);
         for id in 0..4 {
-            assert!(b.focus(id));
+            assert!(b.focus(n(id)));
         }
-        assert_eq!(b.slots, [Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(b.slots, [Some(n(0)), Some(n(1)), Some(n(2)), Some(n(3))]);
         assert!(!b.has_free_slot());
-        assert!(!b.focus(4));
+        assert!(!b.focus(n(4)));
     }
 
     #[test]
     fn focus_twice_is_noop() {
         let mut b = board_with(2);
-        assert!(b.focus(0));
-        assert!(!b.focus(0));
-        assert_eq!(b.slots, [Some(0), None, None, None]);
+        assert!(b.focus(n(0)));
+        assert!(!b.focus(n(0)));
+        assert_eq!(b.slots, [Some(n(0)), None, None, None]);
     }
 
     #[test]
     fn unfocus_frees_slot_and_keeps_task() {
         let mut b = board_with(2);
-        b.focus(0);
-        b.focus(1);
+        b.focus(n(0));
+        b.focus(n(1));
         b.unfocus(0);
-        assert_eq!(b.slots, [None, Some(1), None, None]);
+        assert_eq!(b.slots, [None, Some(n(1)), None, None]);
         assert_eq!(b.tasks.len(), 2);
-        assert!(b.focus(0));
-        assert_eq!(b.slot_of(0), Some(0));
+        assert!(b.focus(n(0)));
+        assert_eq!(b.slot_of(n(0)), Some(0));
     }
 
     #[test]
     fn focus_into_replaces_and_moves() {
         let mut b = board_with(3);
-        b.focus(0);
-        b.focus_into(0, 1);
-        assert_eq!(b.slots, [Some(1), None, None, None]);
-        b.focus_into(2, 1);
-        assert_eq!(b.slots, [None, None, Some(1), None]);
+        b.focus(n(0));
+        b.focus_into(0, n(1));
+        assert_eq!(b.slots, [Some(n(1)), None, None, None]);
+        b.focus_into(2, n(1));
+        assert_eq!(b.slots, [None, None, Some(n(1)), None]);
     }
 
     #[test]
     fn delete_clears_slot() {
         let mut b = board_with(2);
-        b.focus(1);
-        b.delete_task(1);
+        b.focus(n(1));
+        b.delete_task(n(1));
         assert_eq!(b.slots, [None; SLOT_COUNT]);
-        assert!(b.task(1).is_none());
+        assert!(b.task(n(1)).is_none());
     }
 
     #[test]
     fn filter_matches_title_and_notes_case_insensitively() {
         let mut t = Task {
-            id: 0,
+            id: n(0),
             title: "Write Report".into(),
             notes: Vec::new(),
             done: false,
@@ -1139,7 +1142,7 @@ mod tests {
     #[test]
     fn hide_closed_drops_done_tasks_and_keeps_the_filter() {
         let mut b = board_with(2);
-        b.task_mut(1).unwrap().set_done(true, Utc::now());
+        b.task_mut(n(1)).unwrap().set_done(true, Utc::now());
         let shown = |filter, hide| {
             b.tasks
                 .iter()
@@ -1147,17 +1150,17 @@ mod tests {
                 .map(|t| t.id)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(shown("", false), [0, 1]);
-        assert_eq!(shown("", true), [0]);
-        assert_eq!(shown("task 1", false), [1]);
-        assert_eq!(shown("task 1", true), Vec::<u64>::new());
+        assert_eq!(shown("", false), [n(0), n(1)]);
+        assert_eq!(shown("", true), [n(0)]);
+        assert_eq!(shown("task 1", false), [n(1)]);
+        assert_eq!(shown("task 1", true), Vec::<Uuid>::new());
     }
 
     #[test]
     fn serde_round_trip() {
         let mut b = board_with(3);
-        b.focus(2);
-        b.task_mut(0).unwrap().done = true;
+        b.focus(n(2));
+        b.task_mut(n(0)).unwrap().done = true;
         let json = serde_json::to_string(&b).unwrap();
         let back: Board = serde_json::from_str(&json).unwrap();
         assert_eq!(b, back);
@@ -1165,12 +1168,13 @@ mod tests {
 
     #[test]
     fn legacy_string_notes_become_one_comment() {
-        let json = r#"{"id":0,"title":"t","notes":"  old notes "}"#;
+        let json =
+            r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t","notes":"  old notes "}"#;
         let t: Task = serde_json::from_str(json).unwrap();
         assert_eq!(t.notes.len(), 1);
         assert_eq!(t.notes[0].text, "old notes");
 
-        let json = r#"{"id":0,"title":"t","notes":""}"#;
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t","notes":""}"#;
         let t: Task = serde_json::from_str(json).unwrap();
         assert!(t.notes.is_empty());
     }
@@ -1178,7 +1182,7 @@ mod tests {
     #[test]
     fn post_touches_and_skips_blank() {
         let mut b = board_with(1);
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         let later = t.updated_at + TimeDelta::hours(3);
         t.post("   ", MessageKind::Comment, later);
         assert!(t.notes.is_empty());
@@ -1195,7 +1199,7 @@ mod tests {
     fn blockers_drive_state() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         assert_eq!(t.state(), TaskState::Active);
         t.post("waiting on new input case", MessageKind::Block, now);
         t.post("plain comment", MessageKind::Comment, now);
@@ -1229,7 +1233,7 @@ mod tests {
         let mut b = board_with(1);
         let t0 = Utc::now();
         let h = TimeDelta::hours;
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("call Bob", MessageKind::Next, t0);
         t.post("write it up", MessageKind::Next, t0 + h(1));
         assert_eq!(t.state(), TaskState::Ready);
@@ -1271,7 +1275,7 @@ mod tests {
     fn blocked_wins_over_ready_and_done_over_both() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("call Bob", MessageKind::Next, now);
         t.post("waiting on Alice", MessageKind::Block, now);
         assert_eq!(t.state(), TaskState::Blocked);
@@ -1282,25 +1286,29 @@ mod tests {
 
         // Subtasks blocking the parent outweigh its own steps.
         let mut b = tree();
-        b.task_mut(0).unwrap().post("plan", MessageKind::Next, now);
-        assert_eq!(b.state(0), TaskState::Ready);
+        b.task_mut(n(0))
+            .unwrap()
+            .post("plan", MessageKind::Next, now);
+        assert_eq!(b.state(n(0)), TaskState::Ready);
         for id in [1, 2] {
-            b.task_mut(id)
+            b.task_mut(n(id))
                 .unwrap()
                 .post("wait", MessageKind::Block, now);
         }
-        assert_eq!(b.state(0), TaskState::Blocked);
+        assert_eq!(b.state(n(0)), TaskState::Blocked);
         // A subtask's step doesn't make the parent ready.
         let mut b = tree();
-        b.task_mut(1).unwrap().post("plan", MessageKind::Next, now);
-        assert_eq!(b.state(0), TaskState::Active);
+        b.task_mut(n(1))
+            .unwrap()
+            .post("plan", MessageKind::Next, now);
+        assert_eq!(b.state(n(0)), TaskState::Active);
     }
 
     #[test]
     fn a_comment_is_a_blocker_or_a_step_not_both() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("waiting", MessageKind::Block, now);
         t.post("call Bob", MessageKind::Next, now);
         t.mark_next_step(0, now);
@@ -1321,17 +1329,17 @@ mod tests {
     fn steps_round_trip_and_old_notes_load_without() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("open", MessageKind::Next, now);
         t.post("done", MessageKind::Next, now);
         t.toggle_step(1, now);
         t.post("grows", MessageKind::Next, now);
-        b.promote_step(0, 2, "grows".into(), "", now);
+        b.promote_step(n(0), 2, "grows".into(), "", now);
         let json = serde_json::to_string(&b).unwrap();
         let back: Board = serde_json::from_str(&json).unwrap();
         assert_eq!(b, back);
 
-        let json = r#"{"id":0,"title":"t","notes":[{"at":"2026-10-01T10:00:00Z","text":"x"}]}"#;
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t","notes":[{"at":"2026-10-01T10:00:00Z","text":"x"}]}"#;
         let t: Task = serde_json::from_str(json).unwrap();
         assert_eq!(t.notes[0].next_step, None);
     }
@@ -1341,7 +1349,7 @@ mod tests {
         let mut b = board_with(1);
         let t0 = Utc::now();
         let h = TimeDelta::hours;
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post(
             "Write the report\nWith the Q3 numbers",
             MessageKind::Comment,
@@ -1352,7 +1360,7 @@ mod tests {
 
         let id = b
             .promote_step(
-                0,
+                n(0),
                 0,
                 "Write the report".into(),
                 "With the Q3 numbers",
@@ -1360,7 +1368,7 @@ mod tests {
             )
             .unwrap();
         let sub = b.task(id).unwrap();
-        assert_eq!(sub.parent, Some(0));
+        assert_eq!(sub.parent, Some(n(0)));
         assert_eq!(sub.title, "Write the report");
         assert_eq!(sub.created_at, Some(t0));
         assert_eq!(sub.updated_at, t0 + h(1));
@@ -1370,7 +1378,7 @@ mod tests {
         assert!(sub.notes[0].starred);
         assert_eq!(sub.state(), TaskState::Active);
 
-        let t = b.task(0).unwrap();
+        let t = b.task(n(0)).unwrap();
         assert_eq!(
             t.notes[0].next_step,
             Some(NextStep::Promoted {
@@ -1381,31 +1389,33 @@ mod tests {
         );
         assert_eq!(t.updated_at, t0 + h(3));
         // Still ready: "call Bob" is open.
-        assert_eq!(b.state(0), TaskState::Ready);
+        assert_eq!(b.state(n(0)), TaskState::Ready);
         // Only open steps get promoted, and only once.
-        assert_eq!(b.promote_step(0, 0, "again".into(), "", t0), None);
-        b.task_mut(0).unwrap().toggle_step(1, t0 + h(4));
-        assert_eq!(b.promote_step(0, 1, "x".into(), "", t0), None);
-        assert_eq!(b.state(0), TaskState::Active);
+        assert_eq!(b.promote_step(n(0), 0, "again".into(), "", t0), None);
+        b.task_mut(n(0)).unwrap().toggle_step(1, t0 + h(4));
+        assert_eq!(b.promote_step(n(0), 1, "x".into(), "", t0), None);
+        assert_eq!(b.state(n(0)), TaskState::Active);
         // The marker can't be unmarked, ticked or moved.
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.unmark_next_step(0);
         t.toggle_step(0, t0);
         assert!(matches!(
             t.notes[0].next_step,
             Some(NextStep::Promoted { .. })
         ));
-        assert_eq!(b.can_move_note(0, 0, id), Err(MoveError::Promoted));
+        assert_eq!(b.can_move_note(n(0), 0, id), Err(MoveError::Promoted));
         // A one-line step leaves the subtask without comments.
-        b.task_mut(0).unwrap().post("ping", MessageKind::Next, t0);
-        let id = b.promote_step(0, 2, "ping".into(), "", t0).unwrap();
+        b.task_mut(n(0))
+            .unwrap()
+            .post("ping", MessageKind::Next, t0);
+        let id = b.promote_step(n(0), 2, "ping".into(), "", t0).unwrap();
         assert!(b.task(id).unwrap().notes.is_empty());
     }
 
     #[test]
     fn blockers_round_trip_and_old_notes_load() {
         let mut b = board_with(1);
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("resolved", MessageKind::Block, Utc::now());
         t.resolve(0, Utc::now());
         t.post("open", MessageKind::Block, Utc::now());
@@ -1413,7 +1423,7 @@ mod tests {
         let back: Board = serde_json::from_str(&json).unwrap();
         assert_eq!(b, back);
 
-        let json = r#"{"id":0,"title":"t","notes":[{"at":"2026-10-01T10:00:00Z","text":"x"}]}"#;
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t","notes":[{"at":"2026-10-01T10:00:00Z","text":"x"}]}"#;
         let t: Task = serde_json::from_str(json).unwrap();
         assert_eq!(t.notes[0].blocker, None);
         assert_eq!(t.state(), TaskState::Active);
@@ -1423,7 +1433,7 @@ mod tests {
     fn blocking_stars_and_tracks_durations() {
         let mut b = board_with(1);
         let t0 = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("posted as blocker", MessageKind::Block, t0);
         t.post("plain", MessageKind::Comment, t0);
         assert!(t.notes[0].starred);
@@ -1452,7 +1462,7 @@ mod tests {
     fn unblock_resolves_the_blocker_with_a_message() {
         let mut b = board_with(1);
         let t0 = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         assert_eq!(
             t.message_kinds(),
             [
@@ -1514,7 +1524,7 @@ mod tests {
     fn edit_note_replaces_text_and_touches() {
         let mut b = board_with(1);
         let t0 = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("frist", MessageKind::Comment, t0);
         let later = t0 + TimeDelta::hours(1);
         t.edit_note(0, "   ", later);
@@ -1531,7 +1541,7 @@ mod tests {
     fn star_posts_a_starred_comment() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("nice idea", MessageKind::Star, now);
         let note = &t.notes[0];
         assert!(note.starred);
@@ -1544,7 +1554,7 @@ mod tests {
     fn close_marks_done_with_a_message() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("   ", MessageKind::Close, now);
         assert!(!t.done);
         t.post("shipped", MessageKind::Close, now);
@@ -1570,7 +1580,7 @@ mod tests {
     fn set_done_records_time() {
         let mut b = board_with(1);
         let now = Utc::now();
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.set_done(true, now);
         assert_eq!(t.done_at, Some(now));
         t.set_done(false, now);
@@ -1600,13 +1610,22 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_drops_dangling_slots_and_fixes_next_id() {
+    fn sanitize_drops_dangling_slots() {
         let mut b = board_with(2);
-        b.slots[3] = Some(99);
-        b.next_id = 0;
+        b.slots[3] = Some(n(99));
         b.sanitize();
         assert_eq!(b.slots[3], None);
-        assert_eq!(b.next_id, 2);
+    }
+
+    #[test]
+    fn new_tasks_sort_in_creation_order() {
+        let mut b = Board::default();
+        let ids: Vec<Uuid> = (0..50)
+            .map(|i| b.add_task(format!("{i}"), "", None, Utc::now()))
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, ids);
     }
 
     /// 0 ─┬─ 1 ── 3
@@ -1614,58 +1633,58 @@ mod tests {
     /// 4
     fn tree() -> Board {
         let mut b = board_with(5);
-        b.set_parent(1, Some(0));
-        b.set_parent(2, Some(0));
-        b.set_parent(3, Some(1));
+        b.set_parent(n(1), Some(n(0)));
+        b.set_parent(n(2), Some(n(0)));
+        b.set_parent(n(3), Some(n(1)));
         b
     }
 
     #[test]
     fn set_parent_refuses_cycles_and_unknown_tasks() {
         let mut b = tree();
-        assert!(!b.set_parent(0, Some(3)));
-        assert!(!b.set_parent(0, Some(0)));
-        assert!(!b.set_parent(4, Some(99)));
-        assert!(!b.set_parent(99, Some(0)));
-        assert!(b.is_descendant(3, 0));
-        assert!(!b.is_descendant(0, 3));
-        assert_eq!(b.descendants(0).len(), 3);
-        assert!(b.set_parent(3, None));
-        assert_eq!(b.task(3).unwrap().parent, None);
+        assert!(!b.set_parent(n(0), Some(n(3))));
+        assert!(!b.set_parent(n(0), Some(n(0))));
+        assert!(!b.set_parent(n(4), Some(n(99))));
+        assert!(!b.set_parent(n(99), Some(n(0))));
+        assert!(b.is_descendant(n(3), n(0)));
+        assert!(!b.is_descendant(n(0), n(3)));
+        assert_eq!(b.descendants(n(0)).len(), 3);
+        assert!(b.set_parent(n(3), None));
+        assert_eq!(b.task(n(3)).unwrap().parent, None);
     }
 
     #[test]
     fn subtasks_all_blocked_block_the_parent() {
         let now = Utc::now();
         let mut b = tree();
-        assert_eq!(b.state(0), TaskState::Active);
-        b.task_mut(3).unwrap().post("x", MessageKind::Block, now);
+        assert_eq!(b.state(n(0)), TaskState::Active);
+        b.task_mut(n(3)).unwrap().post("x", MessageKind::Block, now);
         // 1 is blocked through 3; 2 is still active.
-        assert_eq!(b.state(1), TaskState::Blocked);
-        assert!(b.blocked_by_subtasks(1));
-        assert_eq!(b.state(0), TaskState::Active);
+        assert_eq!(b.state(n(1)), TaskState::Blocked);
+        assert!(b.blocked_by_subtasks(n(1)));
+        assert_eq!(b.state(n(0)), TaskState::Active);
         // Done subtasks don't count.
-        b.task_mut(2).unwrap().set_done(true, now);
-        assert_eq!(b.state(0), TaskState::Blocked);
-        assert!(b.blocked_by_subtasks(0));
+        b.task_mut(n(2)).unwrap().set_done(true, now);
+        assert_eq!(b.state(n(0)), TaskState::Blocked);
+        assert!(b.blocked_by_subtasks(n(0)));
         // No open subtasks at all: not blocked by them.
-        b.task_mut(1).unwrap().set_done(true, now);
-        assert_eq!(b.state(0), TaskState::Active);
-        assert!(!b.blocked_by_subtasks(4));
+        b.task_mut(n(1)).unwrap().set_done(true, now);
+        assert_eq!(b.state(n(0)), TaskState::Active);
+        assert!(!b.blocked_by_subtasks(n(4)));
         // A done parent stays done.
-        b.task_mut(1).unwrap().set_done(false, now);
-        b.task_mut(0).unwrap().set_done(true, now);
-        assert_eq!(b.state(0), TaskState::Done);
+        b.task_mut(n(1)).unwrap().set_done(false, now);
+        b.task_mut(n(0)).unwrap().set_done(true, now);
+        assert_eq!(b.state(n(0)), TaskState::Done);
     }
 
     #[test]
     fn own_blocker_blocks_a_parent_with_active_subtasks() {
         let mut b = tree();
-        b.task_mut(0)
+        b.task_mut(n(0))
             .unwrap()
             .post("x", MessageKind::Block, Utc::now());
-        assert_eq!(b.state(0), TaskState::Blocked);
-        assert!(!b.blocked_by_subtasks(0));
+        assert_eq!(b.state(n(0)), TaskState::Blocked);
+        assert!(!b.blocked_by_subtasks(n(0)));
     }
 
     #[test]
@@ -1673,39 +1692,39 @@ mod tests {
         let t0 = Utc::now();
         let h = TimeDelta::hours;
         let mut b = tree();
-        assert_eq!(b.blocked_since(0), None);
-        b.task_mut(3).unwrap().post("a", MessageKind::Block, t0);
-        b.task_mut(2)
+        assert_eq!(b.blocked_since(n(0)), None);
+        b.task_mut(n(3)).unwrap().post("a", MessageKind::Block, t0);
+        b.task_mut(n(2))
             .unwrap()
             .post("b", MessageKind::Block, t0 + h(2));
         // Through 1 (via 3, since t0) and 2 (since t0+2h): the later one.
-        assert_eq!(b.blocked_since(1), Some(t0));
-        assert_eq!(b.blocked_since(0), Some(t0 + h(2)));
-        assert_eq!(b.blocked_for(0, t0 + h(5)), Some(h(3)));
+        assert_eq!(b.blocked_since(n(1)), Some(t0));
+        assert_eq!(b.blocked_since(n(0)), Some(t0 + h(2)));
+        assert_eq!(b.blocked_for(n(0), t0 + h(5)), Some(h(3)));
         // An own blocker from before that wins.
-        b.task_mut(0)
+        b.task_mut(n(0))
             .unwrap()
             .post("c", MessageKind::Block, t0 + h(1));
-        assert_eq!(b.blocked_since(0), Some(t0 + h(1)));
+        assert_eq!(b.blocked_since(n(0)), Some(t0 + h(1)));
 
         // Blocked once the last unblocked subtask was closed.
         let mut b = tree();
-        b.task_mut(3).unwrap().post("a", MessageKind::Block, t0);
-        b.task_mut(2).unwrap().set_done(true, t0 + h(4));
-        assert_eq!(b.blocked_since(0), Some(t0 + h(4)));
-        b.task_mut(0).unwrap().set_done(true, t0 + h(5));
-        assert_eq!(b.blocked_since(0), None);
+        b.task_mut(n(3)).unwrap().post("a", MessageKind::Block, t0);
+        b.task_mut(n(2)).unwrap().set_done(true, t0 + h(4));
+        assert_eq!(b.blocked_since(n(0)), Some(t0 + h(4)));
+        b.task_mut(n(0)).unwrap().set_done(true, t0 + h(5));
+        assert_eq!(b.blocked_since(n(0)), None);
     }
 
     #[test]
     fn delete_takes_subtasks_and_their_slots() {
         let mut b = tree();
-        b.focus(3);
-        b.focus(4);
-        b.delete_task(1);
+        b.focus(n(3));
+        b.focus(n(4));
+        b.delete_task(n(1));
         let ids: Vec<_> = b.tasks.iter().map(|t| t.id).collect();
-        assert_eq!(ids, [0, 2, 4]);
-        assert_eq!(b.slots, [None, Some(4), None, None]);
+        assert_eq!(ids, [n(0), n(2), n(4)]);
+        assert_eq!(b.slots, [None, Some(n(4)), None, None]);
     }
 
     #[test]
@@ -1724,13 +1743,13 @@ mod tests {
     #[test]
     fn sanitize_drops_dangling_and_cyclic_parents() {
         let mut b = board_with(4);
-        b.task_mut(0).unwrap().parent = Some(1);
-        b.task_mut(1).unwrap().parent = Some(0);
-        b.task_mut(2).unwrap().parent = Some(99);
-        b.task_mut(3).unwrap().parent = Some(1);
+        b.task_mut(n(0)).unwrap().parent = Some(n(1));
+        b.task_mut(n(1)).unwrap().parent = Some(n(0));
+        b.task_mut(n(2)).unwrap().parent = Some(n(99));
+        b.task_mut(n(3)).unwrap().parent = Some(n(1));
         b.sanitize();
         let parents: Vec<_> = b.tasks.iter().map(|t| t.parent).collect();
-        assert_eq!(parents, [None, Some(0), None, Some(1)]);
+        assert_eq!(parents, [None, Some(n(0)), None, Some(n(1))]);
     }
 
     #[test]
@@ -1738,48 +1757,56 @@ mod tests {
         let mut b = tree();
         assert_eq!(
             b.list_rows("", false),
-            [(0, 0), (1, 1), (3, 2), (2, 1), (4, 0)]
+            [(n(0), 0), (n(1), 1), (n(3), 2), (n(2), 1), (n(4), 0)]
         );
-        assert_eq!(b.list_rows("task 3", false), [(0, 0), (1, 1), (3, 2)]);
-        b.task_mut(0).unwrap().set_done(true, Utc::now());
-        b.task_mut(2).unwrap().set_done(true, Utc::now());
+        assert_eq!(
+            b.list_rows("task 3", false),
+            [(n(0), 0), (n(1), 1), (n(3), 2)]
+        );
+        b.task_mut(n(0)).unwrap().set_done(true, Utc::now());
+        b.task_mut(n(2)).unwrap().set_done(true, Utc::now());
         // 0 is closed but stays to hold its open subtasks.
-        assert_eq!(b.list_rows("", true), [(0, 0), (1, 1), (3, 2), (4, 0)]);
+        assert_eq!(
+            b.list_rows("", true),
+            [(n(0), 0), (n(1), 1), (n(3), 2), (n(4), 0)]
+        );
     }
 
     #[test]
     fn folding_hides_subtasks_except_those_on_the_board() {
         let mut b = tree();
-        b.task_mut(0).unwrap().toggle_fold();
+        b.task_mut(n(0)).unwrap().toggle_fold();
         let rows = b.list_rows("", false);
-        assert_eq!(rows, [(0, 0), (4, 0)]);
-        assert_eq!(b.hidden_subtasks(0, &rows, false), 3);
+        assert_eq!(rows, [(n(0), 0), (n(4), 0)]);
+        assert_eq!(b.hidden_subtasks(n(0), &rows, false), 3);
         // A focused subtask stays, with the path down to it.
-        b.focus(3);
+        b.focus(n(3));
         let rows = b.list_rows("", false);
-        assert_eq!(rows, [(0, 0), (1, 1), (3, 2), (4, 0)]);
-        assert_eq!(b.hidden_subtasks(0, &rows, false), 1);
+        assert_eq!(rows, [(n(0), 0), (n(1), 1), (n(3), 2), (n(4), 0)]);
+        assert_eq!(b.hidden_subtasks(n(0), &rows, false), 1);
         // Folding a leaf changes nothing.
-        b.task_mut(4).unwrap().toggle_fold();
+        b.task_mut(n(4)).unwrap().toggle_fold();
         assert_eq!(b.list_rows("", false), rows);
     }
 
     #[test]
     fn filtering_ignores_folds() {
         let mut b = tree();
-        b.task_mut(0).unwrap().toggle_fold();
-        assert_eq!(b.list_rows("task 2", false), [(0, 0), (2, 1)]);
-        assert_eq!(b.list_rows("  ", false), [(0, 0), (4, 0)]);
+        b.task_mut(n(0)).unwrap().toggle_fold();
+        assert_eq!(b.list_rows("task 2", false), [(n(0), 0), (n(2), 1)]);
+        assert_eq!(b.list_rows("  ", false), [(n(0), 0), (n(4), 0)]);
     }
 
     #[test]
     fn folded_round_trips_and_old_files_load_unfolded() {
         let mut b = tree();
-        b.task_mut(1).unwrap().toggle_fold();
+        b.task_mut(n(1)).unwrap().toggle_fold();
         let json = serde_json::to_string(&b).unwrap();
         let back: Board = serde_json::from_str(&json).unwrap();
         assert_eq!(b, back);
-        let t: Task = serde_json::from_str(r#"{"id":0,"title":"t"}"#).unwrap();
+        let t: Task =
+            serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t"}"#)
+                .unwrap();
         assert!(!t.folded);
     }
 
@@ -1789,11 +1816,13 @@ mod tests {
         let json = serde_json::to_string(&b).unwrap();
         let back: Board = serde_json::from_str(&json).unwrap();
         assert_eq!(b, back);
-        let t: Task = serde_json::from_str(r#"{"id":0,"title":"t"}"#).unwrap();
+        let t: Task =
+            serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t"}"#)
+                .unwrap();
         assert_eq!(t.parent, None);
     }
 
-    fn texts(b: &Board, id: u64) -> Vec<&str> {
+    fn texts(b: &Board, id: Uuid) -> Vec<&str> {
         b.task(id)
             .unwrap()
             .notes
@@ -1807,17 +1836,17 @@ mod tests {
         let t0 = Utc::now();
         let h = TimeDelta::hours;
         let mut b = board_with(2);
-        b.task_mut(0)
+        b.task_mut(n(0))
             .unwrap()
             .post("wrong task", MessageKind::Comment, t0 + h(2));
-        let target = b.task_mut(1).unwrap();
+        let target = b.task_mut(n(1)).unwrap();
         target.post("before", MessageKind::Comment, t0 + h(1));
         target.post("after", MessageKind::Comment, t0 + h(3));
         target.updated_at = t0;
-        assert_eq!(b.move_note(0, 0, 1), Ok(()));
-        assert!(texts(&b, 0).is_empty());
-        assert_eq!(texts(&b, 1), ["before", "wrong task", "after"]);
-        assert_eq!(b.task(1).unwrap().updated_at, t0 + h(2));
+        assert_eq!(b.move_note(n(0), 0, n(1)), Ok(()));
+        assert!(texts(&b, n(0)).is_empty());
+        assert_eq!(texts(&b, n(1)), ["before", "wrong task", "after"]);
+        assert_eq!(b.task(n(1)).unwrap().updated_at, t0 + h(2));
     }
 
     #[test]
@@ -1825,19 +1854,19 @@ mod tests {
         let t0 = Utc::now();
         let h = TimeDelta::hours;
         let mut b = board_with(2);
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("need access", MessageKind::Block, t0);
         t.post("plain", MessageKind::Comment, t0 + h(1));
         t.post("got it", MessageKind::Unblock, t0 + h(2));
         assert_eq!(t.linked_notes(0), [0, 2]);
         assert_eq!(t.linked_notes(2), [0, 2]);
         assert_eq!(t.linked_notes(1), [1]);
-        assert_eq!(b.move_note(0, 2, 1), Ok(()));
-        assert_eq!(texts(&b, 0), ["plain"]);
-        assert_eq!(texts(&b, 1), ["need access", "got it"]);
+        assert_eq!(b.move_note(n(0), 2, n(1)), Ok(()));
+        assert_eq!(texts(&b, n(0)), ["plain"]);
+        assert_eq!(texts(&b, n(1)), ["need access", "got it"]);
 
         // Resolved with the button: no message to take along.
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.set_blocking(0, t0 + h(3));
         t.resolve(0, t0 + h(4));
         assert_eq!(t.linked_notes(0), [0]);
@@ -1847,12 +1876,12 @@ mod tests {
     fn moving_an_open_blocker_needs_an_unblocked_target() {
         let now = Utc::now();
         let mut b = board_with(3);
-        b.task_mut(0).unwrap().post("a", MessageKind::Block, now);
-        b.task_mut(1).unwrap().post("b", MessageKind::Block, now);
-        assert_eq!(b.move_note(0, 0, 1), Err(MoveError::AlreadyBlocked));
-        assert_eq!(b.move_note(0, 0, 2), Ok(()));
-        assert_eq!(b.state(0), TaskState::Active);
-        assert_eq!(b.state(2), TaskState::Blocked);
+        b.task_mut(n(0)).unwrap().post("a", MessageKind::Block, now);
+        b.task_mut(n(1)).unwrap().post("b", MessageKind::Block, now);
+        assert_eq!(b.move_note(n(0), 0, n(1)), Err(MoveError::AlreadyBlocked));
+        assert_eq!(b.move_note(n(0), 0, n(2)), Ok(()));
+        assert_eq!(b.state(n(0)), TaskState::Active);
+        assert_eq!(b.state(n(2)), TaskState::Blocked);
     }
 
     #[test]
@@ -1860,42 +1889,44 @@ mod tests {
         let t0 = Utc::now();
         let h = TimeDelta::hours;
         let mut b = board_with(3);
-        let t = b.task_mut(0).unwrap();
+        let t = b.task_mut(n(0)).unwrap();
         t.post("old", MessageKind::Block, t0);
         t.post("done", MessageKind::Unblock, t0 + h(2));
         // Blocked since before "old" was resolved, and since after.
-        b.task_mut(1)
+        b.task_mut(n(1))
             .unwrap()
             .post("x", MessageKind::Block, t0 + h(1));
-        b.task_mut(2)
+        b.task_mut(n(2))
             .unwrap()
             .post("y", MessageKind::Block, t0 + h(3));
         assert_eq!(
-            b.can_move_note(0, 0, 1),
+            b.can_move_note(n(0), 0, n(1)),
             Err(MoveError::BlockedBeforeResolved)
         );
         assert_eq!(
-            b.can_move_note(0, 1, 1),
+            b.can_move_note(n(0), 1, n(1)),
             Err(MoveError::BlockedBeforeResolved)
         );
-        assert_eq!(b.move_note(0, 1, 2), Ok(()));
-        assert_eq!(texts(&b, 2), ["old", "done", "y"]);
+        assert_eq!(b.move_note(n(0), 1, n(2)), Ok(()));
+        assert_eq!(texts(&b, n(2)), ["old", "done", "y"]);
     }
 
     #[test]
     fn closed_targets_close_notes_and_the_same_task_are_refused() {
         let now = Utc::now();
         let mut b = board_with(3);
-        b.task_mut(0).unwrap().post("c", MessageKind::Comment, now);
-        b.task_mut(1).unwrap().set_done(true, now);
-        b.task_mut(2)
+        b.task_mut(n(0))
+            .unwrap()
+            .post("c", MessageKind::Comment, now);
+        b.task_mut(n(1)).unwrap().set_done(true, now);
+        b.task_mut(n(2))
             .unwrap()
             .post("shipped", MessageKind::Close, now);
-        assert_eq!(b.can_move_note(0, 0, 0), Err(MoveError::SameTask));
-        assert_eq!(b.can_move_note(0, 0, 1), Err(MoveError::TargetClosed));
-        assert_eq!(b.can_move_note(2, 0, 0), Err(MoveError::CloseNote));
-        assert_eq!(b.can_move_note(0, 5, 2), Err(MoveError::NotFound));
-        assert_eq!(b.can_move_note(0, 0, 99), Err(MoveError::NotFound));
+        assert_eq!(b.can_move_note(n(0), 0, n(0)), Err(MoveError::SameTask));
+        assert_eq!(b.can_move_note(n(0), 0, n(1)), Err(MoveError::TargetClosed));
+        assert_eq!(b.can_move_note(n(2), 0, n(0)), Err(MoveError::CloseNote));
+        assert_eq!(b.can_move_note(n(0), 5, n(2)), Err(MoveError::NotFound));
+        assert_eq!(b.can_move_note(n(0), 0, n(99)), Err(MoveError::NotFound));
     }
 
     #[test]

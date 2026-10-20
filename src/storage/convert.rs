@@ -8,34 +8,39 @@ use crate::model::{Blocker, NextStep, Note, NoteAction, Task};
 
 pub fn task_row(t: &Task) -> task::ActiveModel {
     task::Model {
-        id: t.id as i64,
+        id: t.id.to_string(),
         title: t.title.clone(),
         done: t.done,
         updated_at: t.updated_at,
         created_at: t.created_at,
         done_at: t.done_at,
-        parent_id: t.parent.map(|p| p as i64),
+        parent_id: t.parent.map(|p| p.to_string()),
         folded: t.folded,
     }
     .into_active_model()
 }
 
 /// A task without its notes, which come from their own table.
-pub fn task_from_row(row: task::Model) -> Task {
-    Task {
-        id: row.id as u64,
+pub fn task_from_row(row: task::Model) -> Result<Task, DbErr> {
+    Ok(Task {
+        id: parse_id(&row.id, "task")?,
         title: row.title,
         notes: Vec::new(),
         done: row.done,
         updated_at: row.updated_at,
         created_at: row.created_at,
         done_at: row.done_at,
-        parent: row.parent_id.map(|p| p as u64),
+        parent: row.parent_id.map(|p| parse_id(&p, "parent")).transpose()?,
         folded: row.folded,
-    }
+    })
 }
 
-pub fn note_row(task_id: u64, position: usize, n: &Note) -> note::ActiveModel {
+/// A UUID stored as text; `what` names it in the error.
+pub fn parse_id(text: &str, what: &str) -> Result<Uuid, DbErr> {
+    Uuid::parse_str(text).map_err(|e| DbErr::Custom(format!("bad {what} id {text:?}: {e}")))
+}
+
+pub fn note_row(task_id: Uuid, position: usize, n: &Note) -> note::ActiveModel {
     let (blocker_state, blocker_resolved_at) = match n.blocker {
         None => (None, None),
         Some(Blocker::Open) => (Some("open"), None),
@@ -49,7 +54,7 @@ pub fn note_row(task_id: u64, position: usize, n: &Note) -> note::ActiveModel {
             Some("promoted"),
             Some(since),
             Some(at),
-            Some(subtask as i64),
+            Some(subtask.to_string()),
         ),
     };
     let (action_kind, action_quote, action_blocked_since) = match &n.action {
@@ -62,7 +67,7 @@ pub fn note_row(task_id: u64, position: usize, n: &Note) -> note::ActiveModel {
     };
     note::Model {
         id: n.id.to_string(),
-        task_id: task_id as i64,
+        task_id: task_id.to_string(),
         position: position as i32,
         at: n.at,
         text: n.text.clone(),
@@ -82,8 +87,7 @@ pub fn note_row(task_id: u64, position: usize, n: &Note) -> note::ActiveModel {
 }
 
 pub fn note_from_row(row: note::Model) -> Result<Note, DbErr> {
-    let id = Uuid::parse_str(&row.id)
-        .map_err(|e| DbErr::Custom(format!("note {}: bad id: {e}", row.id)))?;
+    let id = parse_id(&row.id, "note")?;
     let blocker = match row.blocker_state.as_deref() {
         None => None,
         Some("open") => Some(Blocker::Open),
@@ -105,7 +109,10 @@ pub fn note_from_row(row: note::Model) -> Result<Note, DbErr> {
                 "promoted" => NextStep::Promoted {
                     since,
                     at: required(row.next_step_at, "next_step_at", &row.id)?,
-                    subtask: required(row.next_step_subtask, "next_step_subtask", &row.id)? as u64,
+                    subtask: parse_id(
+                        &required(row.next_step_subtask, "next_step_subtask", &row.id)?,
+                        "subtask",
+                    )?,
                 },
                 other => return Err(unknown("next_step_state", other, &row.id)),
             })

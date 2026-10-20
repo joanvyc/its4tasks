@@ -3,7 +3,7 @@
 its4tasks is an egui/eframe desktop todo app: four focus cards plus a task list, with a daily/weekly log view. The code is in `src/`:
 - `model.rs`: data and rules
 - `log.rs`: log grouping
-- `api.rs`: the only way the UI reaches the model. It reads a `&Board` and sends serializable `Change`s to `Api::apply`, which also saves. Changes address comments by their stable `Note::id` (a UUID), never by position
+- `api.rs`: the only way the UI reaches the model. It reads a `&Board` and sends serializable `Change`s to `Api::apply`, which also saves. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4), and changes address comments by id, never by position
 - `app.rs`: UI
 - `storage/`: SQLite persistence through sea-orm (entities, migrations, and a diff so a save writes only what changed), plus a one-time import of the old `board.json`
 

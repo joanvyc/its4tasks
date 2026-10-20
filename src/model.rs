@@ -58,7 +58,7 @@ pub enum NoteAction {
 }
 
 /// What posting from the comment box does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
     Comment,
     Star,

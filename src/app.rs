@@ -9,12 +9,12 @@ use eframe::egui::{
     text::{CCursor, LayoutJob},
 };
 
+use crate::api::{Api, Change};
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
     SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
-use crate::storage::Store;
 
 const CARD_GAP: f32 = 12.0;
 const CARD_MARGIN: i8 = 14;
@@ -149,7 +149,13 @@ fn task_menu_items(ui: &mut egui::Ui, task_id: u64, is_subtask: bool, actions: &
         actions.push(Action::AddSubtask(task_id, String::new()));
     }
     if is_subtask && ui.button("Make root task").clicked() {
-        actions.push(Action::SetParent(task_id, None));
+        actions.push(
+            Change::SetParent {
+                task: task_id,
+                parent: None,
+            }
+            .into(),
+        );
     }
     if ui.button("Delete…").clicked() {
         actions.push(Action::Delete(task_id));
@@ -215,7 +221,7 @@ fn comment_menu_items(
                 .on_hover_text("Tick this step off")
                 .clicked()
             {
-                actions.push(Action::ToggleStep(task_id, idx));
+                actions.push(Change::ToggleStep { task: task_id, idx }.into());
             }
             if ui
                 .button("Promote to subtask…")
@@ -225,15 +231,15 @@ fn comment_menu_items(
                 actions.push(Action::StartPromote(task_id, idx));
             }
             if ui.button("Not a next step").clicked() {
-                actions.push(Action::UnmarkStep(task_id, idx));
+                actions.push(Change::UnmarkStep { task: task_id, idx }.into());
             }
         }
         Some(NextStep::Done { .. }) => {
             if ui.button("Reopen step").clicked() {
-                actions.push(Action::ToggleStep(task_id, idx));
+                actions.push(Change::ToggleStep { task: task_id, idx }.into());
             }
             if ui.button("Not a next step").clicked() {
-                actions.push(Action::UnmarkStep(task_id, idx));
+                actions.push(Change::UnmarkStep { task: task_id, idx }.into());
             }
         }
         Some(NextStep::Promoted { .. }) => {}
@@ -244,7 +250,7 @@ fn comment_menu_items(
     }
     let star = if note.starred { "Unstar" } else { "Star" };
     if ui.button(star).clicked() {
-        actions.push(Action::ToggleStar(task_id, idx));
+        actions.push(Change::ToggleStar { task: task_id, idx }.into());
     }
     let unmovable = match (&note.action, note.next_step) {
         (Some(NoteAction::Closed), _) => Some(MoveError::CloseNote),
@@ -260,7 +266,7 @@ fn comment_menu_items(
         actions.push(Action::StartMove(task_id, idx));
     }
     if ui.button("Delete").clicked() {
-        actions.push(Action::DeleteNote(task_id, idx));
+        actions.push(Change::DeleteNote { task: task_id, idx }.into());
     }
 }
 
@@ -280,10 +286,10 @@ fn blocker_menu_items(
                 .on_hover_text("Mark this blocker as resolved")
                 .clicked()
             {
-                actions.push(Action::Resolve(task_id, idx));
+                actions.push(Change::Resolve { task: task_id, idx }.into());
             }
             if ui.button("Not blocking").clicked() {
-                actions.push(Action::Unblock(task_id, idx));
+                actions.push(Change::Unblock { task: task_id, idx }.into());
             }
         }
         Some(Blocker::Resolved { .. }) => {
@@ -293,10 +299,10 @@ fn blocker_menu_items(
                 .on_disabled_hover_text(CommandError::AlreadyBlocked.to_string())
                 .clicked()
             {
-                actions.push(Action::MarkBlocking(task_id, idx));
+                actions.push(Change::MarkBlocking { task: task_id, idx }.into());
             }
             if ui.button("Not blocking").clicked() {
-                actions.push(Action::Unblock(task_id, idx));
+                actions.push(Change::Unblock { task: task_id, idx }.into());
             }
         }
         None => {
@@ -307,7 +313,7 @@ fn blocker_menu_items(
                 .on_disabled_hover_text(CommandError::AlreadyBlocked.to_string())
                 .clicked()
             {
-                actions.push(Action::MarkBlocking(task_id, idx));
+                actions.push(Change::MarkBlocking { task: task_id, idx }.into());
             }
             if note.action.is_none()
                 && ui
@@ -315,7 +321,7 @@ fn blocker_menu_items(
                     .on_hover_text("The next thing to do here, and it's up to you")
                     .clicked()
             {
-                actions.push(Action::MarkStep(task_id, idx));
+                actions.push(Change::MarkStep { task: task_id, idx }.into());
             }
         }
     }
@@ -579,7 +585,7 @@ fn comment(
             // No spacing after the box: its label is empty.
             ui.spacing_mut().icon_spacing = 0.0;
             if ui.checkbox(&mut done, "").on_hover_text(hint).changed() {
-                actions.push(Action::ToggleStep(task_id, idx));
+                actions.push(Change::ToggleStep { task: task_id, idx }.into());
             }
         }
         ui.label(RichText::new(local_time(note.at)).small().weak());
@@ -656,7 +662,7 @@ fn comment(
                 .add_visible(note.starred || hovered, star.frame(false).small())
                 .on_hover_text(if note.starred { "Unstar" } else { "Star" });
             if star.clicked() {
-                actions.push(Action::ToggleStar(task_id, idx));
+                actions.push(Change::ToggleStar { task: task_id, idx }.into());
             }
             let id = ui.make_persistent_id(("comment_menu", task_id, idx));
             dots_menu(ui, id, hovered && edit.is_none(), |ui| {
@@ -681,7 +687,7 @@ fn comment(
         if promoted_to.is_some() {
             let response = ui.add(label).on_hover_text("Focus the subtask");
             if response.clicked() {
-                actions.push(Action::Focus(subtask));
+                actions.push(Change::Focus { task: subtask }.into());
             }
         } else {
             ui.add(label).on_hover_text("The subtask was deleted");
@@ -876,32 +882,28 @@ struct NoteMove {
     target: Option<u64>,
 }
 
-/// Changes requested while drawing, applied once drawing is done so we don't
-/// mutate the board while iterating over it.
+/// What was requested while drawing, done once drawing is done so we don't
+/// change the board while iterating over it.
 enum Action {
-    Focus(u64),
-    FocusInto(usize, u64),
-    Unfocus(usize),
+    /// A change to the board, sent to the API.
+    Change(Change),
     /// Ask for confirmation, then delete.
     Delete(u64),
     /// Open the new task dialog for a subtask of this task, with this title.
     AddSubtask(u64, String),
-    SetParent(u64, Option<u64>),
-    DeleteNote(u64, usize),
-    MarkBlocking(u64, usize),
-    Resolve(u64, usize),
-    Unblock(u64, usize),
-    MarkStep(u64, usize),
-    ToggleStep(u64, usize),
-    UnmarkStep(u64, usize),
     /// Open the new subtask dialog to turn this next step into a subtask.
     StartPromote(u64, usize),
-    ToggleStar(u64, usize),
     StartEdit(u64, usize),
     /// Open the dialog for moving a comment to another task.
     StartMove(u64, usize),
     SaveEdit,
     CancelEdit,
+}
+
+impl From<Change> for Action {
+    fn from(change: Change) -> Self {
+        Action::Change(change)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -911,9 +913,8 @@ enum View {
 }
 
 pub struct TodoApp {
-    board: Board,
-    /// `None` if the database couldn't be opened; changes then aren't saved.
-    store: Option<Store>,
+    /// The board is only read through `api.board()` and changed through `api.apply`.
+    api: Api,
     filter: String,
     new_task: Option<NewTaskDraft>,
     /// The task waiting for the user to confirm its deletion.
@@ -932,21 +933,14 @@ pub struct TodoApp {
     log_starred_only: bool,
     /// Leave done tasks out of the task list.
     hide_closed: bool,
-    dirty: bool,
 }
 
 impl TodoApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(Theme::Light);
-        let store = Store::open()
-            .inspect_err(|e| {
-                eprintln!("its4tasks: failed to open the database: {e}; changes won't be saved")
-            })
-            .ok();
         Self {
-            board: store.as_ref().map(Store::load).unwrap_or_default(),
-            store,
+            api: Api::open(),
             filter: String::new(),
             new_task: None,
             confirm_delete: None,
@@ -959,19 +953,13 @@ impl TodoApp {
             log_period: Period::Day,
             log_starred_only: false,
             hide_closed: false,
-            dirty: false,
         }
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
-        let now = Utc::now();
         for action in actions {
             match action {
-                Action::Focus(id) => {
-                    self.board.focus(id);
-                }
-                Action::FocusInto(slot, id) => self.board.focus_into(slot, id),
-                Action::Unfocus(slot) => self.board.unfocus(slot),
+                Action::Change(change) => self.change(change),
                 Action::Delete(id) => self.confirm_delete = Some(id),
                 Action::AddSubtask(id, title) => {
                     self.new_task = Some(NewTaskDraft {
@@ -980,48 +968,8 @@ impl TodoApp {
                         ..Default::default()
                     });
                 }
-                Action::SetParent(id, parent) => {
-                    self.board.set_parent(id, parent);
-                }
-                Action::DeleteNote(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.delete_note(idx);
-                    }
-                    // The indices after it have shifted.
-                    self.editing.take_if(|e| e.task_id == id);
-                }
-                Action::MarkBlocking(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.set_blocking(idx, now);
-                    }
-                }
-                Action::Resolve(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.resolve(idx, now);
-                    }
-                }
-                Action::Unblock(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.unmark_blocking(idx);
-                    }
-                }
-                Action::MarkStep(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.mark_next_step(idx, now);
-                    }
-                }
-                Action::ToggleStep(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.toggle_step(idx, now);
-                    }
-                }
-                Action::UnmarkStep(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.unmark_next_step(idx);
-                    }
-                }
                 Action::StartPromote(id, idx) => {
-                    let note = self.board.task(id).and_then(|t| t.notes.get(idx));
+                    let note = self.api.board().task(id).and_then(|t| t.notes.get(idx));
                     if let Some(note) = note {
                         let (title, body) = match split_title(&note.text) {
                             (Some(title), body) => (title, body.trim()),
@@ -1036,13 +984,8 @@ impl TodoApp {
                         });
                     }
                 }
-                Action::ToggleStar(id, idx) => {
-                    if let Some(task) = self.board.task_mut(id) {
-                        task.toggle_star(idx);
-                    }
-                }
                 Action::StartEdit(id, idx) => {
-                    let note = self.board.task(id).and_then(|t| t.notes.get(idx));
+                    let note = self.api.board().task(id).and_then(|t| t.notes.get(idx));
                     self.editing = note.map(|note| NoteEdit {
                         task_id: id,
                         idx,
@@ -1058,28 +1001,34 @@ impl TodoApp {
                     });
                 }
                 Action::SaveEdit => {
-                    if let Some(edit) = self.editing.take()
-                        && let Some(task) = self.board.task_mut(edit.task_id)
-                    {
-                        task.edit_note(edit.idx, &edit.text, now);
+                    if let Some(edit) = self.editing.take() {
+                        self.change(Change::EditNote {
+                            task: edit.task_id,
+                            idx: edit.idx,
+                            text: edit.text,
+                        });
                     }
                 }
                 Action::CancelEdit => self.editing = None,
             }
-            self.dirty = true;
         }
     }
 
-    fn save_if_dirty(&mut self) {
-        if !self.dirty {
-            return;
+    /// Sends a change to the API, logging why it failed if it did.
+    fn change(&mut self, change: Change) {
+        // Comment indices on these tasks shift, so an open edit would point
+        // at the wrong comment.
+        let shifted = match change {
+            Change::DeleteNote { task, .. } | Change::DeleteTask { task } => [Some(task), None],
+            Change::MoveNote { from, to, .. } => [Some(from), Some(to)],
+            _ => [None, None],
+        };
+        match self.api.apply(change) {
+            Ok(_) => {
+                self.editing.take_if(|e| shifted.contains(&Some(e.task_id)));
+            }
+            Err(e) => eprintln!("its4tasks: {e}"),
         }
-        if let Some(store) = &mut self.store
-            && let Err(e) = store.save(&self.board)
-        {
-            eprintln!("its4tasks: failed to save: {e}");
-        }
-        self.dirty = false;
     }
 
     fn task_list(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1101,13 +1050,13 @@ impl TodoApp {
         });
         ui.add_space(4.0);
 
-        let shown = self.board.list_rows(&self.filter, self.hide_closed);
+        let shown = self.api.board().list_rows(&self.filter, self.hide_closed);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
                     "{} of {} tasks",
                     shown.len(),
-                    self.board.tasks.len()
+                    self.api.board().tasks.len()
                 ))
                 .small()
                 .weak(),
@@ -1127,35 +1076,36 @@ impl TodoApp {
         });
         ui.separator();
 
-        let has_free_slot = self.board.has_free_slot();
+        let has_free_slot = self.api.board().has_free_slot();
         let now = Utc::now();
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            if self.board.tasks.is_empty() {
+            if self.api.board().tasks.is_empty() {
                 ui.add_space(8.0);
                 ui.weak("No tasks yet. Press + to create one.");
             }
             for &(id, depth) in &shown {
-                let slot = self.board.slot_of(id);
-                let has_subtasks = self.board.children(id).next().is_some();
+                let slot = self.api.board().slot_of(id);
+                let has_subtasks = self.api.board().children(id).next().is_some();
                 // Only shown while folds apply, i.e. without a filter.
                 let hidden = self
-                    .board
+                    .api
+                    .board()
                     .task(id)
                     .filter(|t| t.folded && self.filter.trim().is_empty())
-                    .map(|_| self.board.hidden_subtasks(id, &shown, self.hide_closed));
-                // Read from the whole board before borrowing the task mutably.
+                    .map(|_| self.api.board().hidden_subtasks(id, &shown, self.hide_closed));
                 let blocker = self
-                    .board
+                    .api
+                    .board()
                     .task(id)
-                    .and_then(|t| blocked_text(&self.board, t, now));
-                let next_steps = (self.board.state(id) == TaskState::Ready)
-                    .then(|| self.board.task(id).map(next_steps_text))
+                    .and_then(|t| blocked_text(self.api.board(), t, now));
+                let next_steps = (self.api.board().state(id) == TaskState::Ready)
+                    .then(|| self.api.board().task(id).map(next_steps_text))
                     .flatten();
                 // Whether a task dragged over this row may become its subtask.
-                let can_adopt = |dragged: u64| self.board.can_set_parent(dragged, Some(id));
+                let can_adopt = |dragged: u64| self.api.board().can_set_parent(dragged, Some(id));
                 let hovered_payload =
                     DragAndDrop::payload::<u64>(ui.ctx()).filter(|d| can_adopt(**d));
-                let Some(task) = self.board.task_mut(id) else {
+                let Some(task) = self.api.board().task(id) else {
                     continue;
                 };
                 let is_subtask = task.parent.is_some();
@@ -1185,8 +1135,7 @@ impl TodoApp {
                         bar_response.on_hover_text(hover);
                         let mut done = task.done;
                         if ui.checkbox(&mut done, "").changed() {
-                            task.set_done(done, now);
-                            self.dirty = true;
+                            actions.push(Change::SetDone { task: id, done }.into());
                         }
                         // Kept for tasks without subtasks too, so titles line up.
                         let (arrow, _) =
@@ -1223,7 +1172,7 @@ impl TodoApp {
                                     .on_hover_text("Bring into focus")
                                     .on_disabled_hover_text("All 4 focus slots are taken");
                                 if btn.clicked() {
-                                    actions.push(Action::Focus(id));
+                                    actions.push(Change::Focus { task: id }.into());
                                 }
                             }
                             // Always laid out, so titles don't reflow on hover.
@@ -1261,8 +1210,7 @@ impl TodoApp {
                             });
                         });
                         if toggle_fold {
-                            task.toggle_fold();
-                            self.dirty = true;
+                            actions.push(Change::ToggleFold { task: id }.into());
                         }
                     })
                 });
@@ -1286,7 +1234,7 @@ impl TodoApp {
                     if ui.input(|i| i.pointer.any_released())
                         && let Some(dragged) = DragAndDrop::take_payload::<u64>(ui.ctx())
                     {
-                        actions.push(Action::SetParent(*dragged, Some(id)));
+                        actions.push(Change::SetParent { task: *dragged, parent: Some(id) }.into());
                     }
                 }
             }
@@ -1315,20 +1263,20 @@ impl TodoApp {
         let visuals = ui.visuals().clone();
         let colors = palette(&visuals);
         let now = Utc::now();
-        let task_id = self.board.slots[slot];
-        let task = task_id.and_then(|id| self.board.task(id));
+        let task_id = self.api.board().slots[slot];
+        let task = task_id.and_then(|id| self.api.board().task(id));
         let stroke = match task {
             Some(task) if !task.done => Stroke::new(2.0, freshness_color(task, now, &visuals)),
             _ => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         };
         // Read from the whole board before the task is borrowed mutably below.
-        let state = task_id.map(|id| self.board.state(id));
+        let state = task_id.map(|id| self.api.board().state(id));
         let blocked = state == Some(TaskState::Blocked);
-        let blocked_since = task_id.and_then(|id| self.board.blocked_since(id));
-        let by_subtasks = task_id.is_some_and(|id| self.board.blocked_by_subtasks(id));
+        let blocked_since = task_id.and_then(|id| self.api.board().blocked_since(id));
+        let by_subtasks = task_id.is_some_and(|id| self.api.board().blocked_by_subtasks(id));
         let parent_title = task
             .and_then(|t| t.parent)
-            .and_then(|p| self.board.task(p))
+            .and_then(|p| self.api.board().task(p))
             .map(|p| p.title.clone());
         let has_task = task.is_some();
         let ready = state == Some(TaskState::Ready);
@@ -1338,7 +1286,7 @@ impl TodoApp {
             .flat_map(|t| &t.notes)
             .filter_map(|n| match n.next_step {
                 Some(NextStep::Promoted { subtask, .. }) => {
-                    let title = self.board.task(subtask)?.title.clone();
+                    let title = self.api.board().task(subtask)?.title.clone();
                     Some((subtask, title))
                 }
                 _ => None,
@@ -1356,7 +1304,7 @@ impl TodoApp {
         let (zone, dropped) = ui.dnd_drop_zone::<u64, _>(frame, |ui| {
             ui.set_min_size(content);
             ui.set_max_size(content);
-            let Some(task) = task_id.and_then(|id| self.board.task_mut(id)) else {
+            let Some(task) = task_id.and_then(|id| self.api.board().task(id)) else {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Drop a task here or press → in the list");
                 });
@@ -1365,8 +1313,13 @@ impl TodoApp {
             ui.horizontal(|ui| {
                 let mut done = task.done;
                 if ui.checkbox(&mut done, "").changed() {
-                    task.set_done(done, now);
-                    self.dirty = true;
+                    actions.push(
+                        Change::SetDone {
+                            task: task.id,
+                            done,
+                        }
+                        .into(),
+                    );
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -1374,16 +1327,22 @@ impl TodoApp {
                         .on_hover_text("Send back to the list")
                         .clicked()
                     {
-                        actions.push(Action::Unfocus(slot));
+                        actions.push(Change::Unfocus { slot }.into());
                     }
                     task_menu(ui, task.id, task.parent.is_some(), true, actions);
-                    let title = TextEdit::singleline(&mut task.title)
+                    let mut title = task.title.clone();
+                    let edit = TextEdit::singleline(&mut title)
                         .font(TextStyle::Heading)
                         .frame(Frame::NONE)
                         .desired_width(f32::INFINITY);
-                    if ui.add(title).changed() {
-                        task.touch(now);
-                        self.dirty = true;
+                    if ui.add(edit).changed() {
+                        actions.push(
+                            Change::Rename {
+                                task: task.id,
+                                title,
+                            }
+                            .into(),
+                        );
                     }
                 });
             });
@@ -1573,10 +1532,16 @@ impl TodoApp {
                 if submit && !draft.trim().is_empty() {
                     match task.parse_input(draft).result {
                         Ok(Submit::Post(k, text)) => {
-                            task.post(text, k.unwrap_or(*kind), now);
+                            actions.push(
+                                Change::Post {
+                                    task: task.id,
+                                    text: text.to_owned(),
+                                    kind: k.unwrap_or(*kind),
+                                }
+                                .into(),
+                            );
                             draft.clear();
                             *kind = MessageKind::Comment;
-                            self.dirty = true;
                         }
                         Ok(Submit::SetKind(k)) => {
                             *kind = k;
@@ -1703,7 +1668,7 @@ impl TodoApp {
             ui.painter().set(background, Shape::Vec(shapes));
         }
         if let Some(id) = dropped {
-            actions.push(Action::FocusInto(slot, *id));
+            actions.push(Change::FocusInto { slot, task: *id }.into());
         }
     }
 
@@ -1746,7 +1711,12 @@ impl TodoApp {
     }
 
     fn log_view(&mut self, ui: &mut egui::Ui) {
-        let pages = log::build(&self.board, self.log_period, self.log_starred_only, &Local);
+        let pages = log::build(
+            self.api.board(),
+            self.log_period,
+            self.log_starred_only,
+            &Local,
+        );
         let time_format = match self.log_period {
             Period::Day => "%H:%M",
             Period::Week => "%a %H:%M",
@@ -1774,12 +1744,12 @@ impl TodoApp {
     }
 
     fn delete_modal(&mut self, ctx: &egui::Context) {
-        let Some(task) = self.confirm_delete.and_then(|id| self.board.task(id)) else {
+        let Some(task) = self.confirm_delete.and_then(|id| self.api.board().task(id)) else {
             self.confirm_delete = None;
             return;
         };
         let id = task.id;
-        let prompt = delete_prompt(task, self.board.descendants(id).len());
+        let prompt = delete_prompt(task, self.api.board().descendants(id).len());
         let mut confirm = false;
         let mut cancel = false;
         let modal = Modal::new(Id::unique("delete_task_modal")).show(ctx, |ui| {
@@ -1800,10 +1770,8 @@ impl TodoApp {
             });
         });
         if confirm {
-            self.board.delete_task(id);
-            self.editing.take_if(|e| e.task_id == id);
+            self.change(Change::DeleteTask { task: id });
             self.confirm_delete = None;
-            self.dirty = true;
         } else if cancel || modal.should_close() {
             self.confirm_delete = None;
         }
@@ -1816,11 +1784,11 @@ impl TodoApp {
             return;
         };
         let (from, idx) = (moving.from, moving.idx);
-        let Some(source) = self.board.task(from).filter(|t| idx < t.notes.len()) else {
+        let Some(source) = self.api.board().task(from).filter(|t| idx < t.notes.len()) else {
             self.moving = None;
             return;
         };
-        let rows = self.board.list_rows("", true);
+        let rows = self.api.board().list_rows("", true);
         let mut confirm = false;
         let mut cancel = false;
         let modal = Modal::new(Id::unique("move_note_modal")).show(ctx, |ui| {
@@ -1831,10 +1799,10 @@ impl TodoApp {
             ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for (id, depth) in rows {
-                    let Some(task) = self.board.task(id) else {
+                    let Some(task) = self.api.board().task(id) else {
                         continue;
                     };
-                    let allowed = self.board.can_move_note(from, idx, id);
+                    let allowed = self.api.board().can_move_note(from, idx, id);
                     ui.horizontal(|ui| {
                         ui.add_space(depth as f32 * SUBTASK_INDENT);
                         let selected = moving.target == Some(id);
@@ -1880,12 +1848,7 @@ impl TodoApp {
             });
         });
         if confirm && let Some(to) = moving.target {
-            if self.board.move_note(from, idx, to).is_ok() {
-                // The comment indices of both tasks have shifted.
-                self.editing
-                    .take_if(|e| e.task_id == from || e.task_id == to);
-                self.dirty = true;
-            }
+            self.change(Change::MoveNote { from, idx, to });
             self.moving = None;
         } else if cancel || modal.should_close() {
             self.moving = None;
@@ -1893,13 +1856,13 @@ impl TodoApp {
     }
 
     fn new_task_modal(&mut self, ctx: &egui::Context) {
-        let has_free_slot = self.board.has_free_slot();
+        let has_free_slot = self.api.board().has_free_slot();
         let Some(draft) = &mut self.new_task else {
             return;
         };
         let parent_title = draft
             .parent
-            .and_then(|id| self.board.task(id))
+            .and_then(|id| self.api.board().task(id))
             .map(|t| t.title.clone());
         let promoting = draft.from_step.is_some();
         let mut submit = false;
@@ -1963,22 +1926,21 @@ impl TodoApp {
         if submit && !draft.title.trim().is_empty() {
             let draft = self.new_task.take().unwrap_or_default();
             let title = draft.title.trim().to_owned();
-            let id = match (draft.parent, draft.from_step) {
-                (Some(parent), Some(idx)) => {
-                    self.board
-                        .promote_step(parent, idx, title, &draft.notes, Utc::now())
-                }
-                _ => Some(
-                    self.board
-                        .add_task(title, &draft.notes, draft.parent, Utc::now()),
-                ),
-            };
-            if draft.add_to_focus
-                && let Some(id) = id
-            {
-                self.board.focus(id);
-            }
-            self.dirty = true;
+            self.change(match (draft.parent, draft.from_step) {
+                (Some(parent), Some(idx)) => Change::PromoteStep {
+                    task: parent,
+                    idx,
+                    title,
+                    notes: draft.notes,
+                    focus: draft.add_to_focus,
+                },
+                _ => Change::AddTask {
+                    title,
+                    notes: draft.notes,
+                    parent: draft.parent,
+                    focus: draft.add_to_focus,
+                },
+            });
         } else if cancel || modal.should_close() {
             self.new_task = None;
         }
@@ -2004,12 +1966,7 @@ impl eframe::App for TodoApp {
         self.delete_modal(&ui.ctx().clone());
         self.move_modal(&ui.ctx().clone());
         self.apply(actions);
-        self.save_if_dirty();
         // Keep the freshness colors drifting while the app sits idle.
         ui.ctx().request_repaint_after(Duration::from_secs(60));
-    }
-
-    fn on_exit(&mut self) {
-        self.save_if_dirty();
     }
 }

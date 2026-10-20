@@ -14,7 +14,7 @@ use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
     SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
-use crate::storage;
+use crate::storage::Store;
 
 const CARD_GAP: f32 = 12.0;
 const CARD_MARGIN: i8 = 14;
@@ -912,6 +912,8 @@ enum View {
 
 pub struct TodoApp {
     board: Board,
+    /// `None` if the database couldn't be opened; changes then aren't saved.
+    store: Option<Store>,
     filter: String,
     new_task: Option<NewTaskDraft>,
     /// The task waiting for the user to confirm its deletion.
@@ -937,8 +939,14 @@ impl TodoApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(Theme::Light);
+        let store = Store::open()
+            .inspect_err(|e| {
+                eprintln!("its4tasks: failed to open the database: {e}; changes won't be saved")
+            })
+            .ok();
         Self {
-            board: storage::load(),
+            board: store.as_ref().map(Store::load).unwrap_or_default(),
+            store,
             filter: String::new(),
             new_task: None,
             confirm_delete: None,
@@ -1066,7 +1074,9 @@ impl TodoApp {
         if !self.dirty {
             return;
         }
-        if let Err(e) = storage::save(&self.board) {
+        if let Some(store) = &mut self.store
+            && let Err(e) = store.save(&self.board)
+        {
             eprintln!("its4tasks: failed to save: {e}");
         }
         self.dirty = false;

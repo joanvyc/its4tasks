@@ -1,3 +1,5 @@
+//! The JSON file the board lived in before SQLite, imported once.
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -6,18 +8,15 @@ use directories::ProjectDirs;
 
 use crate::model::Board;
 
-/// `~/.local/share/its4tasks/board.json` on Linux, the platform equivalent elsewhere.
-pub fn data_path() -> Option<PathBuf> {
-    ProjectDirs::from("", "", "its4tasks").map(|d| d.data_dir().join("board.json"))
-}
+pub const FILE_NAME: &str = "board.json";
 
 /// Where the app kept its board when it was called focal.
 fn legacy_data_path() -> Option<PathBuf> {
-    ProjectDirs::from("", "", "focal").map(|d| d.data_dir().join("board.json"))
+    ProjectDirs::from("", "", "focal").map(|d| d.data_dir().join(FILE_NAME))
 }
 
 /// Moves a board left by the old focal name to `path`, if there is one and `path` is free.
-fn migrate_legacy(path: &Path) {
+pub fn migrate_legacy(path: &Path) {
     let Some(legacy) = legacy_data_path() else {
         return;
     };
@@ -42,47 +41,47 @@ fn migrate_legacy(path: &Path) {
     }
 }
 
-pub fn load() -> Board {
-    let Some(path) = data_path() else {
-        eprintln!("its4tasks: could not determine a data directory; starting empty");
-        return Board::default();
-    };
-    migrate_legacy(&path);
-    let text = match fs::read_to_string(&path) {
+/// The board in the file at `path`, if there is a readable one.
+pub fn read(path: &Path) -> Option<Board> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Board::default(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(e) => {
             eprintln!("its4tasks: failed to read {}: {e}", path.display());
-            return Board::default();
+            return None;
         }
     };
     match serde_json::from_str::<Board>(&text) {
         Ok(mut board) => {
             board.sanitize();
-            board
+            Some(board)
         }
         Err(e) => {
-            // Keep the unreadable file around instead of overwriting it on the next save.
+            // Keep the unreadable file around, out of the way of the next import.
             let backup = path.with_extension("json.corrupt");
             eprintln!(
                 "its4tasks: failed to parse {}: {e}; moved it to {}",
                 path.display(),
                 backup.display()
             );
-            let _ = fs::rename(&path, &backup);
-            Board::default()
+            let _ = fs::rename(path, &backup);
+            None
         }
     }
 }
 
-/// Write to a temp file then rename, so a crash can't leave a half-written file.
-pub fn save(board: &Board) -> io::Result<()> {
-    let path = data_path().ok_or_else(|| io::Error::other("no data directory"))?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+/// Renames the file once its board is in the database, so it isn't imported again.
+pub fn mark_imported(path: &Path) {
+    let done = path.with_extension("json.imported");
+    match fs::rename(path, &done) {
+        Ok(()) => eprintln!(
+            "its4tasks: imported {} into the database; kept it as {}",
+            path.display(),
+            done.display()
+        ),
+        Err(e) => eprintln!(
+            "its4tasks: imported {} but failed to rename it: {e}",
+            path.display()
+        ),
     }
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(board).map_err(io::Error::other)?;
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &path)
 }

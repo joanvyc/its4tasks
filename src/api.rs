@@ -1,28 +1,38 @@
-//! The only way the UI touches the board: it reads a `&Board` and sends
-//! `Change`s. `Change` is serializable so it can later travel over HTTP.
+//! The only way to change the board: a client reads a `Board` and sends
+//! `Change`s, which travel over HTTP as JSON (see `server`).
+//!
+//! `apply_change` holds the rules. The server applies a change with it, and
+//! the GUI applies the same change to its own copy straight away (see
+//! `client`). For both to agree, changes that create a task or comment carry
+//! the new ids, picked by the client.
 
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use sea_orm::DbErr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::{Board, MessageKind, MoveError, Task};
-use sea_orm::DbErr;
-
 use crate::storage::Store;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Change {
+    /// `id` is the new task's, `note_id` its first comment's (if `notes`
+    /// isn't blank).
     AddTask {
+        id: Uuid,
+        note_id: Uuid,
         title: String,
         notes: String,
         parent: Option<Uuid>,
         focus: bool,
     },
-    /// Turn a next step into a subtask of its task.
+    /// Turn a next step into a subtask of its task, with ids as in `AddTask`.
     PromoteStep {
         note: Uuid,
+        id: Uuid,
+        note_id: Uuid,
         title: String,
         notes: String,
         focus: bool,
@@ -56,8 +66,10 @@ pub enum Change {
     Unfocus {
         slot: usize,
     },
+    /// `id` is the new comment's.
     Post {
         task: Uuid,
+        id: Uuid,
         text: String,
         kind: MessageKind,
     },
@@ -95,6 +107,43 @@ pub enum Change {
     },
 }
 
+impl Change {
+    /// An `AddTask` with fresh ids.
+    pub fn add_task(title: String, notes: String, parent: Option<Uuid>, focus: bool) -> Change {
+        Change::AddTask {
+            // Time-ordered, so sorting by id keeps tasks in creation order.
+            id: Uuid::now_v7(),
+            note_id: Uuid::new_v4(),
+            title,
+            notes,
+            parent,
+            focus,
+        }
+    }
+
+    /// A `PromoteStep` with fresh ids.
+    pub fn promote_step(note: Uuid, title: String, notes: String, focus: bool) -> Change {
+        Change::PromoteStep {
+            note,
+            id: Uuid::now_v7(),
+            note_id: Uuid::new_v4(),
+            title,
+            notes,
+            focus,
+        }
+    }
+
+    /// A `Post` with a fresh id.
+    pub fn post(task: Uuid, text: String, kind: MessageKind) -> Change {
+        Change::Post {
+            task,
+            id: Uuid::new_v4(),
+            text,
+            kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Done,
@@ -106,6 +155,8 @@ pub enum ApiError {
     UnknownTask(Uuid),
     UnknownNote(Uuid),
     Move(MoveError),
+    /// A new task or comment was given an id that's taken.
+    Duplicate(Uuid),
     /// The board's rules don't allow it, e.g. a parent that makes a cycle.
     Refused,
 }
@@ -116,6 +167,7 @@ impl fmt::Display for ApiError {
             ApiError::UnknownTask(id) => write!(f, "There is no task {id}"),
             ApiError::UnknownNote(id) => write!(f, "There is no comment {id}"),
             ApiError::Move(e) => e.fmt(f),
+            ApiError::Duplicate(id) => write!(f, "The id {id} is taken"),
             ApiError::Refused => f.write_str("Not allowed"),
         }
     }
@@ -154,7 +206,7 @@ impl Api {
     }
 
     async fn apply_at(&mut self, change: Change, now: DateTime<Utc>) -> Result<Outcome, ApiError> {
-        let outcome = change_board(&mut self.board, change, now)?;
+        let outcome = apply_change(&mut self.board, change, now)?;
         if let Some(store) = &mut self.store
             && let Err(e) = store.save(&self.board).await
         {
@@ -164,9 +216,18 @@ impl Api {
     }
 }
 
-fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Outcome, ApiError> {
+/// Applies a change to a board as of `now`: the board's rules, shared by the
+/// server and the GUI's optimistic copy. The same change on equal boards at
+/// the same `now` gives equal boards.
+pub fn apply_change(
+    b: &mut Board,
+    change: Change,
+    now: DateTime<Utc>,
+) -> Result<Outcome, ApiError> {
     match change {
         Change::AddTask {
+            id,
+            note_id,
             title,
             notes,
             parent,
@@ -175,22 +236,28 @@ fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Out
             if let Some(p) = parent {
                 task(b, p)?;
             }
-            let id = b.add_task(title, &notes, parent, now);
+            unused_task(b, id)?;
+            unused_note(b, note_id)?;
+            b.add_task_as(id, note_id, title, &notes, parent, now);
             if focus {
                 b.focus(id);
             }
             return Ok(Outcome::Created(id));
         }
         Change::PromoteStep {
-            note: note_id,
+            note: step,
+            id,
+            note_id,
             title,
             notes,
             focus,
         } => {
-            let (task_id, idx) = find(b, note_id)?;
-            let id = b
-                .promote_step(task_id, idx, title, &notes, now)
-                .ok_or(ApiError::Refused)?;
+            let (task_id, idx) = find(b, step)?;
+            unused_task(b, id)?;
+            unused_note(b, note_id)?;
+            if !b.promote_step_as(id, note_id, task_id, idx, title, &notes, now) {
+                return Err(ApiError::Refused);
+            }
             if focus {
                 b.focus(id);
             }
@@ -225,10 +292,14 @@ fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Out
         }
         Change::Unfocus { slot } => b.unfocus(slot),
         Change::Post {
-            task: id,
+            task: task_id,
+            id,
             text,
             kind,
-        } => task(b, id)?.post(&text, kind, now),
+        } => {
+            unused_note(b, id)?;
+            task(b, task_id)?.post_as(id, &text, kind, now);
+        }
         Change::EditNote { note: id, text } => {
             let (t, idx) = note(b, id)?;
             t.edit_note(idx, &text, now);
@@ -273,6 +344,20 @@ fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Out
     Ok(Outcome::Done)
 }
 
+fn unused_task(b: &Board, id: Uuid) -> Result<(), ApiError> {
+    match b.task(id) {
+        Some(_) => Err(ApiError::Duplicate(id)),
+        None => Ok(()),
+    }
+}
+
+fn unused_note(b: &Board, id: Uuid) -> Result<(), ApiError> {
+    match b.find_note(id) {
+        Some(_) => Err(ApiError::Duplicate(id)),
+        None => Ok(()),
+    }
+}
+
 fn task(b: &mut Board, id: Uuid) -> Result<&mut Task, ApiError> {
     b.task_mut(id).ok_or(ApiError::UnknownTask(id))
 }
@@ -295,12 +380,7 @@ mod tests {
     use super::*;
 
     async fn add(api: &mut Api, title: &str, focus: bool) -> Uuid {
-        let change = Change::AddTask {
-            title: title.into(),
-            notes: String::new(),
-            parent: None,
-            focus,
-        };
+        let change = Change::add_task(title.into(), String::new(), None, focus);
         match api.apply(change).await {
             Ok(Outcome::Created(id)) => id,
             other => panic!("expected a new task, got {other:?}"),
@@ -335,11 +415,7 @@ mod tests {
         let mut api = Api::new(Board::default());
         let a = add(&mut api, "a", false).await;
         let b = add(&mut api, "b", false).await;
-        let post = Change::Post {
-            task: a,
-            text: "hi".into(),
-            kind: MessageKind::Comment,
-        };
+        let post = Change::post(a, "hi".into(), MessageKind::Comment);
         api.apply(post).await.unwrap();
         api.apply(Change::SetDone {
             task: b,
@@ -374,11 +450,7 @@ mod tests {
         let mut api = Api::new(Board::default());
         let a = add(&mut api, "a", false).await;
         for text in ["first", "second"] {
-            let post = Change::Post {
-                task: a,
-                text: text.into(),
-                kind: MessageKind::Comment,
-            };
+            let post = Change::post(a, text.into(), MessageKind::Comment);
             api.apply(post).await.unwrap();
         }
         let ids: Vec<Uuid> = api
@@ -412,12 +484,66 @@ mod tests {
 
     #[tokio::test]
     async fn changes_round_trip_through_json() {
-        let change = Change::Post {
-            task: Uuid::from_u128(3),
-            text: "/block waiting".into(),
-            kind: MessageKind::Block,
-        };
+        let change = Change::post(
+            Uuid::from_u128(3),
+            "/block waiting".into(),
+            MessageKind::Block,
+        );
         let json = serde_json::to_string(&change).unwrap();
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
+    }
+
+    #[tokio::test]
+    async fn taken_ids_are_refused() {
+        let mut api = Api::new(Board::default());
+        let a = add(&mut api, "a", false).await;
+        let again = Change::AddTask {
+            id: a,
+            note_id: Uuid::new_v4(),
+            title: "b".into(),
+            notes: String::new(),
+            parent: None,
+            focus: false,
+        };
+        assert_eq!(api.apply(again).await, Err(ApiError::Duplicate(a)));
+        let post = Change::post(a, "hi".into(), MessageKind::Comment);
+        api.apply(post.clone()).await.unwrap();
+        // The same post sent twice, say after a lost answer.
+        let Change::Post { id, .. } = post else {
+            unreachable!()
+        };
+        assert_eq!(api.apply(post).await, Err(ApiError::Duplicate(id)));
+        assert_eq!(api.board().task(a).unwrap().notes.len(), 1);
+    }
+
+    #[test]
+    fn a_change_gives_the_same_board_everywhere() {
+        // What lets the GUI show a change before the server confirms it.
+        let now = Utc::now();
+        let (mut here, mut there) = (Board::default(), Board::default());
+        let add = Change::add_task("a".into(), "first".into(), None, true);
+        let Change::AddTask { id, .. } = add else {
+            unreachable!()
+        };
+        let changes = [
+            add,
+            Change::post(id, "/next ship it".into(), MessageKind::Next),
+            Change::Rename {
+                task: id,
+                title: "b".into(),
+            },
+        ];
+        for change in changes {
+            let a = apply_change(&mut here, change.clone(), now);
+            let b = apply_change(&mut there, change, now);
+            assert_eq!(a, b);
+        }
+        assert_eq!(here, there);
+        let step = here.task(id).unwrap().notes[1].id;
+        let promote = Change::promote_step(step, "ship".into(), String::new(), false);
+        let a = apply_change(&mut here, promote.clone(), now);
+        assert_eq!(a, apply_change(&mut there, promote, now));
+        assert!(matches!(a, Ok(Outcome::Created(_))));
+        assert_eq!(here, there);
     }
 }

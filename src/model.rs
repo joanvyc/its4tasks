@@ -233,11 +233,17 @@ impl Task {
     ///   (a plain comment if nothing is blocking).
     /// - `Close` marks the task done, with this as the message.
     pub fn post(&mut self, text: &str, kind: MessageKind, now: DateTime<Utc>) {
+        self.post_as(Uuid::new_v4(), text, kind, now);
+    }
+
+    /// `post`, giving the comment this id.
+    pub fn post_as(&mut self, id: Uuid, text: &str, kind: MessageKind, now: DateTime<Utc>) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
         let mut note = Note::new(text.to_owned(), now);
+        note.id = id;
         match kind {
             MessageKind::Comment => {}
             MessageKind::Star => note.starred = true,
@@ -667,6 +673,20 @@ impl Board {
     ) -> Uuid {
         // Time-ordered, so sorting by id keeps tasks in creation order.
         let id = Uuid::now_v7();
+        self.add_task_as(id, Uuid::new_v4(), title, first_note, parent, now);
+        id
+    }
+
+    /// `add_task`, giving the task `id` and its first comment `note_id`.
+    pub fn add_task_as(
+        &mut self,
+        id: Uuid,
+        note_id: Uuid,
+        title: String,
+        first_note: &str,
+        parent: Option<Uuid>,
+        now: DateTime<Utc>,
+    ) {
         let mut task = Task {
             id,
             title,
@@ -678,9 +698,8 @@ impl Board {
             parent,
             folded: false,
         };
-        task.post(first_note, MessageKind::Comment, now);
+        task.post_as(note_id, first_note, MessageKind::Comment, now);
         self.tasks.push(task);
-        id
     }
 
     /// Turn an open next step into a subtask with this title and first
@@ -696,26 +715,48 @@ impl Board {
         first_note: &str,
         now: DateTime<Utc>,
     ) -> Option<Uuid> {
-        let note = self.task(task_id)?.notes.get(idx)?;
+        let id = Uuid::now_v7();
+        self.promote_step_as(id, Uuid::new_v4(), task_id, idx, title, first_note, now)
+            .then_some(id)
+    }
+
+    /// `promote_step`, giving the subtask `id` and its first comment
+    /// `note_id`. False if the comment isn't an open step any more.
+    #[allow(clippy::too_many_arguments)]
+    pub fn promote_step_as(
+        &mut self,
+        id: Uuid,
+        note_id: Uuid,
+        task_id: Uuid,
+        idx: usize,
+        title: String,
+        first_note: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(note) = self.task(task_id).and_then(|t| t.notes.get(idx)) else {
+            return false;
+        };
         let Some(NextStep::Open { since }) = note.next_step else {
-            return None;
+            return false;
         };
         let (posted, starred) = (note.at, note.starred);
-        let id = self.add_task(title, first_note, Some(task_id), posted);
+        self.add_task_as(id, note_id, title, first_note, Some(task_id), posted);
         if let Some(subtask) = self.task_mut(id) {
             subtask.updated_at = since;
             if let Some(first) = subtask.notes.first_mut() {
                 first.starred = starred;
             }
         }
-        let task = self.task_mut(task_id)?;
+        let Some(task) = self.task_mut(task_id) else {
+            return false;
+        };
         task.notes[idx].next_step = Some(NextStep::Promoted {
             since,
             at: now,
             subtask: id,
         });
         task.touch(now);
-        Some(id)
+        true
     }
 
     /// Delete the task and all its subtasks.

@@ -925,7 +925,10 @@ impl TodoApp {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(Theme::Light);
         Self {
-            api: Client::connect(),
+            api: Client::connect({
+                let ctx = cc.egui_ctx.clone();
+                move || ctx.request_repaint()
+            }),
             filter: String::new(),
             new_task: None,
             confirm_delete: None,
@@ -1502,14 +1505,8 @@ impl TodoApp {
                 if submit && !draft.trim().is_empty() {
                     match task.parse_input(draft).result {
                         Ok(Submit::Post(k, text)) => {
-                            actions.push(
-                                Change::Post {
-                                    task: task.id,
-                                    text: text.to_owned(),
-                                    kind: k.unwrap_or(*kind),
-                                }
-                                .into(),
-                            );
+                            let post = Change::post(task.id, text.to_owned(), k.unwrap_or(*kind));
+                            actions.push(post.into());
                             draft.clear();
                             *kind = MessageKind::Comment;
                         }
@@ -1669,9 +1666,12 @@ impl TodoApp {
                 if theme != before {
                     ui.ctx().set_theme(theme);
                 }
-                if let Some(e) = self.api.error() {
-                    let text = RichText::new(format!("Can't reach the server: {e}"))
-                        .color(palette(ui.visuals()).blocker);
+                let problem = match (self.api.error(), self.api.notice()) {
+                    (Some(e), _) => Some(format!("Can't reach the server: {e}")),
+                    (None, notice) => notice.map(str::to_owned),
+                };
+                if let Some(problem) = problem {
+                    let text = RichText::new(problem).color(palette(ui.visuals()).blocker);
                     ui.add(Label::new(text).truncate());
                 }
             });
@@ -1899,18 +1899,10 @@ impl TodoApp {
             let draft = self.new_task.take().unwrap_or_default();
             let title = draft.title.trim().to_owned();
             self.change(match (draft.parent, draft.from_step) {
-                (Some(_), Some(note)) => Change::PromoteStep {
-                    note,
-                    title,
-                    notes: draft.notes,
-                    focus: draft.add_to_focus,
-                },
-                _ => Change::AddTask {
-                    title,
-                    notes: draft.notes,
-                    parent: draft.parent,
-                    focus: draft.add_to_focus,
-                },
+                (Some(_), Some(note)) => {
+                    Change::promote_step(note, title, draft.notes, draft.add_to_focus)
+                }
+                _ => Change::add_task(title, draft.notes, draft.parent, draft.add_to_focus),
             });
         } else if cancel || modal.should_close() {
             self.new_task = None;
@@ -1920,6 +1912,7 @@ impl TodoApp {
 
 impl eframe::App for TodoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.api.poll();
         self.api.refresh();
         let mut actions = Vec::new();
         Panel::right("task_list")
@@ -1941,5 +1934,12 @@ impl eframe::App for TodoApp {
         // Keep the freshness colors drifting while the app sits idle.
         // Also fetches other clients' changes, through `refresh`.
         ui.ctx().request_repaint_after(Duration::from_secs(2));
+    }
+
+    /// Gives the last changes a moment to reach the server.
+    fn on_exit(&mut self) {
+        if !self.api.flush(Duration::from_secs(2)) {
+            eprintln!("its4tasks: closing with changes the server hasn't confirmed");
+        }
     }
 }

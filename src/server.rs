@@ -1,7 +1,8 @@
 //! `Api` over HTTP, with JSON bodies:
 //! - `GET /board`: the `Board`.
 //! - `POST /changes` with a `Change`: an `Applied`, or a `Rejected` with
-//!   404 (no such task or comment) or 409 (the board's rules refuse it).
+//!   404 (no such task or comment) or 409 (the board's rules refuse it, or
+//!   a new id is taken).
 
 use std::sync::Arc;
 
@@ -27,10 +28,12 @@ pub struct Applied {
     pub board: Board,
 }
 
-/// Why a change was turned down.
+/// Why a change was turned down, and the board it was turned down by:
+/// often the client's copy was out of date.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Rejected {
     pub error: ApiError,
+    pub board: Board,
 }
 
 pub fn router(api: Api) -> Router {
@@ -59,20 +62,27 @@ async fn change(State(api): State<Shared>, Json(change): Json<Change>) -> Respon
         Err(error) => {
             let status = match error {
                 ApiError::UnknownTask(_) | ApiError::UnknownNote(_) => StatusCode::NOT_FOUND,
-                ApiError::Move(_) | ApiError::Refused => StatusCode::CONFLICT,
+                ApiError::Move(_) | ApiError::Duplicate(_) | ApiError::Refused => {
+                    StatusCode::CONFLICT
+                }
             };
-            (status, Json(Rejected { error })).into_response()
+            let board = api.board().clone();
+            (status, Json(Rejected { error, board })).into_response()
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use uuid::Uuid;
 
     use super::*;
     use crate::client::{Client, ClientError};
     use crate::model::MessageKind;
+
+    const WAIT: Duration = Duration::from_secs(5);
 
     /// Serves an unsaved board on a free port, for as long as the test runs.
     fn start() -> String {
@@ -91,60 +101,126 @@ mod tests {
         format!("http://{}", rx.recv().unwrap())
     }
 
+    /// A client that has the server's board.
+    fn client(url: &str) -> Client {
+        let mut client = Client::new(url, WAIT, || {});
+        assert!(client.flush(WAIT));
+        client
+    }
+
+    fn add(client: &mut Client, title: &str) -> Uuid {
+        match client.apply(Change::add_task(title.into(), String::new(), None, false)) {
+            Ok(Outcome::Created(id)) => id,
+            other => panic!("no task created: {other:?}"),
+        }
+    }
+
     #[test]
-    fn clients_change_the_board_over_http() {
+    fn changes_show_at_once_and_reach_the_server() {
         let url = start();
-        let mut a = Client::new(&url);
-        let mut b = Client::new(&url);
-        assert_eq!((a.error(), b.error()), (None, None));
-
-        let add = Change::AddTask {
-            title: "Write report".into(),
-            notes: String::new(),
-            parent: None,
-            focus: true,
-        };
-        let Ok(Outcome::Created(id)) = a.apply(add) else {
-            panic!("no task created");
-        };
-        let post = Change::Post {
-            task: id,
-            text: "first draft done".into(),
-            kind: MessageKind::Comment,
-        };
+        let mut a = client(&url);
+        let id = add(&mut a, "Write report");
+        let post = Change::post(id, "first draft done".into(), MessageKind::Comment);
         assert_eq!(a.apply(post), Ok(Outcome::Done));
-        // The answer carries the new board.
-        let task = a.board().task(id).unwrap();
-        assert_eq!(task.notes[0].text, "first draft done");
-        assert_eq!(a.board().slots[0], Some(id));
+        // Shown before the server has answered either change.
+        assert_eq!(
+            a.board().task(id).unwrap().notes[0].text,
+            "first draft done"
+        );
 
-        // The server's rules still apply.
+        assert!(a.flush(WAIT));
+        assert_eq!(a.error(), None);
+        let b = client(&url);
+        assert_eq!(b.board(), a.board(), "same ids on the server");
+    }
+
+    #[test]
+    fn a_refused_change_is_undone() {
+        let url = start();
+        let mut a = client(&url);
+        let id = add(&mut a, "Write report");
+        assert!(a.flush(WAIT));
+        let mut b = client(&url);
+        b.apply(Change::DeleteTask { task: id }).unwrap();
+        assert!(b.flush(WAIT));
+
+        // `a` hasn't heard, so the comment shows until the server refuses it.
+        let post = Change::post(id, "too late".into(), MessageKind::Comment);
+        assert_eq!(a.apply(post), Ok(Outcome::Done));
+        assert!(a.board().task(id).is_some());
+        assert!(a.flush(WAIT));
+        assert!(a.board().task(id).is_none());
+        assert!(a.notice().is_some_and(|n| n.contains("no task")));
+        assert_eq!(a.error(), None);
+    }
+
+    #[test]
+    fn rules_broken_here_are_not_sent() {
+        let url = start();
+        let mut a = client(&url);
         let gone = Uuid::new_v4();
         assert_eq!(
             a.apply(Change::ToggleStar { note: gone }),
             Err(ClientError::Api(ApiError::UnknownNote(gone)))
         );
-
-        // Another client sees the change once it fetches.
-        assert!(b.board().task(id).is_none());
-        b.fetch_now();
-        assert_eq!(b.board(), a.board());
+        assert!(a.flush(WAIT));
+        assert_eq!(a.notice(), None);
     }
 
     #[test]
-    fn a_missing_server_is_reported() {
+    fn quick_renames_never_go_backwards() {
+        let url = start();
+        let mut a = client(&url);
+        let id = add(&mut a, "t");
+        let mut title = String::from("t");
+        for c in "abcdefghijklmnopqrst".chars() {
+            title.push(c);
+            let rename = Change::Rename {
+                task: id,
+                title: title.clone(),
+            };
+            a.apply(rename).unwrap();
+            // Answers to earlier renames arrive while typing.
+            a.poll();
+            assert_eq!(a.board().task(id).unwrap().title, title);
+        }
+        assert!(a.flush(WAIT));
+        assert_eq!(a.board().task(id).unwrap().title, title);
+        assert_eq!(client(&url).board().task(id).unwrap().title, title);
+    }
+
+    #[test]
+    fn a_missing_server_undoes_changes() {
         // Nothing listens on a port that was just freed.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        let mut client = Client::new(&format!("http://127.0.0.1:{port}"));
-        assert!(client.error().is_some());
-        assert!(matches!(
-            client.apply(Change::Unfocus { slot: 0 }),
-            Err(ClientError::Http(_))
-        ));
-        assert!(client.error().is_some());
+        let mut a = Client::new(&format!("http://127.0.0.1:{port}"), WAIT, || {});
+        assert!(a.flush(WAIT));
+        assert!(a.error().is_some());
+        let id = add(&mut a, "offline");
+        assert!(a.board().task(id).is_some());
+        assert!(a.flush(WAIT));
+        assert!(a.board().task(id).is_none());
+        assert!(a.error().is_some());
+    }
+
+    #[test]
+    fn a_hanging_server_times_out() {
+        // Accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        let mut a = Client::new(&url, Duration::from_millis(300), || {});
+        let id = add(&mut a, "slow");
+        assert!(a.board().task(id).is_some(), "shown without waiting");
+        assert!(a.flush(WAIT));
+        assert!(a.board().task(id).is_none());
+        assert!(a.error().is_some());
     }
 }

@@ -5,7 +5,7 @@ its4tasks is an egui/eframe desktop todo app: four focus cards plus a task list,
 - `log.rs`: log grouping
 - `api.rs`: the only way to change the board. Clients read a `Board` and send serializable `Change`s, which `Api::apply` applies and saves. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4), and changes address comments by id, never by position
 - `server.rs` and `bin/its4tasks-server.rs`: `Api` over HTTP (`GET /board`, `POST /changes`). Listens on `$ITS4TASKS_ADDR`, by default `127.0.0.1:7878`
-- `client.rs`: the GUI's side. It keeps the last board the server sent and sends changes with blocking requests. Talks to `$ITS4TASKS_SERVER`, by default `http://127.0.0.1:7878`
+- `client.rs`: the GUI's side. An edit shows at once: `apply` applies the change to a local copy with the server's rules (`api::apply_change`), and a worker thread sends it, so the UI never waits on the network. Server answers replace the copy's base, with unanswered changes replayed on top. A refused change, or one sent while the server is unreachable, is undone. Changes that create tasks or comments carry client-picked ids so both sides agree. Talks to `$ITS4TASKS_SERVER`, by default `http://127.0.0.1:7878`
 - `main.rs` and `app.rs`: the GUI
 - `storage/`: SQLite persistence through sea-orm (entities, migrations, and a diff so a save writes only what changed), plus a one-time import of the old `board.json`
 
@@ -38,7 +38,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    APP=$!
    sleep 2.5
    ```
-   `curl -s 127.0.0.1:7979/board` shows what the server holds. A change POSTed with curl, as another client would, shows up in the GUI within about 2 s.
+   `curl -s 127.0.0.1:7979/board` shows what the server holds. A change POSTed with curl, as another client would, shows up in the GUI within about 2 s. To check behaviour on a slow network, start the server with `ITS4TASKS_DELAY_MS=800`, which holds back every answer that long. Edits should still show at once.
 
 3. **Screenshot and look at the result:**
    ```sh

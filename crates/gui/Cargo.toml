@@ -1,0 +1,35 @@
+[package]
+name = "its4tasks"
+description = "The its4tasks GUI, natively or in the browser, talking to its4tasks-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+its4tasks-core.workspace = true
+chrono.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+web-time.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native only: signing in through the browser, and local mode's server.
+base64.workspace = true
+directories.workspace = true
+its4tasks-server.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+ureq.workspace = true
+webbrowser.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ehttp.workspace = true
+js-sys.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = ["console", "Document", "HtmlCanvasElement", "Location", "Window"] }
+
+[dev-dependencies]
+its4tasks-server.workspace = true
+tokio.workspace = true

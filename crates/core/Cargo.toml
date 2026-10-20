@@ -1,0 +1,16 @@
+[package]
+name = "its4tasks-core"
+description = "The board's data and rules, shared by the server and the GUI (native and web)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `Utc::now` and random ids come from the browser.
+chrono = { workspace = true, features = ["wasmbind"] }
+uuid = { workspace = true, features = ["js"] }

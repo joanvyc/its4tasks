@@ -1,0 +1,5 @@
+# `trunk build` (or `--release`) writes the web GUI to dist/, which
+# its4tasks-server serves at / (and embeds in release builds).
+[build]
+target = "index.html"
+dist = "dist"

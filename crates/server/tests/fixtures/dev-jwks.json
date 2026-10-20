@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "alg": "RS256",
+      "kid": "its4tasks-dev",
+      "n": "63wQaU3eKRmIhn9AKL5gpiyGQYfpdDk8p0cUajxX--gHAiSPxjl8W6Q9WPhP-49ZyUO9LkDgajY-FcU1znmDVMyyLLcJ3C7HkoFHrKeS7eKS3uP1wy-UP-2IfzuaHJPxSuuDbIAQDhEI9l1hioPLt0uUZdNPgkr1jV8g3YBeYBNWx9tVq_afCizwvxDDUR9wkJ2JiGA0wkwiJtxvbX4FOqPBwdBqJb-i1uwrpd8hFRVFln-53qkRXbkY40ZalYxBLANNDdHj0kBr0u6m_zrzDYcXZ-17UWOpTjKuyzGdN_olJkxxh3bdr27jXt0MDb_TpfF6y1ut825fwTfTVAZcyQ",
+      "e": "AQAB"
+    }
+  ]
+}

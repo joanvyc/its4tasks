@@ -1,0 +1,31 @@
+[package]
+name = "its4tasks-server"
+description = "Keeps the board in SQLite and serves it, and the web GUI, over HTTP"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["sqlite"]
+# Which databases DATABASE_URL may point at. At least one is needed.
+sqlite = ["sea-orm/sqlx-sqlite", "sea-orm-migration/sqlx-sqlite"]
+postgres = ["sea-orm/sqlx-postgres", "sea-orm-migration/sqlx-postgres"]
+
+[dependencies]
+its4tasks-core.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+directories.workspace = true
+jsonwebtoken.workspace = true
+rust-embed.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ureq.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

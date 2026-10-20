@@ -8,6 +8,8 @@ pub struct Model {
     /// The model's `Note::id`, a UUID as text.
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
+    /// The user whose board it's on, as its task's.
+    pub owner_id: String,
     pub task_id: String,
     /// Order within the task.
     pub position: i32,

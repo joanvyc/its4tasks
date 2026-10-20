@@ -4,6 +4,12 @@ description = "Keeps the board in SQLite and serves it, and the web GUI, over HT
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["sqlite"]
+# Which databases DATABASE_URL may point at. At least one is needed.
+sqlite = ["sea-orm/sqlx-sqlite", "sea-orm-migration/sqlx-sqlite"]
+postgres = ["sea-orm/sqlx-postgres", "sea-orm-migration/sqlx-postgres"]
+
 [dependencies]
 its4tasks-core.workspace = true
 axum.workspace = true

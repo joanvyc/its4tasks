@@ -18,7 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use web_time::Instant;
 
-use crate::api::{ApiError, Applied, Change, Outcome, Rejected, apply_change};
+use crate::api::{self, ApiError, Applied, Change, Outcome, Rejected, apply_change};
 use crate::model::Board;
 
 /// Where the native GUI looks for the server unless `$ITS4TASKS_SERVER`
@@ -153,7 +153,7 @@ impl Client {
     /// Applies the change to the board shown and sends it to the server.
     /// Fails, without sending, if the board's rules refuse it here.
     pub fn apply(&mut self, change: Change) -> Result<Outcome, ClientError> {
-        let at = Utc::now();
+        let at = api::now();
         let outcome =
             apply_change(&mut self.board, change.clone(), at).map_err(ClientError::Api)?;
         let seq = self.next_seq;

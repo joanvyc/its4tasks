@@ -11,6 +11,11 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Reshapes data from the app's SQLite days; other databases start
+        // with m0004's schema.
+        if manager.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+            return Ok(());
+        }
         manager
             .get_connection()
             .execute_unprepared(

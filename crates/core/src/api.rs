@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -156,6 +156,8 @@ pub enum ApiError {
     Move(MoveError),
     /// A new task or comment was given an id that's taken.
     Duplicate(Uuid),
+    /// The task or comment is on someone else's board.
+    Forbidden(Uuid),
     /// The board's rules don't allow it, e.g. a parent that makes a cycle.
     Refused,
 }
@@ -167,9 +169,19 @@ impl fmt::Display for ApiError {
             ApiError::UnknownNote(id) => write!(f, "There is no comment {id}"),
             ApiError::Move(e) => e.fmt(f),
             ApiError::Duplicate(id) => write!(f, "The id {id} is taken"),
+            ApiError::Forbidden(id) => write!(f, "{id} is on someone else's board"),
             ApiError::Refused => f.write_str("Not allowed"),
         }
     }
+}
+
+/// The time to apply changes at: now, to the microsecond, which is as
+/// precise as every database keeps it (Postgres drops nanoseconds), so a
+/// board saved and loaded again is the same board.
+pub fn now() -> DateTime<Utc> {
+    let now = Utc::now();
+    now.with_nanosecond(now.nanosecond() / 1000 * 1000)
+        .unwrap_or(now)
 }
 
 /// What a change did, and the board after it.

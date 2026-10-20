@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use its4tasks::api::{ApiError, Change, Outcome};
 use its4tasks::client::{Client, ClientError};
-use its4tasks::model::{Board, MessageKind};
+use its4tasks::model::MessageKind;
 use its4tasks_server::api::Api;
 use its4tasks_server::server::serve;
 use tokio::net::TcpListener;
@@ -23,7 +23,7 @@ fn start() -> String {
         rt.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(listener.local_addr().unwrap()).unwrap();
-            serve(listener, Api::new(Board::default())).await.unwrap();
+            serve(listener, Api::new()).await.unwrap();
         });
     });
     format!("http://{}", rx.recv().unwrap())

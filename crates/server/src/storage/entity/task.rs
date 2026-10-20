@@ -6,6 +6,8 @@ pub struct Model {
     /// The model's `Task::id`, a UUID as text.
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
+    /// The user whose board it's on.
+    pub owner_id: String,
     #[sea_orm(column_type = "Text")]
     pub title: String,
     pub done: bool,

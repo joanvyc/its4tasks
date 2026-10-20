@@ -3,3 +3,4 @@
 pub mod note;
 pub mod slot;
 pub mod task;
+pub mod user;

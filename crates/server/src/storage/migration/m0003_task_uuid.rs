@@ -16,6 +16,11 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Reshapes data from the app's SQLite days; other databases start
+        // with m0004's schema.
+        if manager.get_database_backend() != sea_orm::DatabaseBackend::Sqlite {
+            return Ok(());
+        }
         let db = manager.get_connection();
         // Includes subtask ids of promoted steps whose subtask was deleted,
         // so they still map to something.

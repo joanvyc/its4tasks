@@ -6,9 +6,10 @@ use uuid::Uuid;
 use super::entity::{note, task};
 use its4tasks_core::model::{Blocker, NextStep, Note, NoteAction, Task};
 
-pub fn task_row(t: &Task) -> task::ActiveModel {
+pub fn task_row(owner: Uuid, t: &Task) -> task::ActiveModel {
     task::Model {
         id: t.id.to_string(),
+        owner_id: owner.to_string(),
         title: t.title.clone(),
         done: t.done,
         updated_at: t.updated_at,
@@ -40,7 +41,7 @@ pub fn parse_id(text: &str, what: &str) -> Result<Uuid, DbErr> {
     Uuid::parse_str(text).map_err(|e| DbErr::Custom(format!("bad {what} id {text:?}: {e}")))
 }
 
-pub fn note_row(task_id: Uuid, position: usize, n: &Note) -> note::ActiveModel {
+pub fn note_row(owner: Uuid, task_id: Uuid, position: usize, n: &Note) -> note::ActiveModel {
     let (blocker_state, blocker_resolved_at) = match n.blocker {
         None => (None, None),
         Some(Blocker::Open) => (Some("open"), None),
@@ -67,6 +68,7 @@ pub fn note_row(task_id: Uuid, position: usize, n: &Note) -> note::ActiveModel {
     };
     note::Model {
         id: n.id.to_string(),
+        owner_id: owner.to_string(),
         task_id: task_id.to_string(),
         position: position as i32,
         at: n.at,

@@ -5,6 +5,7 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::model::{Board, MessageKind, MoveError, Task};
 use crate::storage::Store;
@@ -19,8 +20,7 @@ pub enum Change {
     },
     /// Turn a next step into a subtask of its task.
     PromoteStep {
-        task: u64,
-        idx: usize,
+        note: Uuid,
         title: String,
         notes: String,
         focus: bool,
@@ -60,45 +60,35 @@ pub enum Change {
         kind: MessageKind,
     },
     EditNote {
-        task: u64,
-        idx: usize,
+        note: Uuid,
         text: String,
     },
     DeleteNote {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     MarkBlocking {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     Resolve {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     Unblock {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     MarkStep {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     ToggleStep {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     UnmarkStep {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     ToggleStar {
-        task: u64,
-        idx: usize,
+        note: Uuid,
     },
     MoveNote {
-        from: u64,
-        idx: usize,
+        note: Uuid,
         to: u64,
     },
 }
@@ -112,7 +102,7 @@ pub enum Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiError {
     UnknownTask(u64),
-    UnknownNote(u64, usize),
+    UnknownNote(Uuid),
     Move(MoveError),
     /// The board's rules don't allow it, e.g. a parent that makes a cycle.
     Refused,
@@ -122,7 +112,7 @@ impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ApiError::UnknownTask(id) => write!(f, "There is no task {id}"),
-            ApiError::UnknownNote(id, idx) => write!(f, "Task {id} has no comment {idx}"),
+            ApiError::UnknownNote(id) => write!(f, "There is no comment {id}"),
             ApiError::Move(e) => e.fmt(f),
             ApiError::Refused => f.write_str("Not allowed"),
         }
@@ -192,15 +182,14 @@ fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Out
             return Ok(Outcome::Created(id));
         }
         Change::PromoteStep {
-            task: id,
-            idx,
+            note: note_id,
             title,
             notes,
             focus,
         } => {
-            note(b, id, idx)?;
+            let (task_id, idx) = find(b, note_id)?;
             let id = b
-                .promote_step(id, idx, title, &notes, now)
+                .promote_step(task_id, idx, title, &notes, now)
                 .ok_or(ApiError::Refused)?;
             if focus {
                 b.focus(id);
@@ -240,20 +229,46 @@ fn change_board(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Out
             text,
             kind,
         } => task(b, id)?.post(&text, kind, now),
-        Change::EditNote {
-            task: id,
-            idx,
-            text,
-        } => note(b, id, idx)?.edit_note(idx, &text, now),
-        Change::DeleteNote { task: id, idx } => note(b, id, idx)?.delete_note(idx),
-        Change::MarkBlocking { task: id, idx } => note(b, id, idx)?.set_blocking(idx, now),
-        Change::Resolve { task: id, idx } => note(b, id, idx)?.resolve(idx, now),
-        Change::Unblock { task: id, idx } => note(b, id, idx)?.unmark_blocking(idx),
-        Change::MarkStep { task: id, idx } => note(b, id, idx)?.mark_next_step(idx, now),
-        Change::ToggleStep { task: id, idx } => note(b, id, idx)?.toggle_step(idx, now),
-        Change::UnmarkStep { task: id, idx } => note(b, id, idx)?.unmark_next_step(idx),
-        Change::ToggleStar { task: id, idx } => note(b, id, idx)?.toggle_star(idx),
-        Change::MoveNote { from, idx, to } => b.move_note(from, idx, to).map_err(ApiError::Move)?,
+        Change::EditNote { note: id, text } => {
+            let (t, idx) = note(b, id)?;
+            t.edit_note(idx, &text, now);
+        }
+        Change::DeleteNote { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.delete_note(idx);
+        }
+        Change::MarkBlocking { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.set_blocking(idx, now);
+        }
+        Change::Resolve { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.resolve(idx, now);
+        }
+        Change::Unblock { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.unmark_blocking(idx);
+        }
+        Change::MarkStep { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.mark_next_step(idx, now);
+        }
+        Change::ToggleStep { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.toggle_step(idx, now);
+        }
+        Change::UnmarkStep { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.unmark_next_step(idx);
+        }
+        Change::ToggleStar { note: id } => {
+            let (t, idx) = note(b, id)?;
+            t.toggle_star(idx);
+        }
+        Change::MoveNote { note: id, to } => {
+            let (from, idx) = find(b, id)?;
+            b.move_note(from, idx, to).map_err(ApiError::Move)?;
+        }
     }
     Ok(Outcome::Done)
 }
@@ -262,14 +277,15 @@ fn task(b: &mut Board, id: u64) -> Result<&mut Task, ApiError> {
     b.task_mut(id).ok_or(ApiError::UnknownTask(id))
 }
 
-/// The task, if it has a comment at `idx`.
-fn note(b: &mut Board, id: u64, idx: usize) -> Result<&mut Task, ApiError> {
-    let t = task(b, id)?;
-    if idx < t.notes.len() {
-        Ok(t)
-    } else {
-        Err(ApiError::UnknownNote(id, idx))
-    }
+/// The task holding a comment, and the comment's index in it.
+fn find(b: &Board, id: Uuid) -> Result<(u64, usize), ApiError> {
+    b.find_note(id).ok_or(ApiError::UnknownNote(id))
+}
+
+/// Like `find`, with the task ready to change.
+fn note(b: &mut Board, id: Uuid) -> Result<(&mut Task, usize), ApiError> {
+    let (task_id, idx) = find(b, id)?;
+    Ok((task(b, task_id)?, idx))
 }
 
 #[cfg(test)]
@@ -331,8 +347,7 @@ mod tests {
         })
         .unwrap();
         let moved = Change::MoveNote {
-            from: a,
-            idx: 0,
+            note: api.board().task(a).unwrap().notes[0].id,
             to: b,
         };
         assert_eq!(
@@ -343,9 +358,49 @@ mod tests {
             api.apply(Change::ToggleFold { task: 99 }),
             Err(ApiError::UnknownTask(99))
         );
+        let gone = Uuid::new_v4();
         assert_eq!(
-            api.apply(Change::ToggleStar { task: a, idx: 5 }),
-            Err(ApiError::UnknownNote(a, 5))
+            api.apply(Change::ToggleStar { note: gone }),
+            Err(ApiError::UnknownNote(gone))
+        );
+    }
+
+    #[test]
+    fn comments_keep_their_id_when_others_go() {
+        let mut api = Api::new(Board::default());
+        let a = add(&mut api, "a", false);
+        for text in ["first", "second"] {
+            let post = Change::Post {
+                task: a,
+                text: text.into(),
+                kind: MessageKind::Comment,
+            };
+            api.apply(post).unwrap();
+        }
+        let ids: Vec<Uuid> = api
+            .board()
+            .task(a)
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        // With indices, the edit would have landed on "first"'s old slot.
+        api.apply(Change::DeleteNote { note: ids[0] }).unwrap();
+        let edit = Change::EditNote {
+            note: ids[1],
+            text: "second, edited".into(),
+        };
+        api.apply(edit).unwrap();
+        let notes = &api.board().task(a).unwrap().notes;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].id, notes[0].text.as_str()),
+            (ids[1], "second, edited")
+        );
+        assert_eq!(
+            api.apply(Change::ToggleStar { note: ids[0] }),
+            Err(ApiError::UnknownNote(ids[0]))
         );
     }
 

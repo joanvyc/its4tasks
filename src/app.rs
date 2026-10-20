@@ -15,6 +15,7 @@ use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
     SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
+use uuid::Uuid;
 
 const CARD_GAP: f32 = 12.0;
 const CARD_MARGIN: i8 = 14;
@@ -206,14 +207,7 @@ fn dots_menu(ui: &mut egui::Ui, id: Id, visible: bool, add_contents: impl FnOnce
 }
 
 /// A comment's menu entries, shared by its "⋯" button and its right-click menu.
-fn comment_menu_items(
-    ui: &mut egui::Ui,
-    note: &Note,
-    task_id: u64,
-    idx: usize,
-    can_block: bool,
-    actions: &mut Vec<Action>,
-) {
+fn comment_menu_items(ui: &mut egui::Ui, note: &Note, can_block: bool, actions: &mut Vec<Action>) {
     match note.next_step {
         Some(NextStep::Open { .. }) => {
             if ui
@@ -221,36 +215,36 @@ fn comment_menu_items(
                 .on_hover_text("Tick this step off")
                 .clicked()
             {
-                actions.push(Change::ToggleStep { task: task_id, idx }.into());
+                actions.push(Change::ToggleStep { note: note.id }.into());
             }
             if ui
                 .button("Promote to subtask…")
                 .on_hover_text("Turn this step into a subtask of its own")
                 .clicked()
             {
-                actions.push(Action::StartPromote(task_id, idx));
+                actions.push(Action::StartPromote(note.id));
             }
             if ui.button("Not a next step").clicked() {
-                actions.push(Change::UnmarkStep { task: task_id, idx }.into());
+                actions.push(Change::UnmarkStep { note: note.id }.into());
             }
         }
         Some(NextStep::Done { .. }) => {
             if ui.button("Reopen step").clicked() {
-                actions.push(Change::ToggleStep { task: task_id, idx }.into());
+                actions.push(Change::ToggleStep { note: note.id }.into());
             }
             if ui.button("Not a next step").clicked() {
-                actions.push(Change::UnmarkStep { task: task_id, idx }.into());
+                actions.push(Change::UnmarkStep { note: note.id }.into());
             }
         }
         Some(NextStep::Promoted { .. }) => {}
-        None => blocker_menu_items(ui, note, task_id, idx, can_block, actions),
+        None => blocker_menu_items(ui, note, can_block, actions),
     }
     if ui.button("Edit").clicked() {
-        actions.push(Action::StartEdit(task_id, idx));
+        actions.push(Action::StartEdit(note.id));
     }
     let star = if note.starred { "Unstar" } else { "Star" };
     if ui.button(star).clicked() {
-        actions.push(Change::ToggleStar { task: task_id, idx }.into());
+        actions.push(Change::ToggleStar { note: note.id }.into());
     }
     let unmovable = match (&note.action, note.next_step) {
         (Some(NoteAction::Closed), _) => Some(MoveError::CloseNote),
@@ -263,22 +257,15 @@ fn comment_menu_items(
         .on_disabled_hover_text(unmovable.map(|e| e.to_string()).unwrap_or_default())
         .clicked()
     {
-        actions.push(Action::StartMove(task_id, idx));
+        actions.push(Action::StartMove(note.id));
     }
     if ui.button("Delete").clicked() {
-        actions.push(Change::DeleteNote { task: task_id, idx }.into());
+        actions.push(Change::DeleteNote { note: note.id }.into());
     }
 }
 
 /// The blocker entries of a comment's menu, for comments that aren't next steps.
-fn blocker_menu_items(
-    ui: &mut egui::Ui,
-    note: &Note,
-    task_id: u64,
-    idx: usize,
-    can_block: bool,
-    actions: &mut Vec<Action>,
-) {
+fn blocker_menu_items(ui: &mut egui::Ui, note: &Note, can_block: bool, actions: &mut Vec<Action>) {
     match note.blocker {
         Some(Blocker::Open) => {
             if ui
@@ -286,10 +273,10 @@ fn blocker_menu_items(
                 .on_hover_text("Mark this blocker as resolved")
                 .clicked()
             {
-                actions.push(Change::Resolve { task: task_id, idx }.into());
+                actions.push(Change::Resolve { note: note.id }.into());
             }
             if ui.button("Not blocking").clicked() {
-                actions.push(Change::Unblock { task: task_id, idx }.into());
+                actions.push(Change::Unblock { note: note.id }.into());
             }
         }
         Some(Blocker::Resolved { .. }) => {
@@ -299,10 +286,10 @@ fn blocker_menu_items(
                 .on_disabled_hover_text(CommandError::AlreadyBlocked.to_string())
                 .clicked()
             {
-                actions.push(Change::MarkBlocking { task: task_id, idx }.into());
+                actions.push(Change::MarkBlocking { note: note.id }.into());
             }
             if ui.button("Not blocking").clicked() {
-                actions.push(Change::Unblock { task: task_id, idx }.into());
+                actions.push(Change::Unblock { note: note.id }.into());
             }
         }
         None => {
@@ -313,7 +300,7 @@ fn blocker_menu_items(
                 .on_disabled_hover_text(CommandError::AlreadyBlocked.to_string())
                 .clicked()
             {
-                actions.push(Change::MarkBlocking { task: task_id, idx }.into());
+                actions.push(Change::MarkBlocking { note: note.id }.into());
             }
             if note.action.is_none()
                 && ui
@@ -321,7 +308,7 @@ fn blocker_menu_items(
                     .on_hover_text("The next thing to do here, and it's up to you")
                     .clicked()
             {
-                actions.push(Change::MarkStep { task: task_id, idx }.into());
+                actions.push(Change::MarkStep { note: note.id }.into());
             }
         }
     }
@@ -564,8 +551,6 @@ fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
 fn comment(
     ui: &mut egui::Ui,
     note: &Note,
-    idx: usize,
-    task_id: u64,
     hovered: bool,
     can_block: bool,
     promoted_to: Option<&str>,
@@ -585,7 +570,7 @@ fn comment(
             // No spacing after the box: its label is empty.
             ui.spacing_mut().icon_spacing = 0.0;
             if ui.checkbox(&mut done, "").on_hover_text(hint).changed() {
-                actions.push(Change::ToggleStep { task: task_id, idx }.into());
+                actions.push(Change::ToggleStep { note: note.id }.into());
             }
         }
         ui.label(RichText::new(local_time(note.at)).small().weak());
@@ -662,11 +647,11 @@ fn comment(
                 .add_visible(note.starred || hovered, star.frame(false).small())
                 .on_hover_text(if note.starred { "Unstar" } else { "Star" });
             if star.clicked() {
-                actions.push(Change::ToggleStar { task: task_id, idx }.into());
+                actions.push(Change::ToggleStar { note: note.id }.into());
             }
-            let id = ui.make_persistent_id(("comment_menu", task_id, idx));
+            let id = ui.make_persistent_id(("comment_menu", note.id));
             dots_menu(ui, id, hovered && edit.is_none(), |ui| {
-                comment_menu_items(ui, note, task_id, idx, can_block, actions);
+                comment_menu_items(ui, note, can_block, actions);
             });
         });
     });
@@ -718,7 +703,7 @@ fn comment(
 
 /// Editing a comment: Enter saves, Shift+Enter adds a newline, Escape cancels.
 fn edit_box(ui: &mut egui::Ui, edit: &mut NoteEdit, actions: &mut Vec<Action>) {
-    let id = ui.make_persistent_id(("edit_note", edit.task_id, edit.idx));
+    let id = ui.make_persistent_id(("edit_note", edit.note));
     let save = ui.memory(|m| m.has_focus(id))
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter));
     // Checked regardless of focus: egui drops the text box's focus on Escape
@@ -860,7 +845,7 @@ struct NewTaskDraft {
     /// Creating a subtask of this task.
     parent: Option<u64>,
     /// Promoting this comment of `parent`, a next step, to the subtask.
-    from_step: Option<usize>,
+    from_step: Option<Uuid>,
     title: String,
     notes: String,
     add_to_focus: bool,
@@ -869,16 +854,14 @@ struct NewTaskDraft {
 
 /// A comment being edited in place.
 struct NoteEdit {
-    task_id: u64,
-    idx: usize,
+    note: Uuid,
     text: String,
     focus_requested: bool,
 }
 
 /// A comment waiting for the user to pick the task it moves to.
 struct NoteMove {
-    from: u64,
-    idx: usize,
+    note: Uuid,
     target: Option<u64>,
 }
 
@@ -892,10 +875,10 @@ enum Action {
     /// Open the new task dialog for a subtask of this task, with this title.
     AddSubtask(u64, String),
     /// Open the new subtask dialog to turn this next step into a subtask.
-    StartPromote(u64, usize),
-    StartEdit(u64, usize),
+    StartPromote(Uuid),
+    StartEdit(Uuid),
     /// Open the dialog for moving a comment to another task.
-    StartMove(u64, usize),
+    StartMove(Uuid),
     SaveEdit,
     CancelEdit,
 }
@@ -968,43 +951,35 @@ impl TodoApp {
                         ..Default::default()
                     });
                 }
-                Action::StartPromote(id, idx) => {
-                    let note = self.api.board().task(id).and_then(|t| t.notes.get(idx));
-                    if let Some(note) = note {
+                Action::StartPromote(note_id) => {
+                    if let Some((id, note)) = self.api.board().note(note_id) {
                         let (title, body) = match split_title(&note.text) {
                             (Some(title), body) => (title, body.trim()),
                             (None, text) => (text, ""),
                         };
                         self.new_task = Some(NewTaskDraft {
                             parent: Some(id),
-                            from_step: Some(idx),
+                            from_step: Some(note_id),
                             title: title.to_owned(),
                             notes: body.to_owned(),
                             ..Default::default()
                         });
                     }
                 }
-                Action::StartEdit(id, idx) => {
-                    let note = self.api.board().task(id).and_then(|t| t.notes.get(idx));
-                    self.editing = note.map(|note| NoteEdit {
-                        task_id: id,
-                        idx,
+                Action::StartEdit(note_id) => {
+                    self.editing = self.api.board().note(note_id).map(|(_, note)| NoteEdit {
+                        note: note_id,
                         text: note.text.clone(),
                         focus_requested: false,
                     });
                 }
-                Action::StartMove(from, idx) => {
-                    self.moving = Some(NoteMove {
-                        from,
-                        idx,
-                        target: None,
-                    });
+                Action::StartMove(note) => {
+                    self.moving = Some(NoteMove { note, target: None });
                 }
                 Action::SaveEdit => {
                     if let Some(edit) = self.editing.take() {
                         self.change(Change::EditNote {
-                            task: edit.task_id,
-                            idx: edit.idx,
+                            note: edit.note,
                             text: edit.text,
                         });
                     }
@@ -1016,19 +991,12 @@ impl TodoApp {
 
     /// Sends a change to the API, logging why it failed if it did.
     fn change(&mut self, change: Change) {
-        // Comment indices on these tasks shift, so an open edit would point
-        // at the wrong comment.
-        let shifted = match change {
-            Change::DeleteNote { task, .. } | Change::DeleteTask { task } => [Some(task), None],
-            Change::MoveNote { from, to, .. } => [Some(from), Some(to)],
-            _ => [None, None],
-        };
-        match self.api.apply(change) {
-            Ok(_) => {
-                self.editing.take_if(|e| shifted.contains(&Some(e.task_id)));
-            }
-            Err(e) => eprintln!("its4tasks: {e}"),
+        if let Err(e) = self.api.apply(change) {
+            eprintln!("its4tasks: {e}");
         }
+        // Stop editing a comment that is gone.
+        let board = self.api.board();
+        self.editing.take_if(|e| board.find_note(e.note).is_none());
     }
 
     fn task_list(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1565,12 +1533,8 @@ impl TodoApp {
                             if task.notes.is_empty() {
                                 ui.weak("No comments yet.");
                             }
-                            for (idx, note) in task.notes.iter().enumerate() {
-                                let id = task.id;
-                                let edit = self
-                                    .editing
-                                    .as_mut()
-                                    .filter(|e| e.task_id == id && e.idx == idx);
+                            for note in &task.notes {
+                                let edit = self.editing.as_mut().filter(|e| e.note == note.id);
                                 let can_block = task.can_block();
                                 let promoted_to = match note.next_step {
                                     Some(NextStep::Promoted { subtask, .. }) => promoted
@@ -1603,8 +1567,6 @@ impl TodoApp {
                                             comment(
                                                 ui,
                                                 note,
-                                                idx,
-                                                id,
                                                 hovered,
                                                 can_block,
                                                 promoted_to,
@@ -1634,7 +1596,7 @@ impl TodoApp {
                                     })
                                     .response;
                                 entry.context_menu(|ui| {
-                                    comment_menu_items(ui, note, id, idx, can_block, actions);
+                                    comment_menu_items(ui, note, can_block, actions);
                                 });
                                 ui.add_space(4.0);
                             }
@@ -1783,8 +1745,11 @@ impl TodoApp {
         let Some(moving) = &mut self.moving else {
             return;
         };
-        let (from, idx) = (moving.from, moving.idx);
-        let Some(source) = self.api.board().task(from).filter(|t| idx < t.notes.len()) else {
+        let note = moving.note;
+        let found = self.api.board().find_note(note);
+        let Some(((from, idx), source)) =
+            found.and_then(|(from, idx)| Some(((from, idx), self.api.board().task(from)?)))
+        else {
             self.moving = None;
             return;
         };
@@ -1848,7 +1813,7 @@ impl TodoApp {
             });
         });
         if confirm && let Some(to) = moving.target {
-            self.change(Change::MoveNote { from, idx, to });
+            self.change(Change::MoveNote { note, to });
             self.moving = None;
         } else if cancel || modal.should_close() {
             self.moving = None;
@@ -1927,9 +1892,8 @@ impl TodoApp {
             let draft = self.new_task.take().unwrap_or_default();
             let title = draft.title.trim().to_owned();
             self.change(match (draft.parent, draft.from_step) {
-                (Some(parent), Some(idx)) => Change::PromoteStep {
-                    task: parent,
-                    idx,
+                (Some(_), Some(note)) => Change::PromoteStep {
+                    note,
                     title,
                     notes: draft.notes,
                     focus: draft.add_to_focus,

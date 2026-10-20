@@ -21,6 +21,7 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use tokio::runtime::Runtime;
+use uuid::Uuid;
 
 use crate::model::{Board, Note, SLOT_COUNT};
 use diff::{Changes, diff};
@@ -143,7 +144,7 @@ async fn read(db: &impl ConnectionTrait) -> Result<Board, DbErr> {
 
 async fn write(db: &DatabaseConnection, changes: &Changes<'_>) -> Result<(), DbErr> {
     let txn = db.begin().await?;
-    for &(t, notes_changed) in &changes.upserts {
+    for &t in &changes.upserts {
         task::Entity::insert(convert::task_row(t))
             .on_conflict(
                 OnConflict::column(task::Column::Id)
@@ -160,18 +161,38 @@ async fn write(db: &DatabaseConnection, changes: &Changes<'_>) -> Result<(), DbE
             )
             .exec_without_returning(&txn)
             .await?;
-        if notes_changed {
-            // Notes have no identity in the model, so replace them all.
-            note::Entity::delete_many()
-                .filter(note::Column::TaskId.eq(t.id as i64))
-                .exec(&txn)
-                .await?;
-            if !t.notes.is_empty() {
-                note::Entity::insert_many(convert::note_rows(t))
-                    .exec_without_returning(&txn)
-                    .await?;
-            }
-        }
+    }
+    for &(task_id, position, n) in &changes.note_upserts {
+        note::Entity::insert(convert::note_row(task_id, position, n))
+            .on_conflict(
+                OnConflict::column(note::Column::Id)
+                    .update_columns([
+                        note::Column::TaskId,
+                        note::Column::Position,
+                        note::Column::At,
+                        note::Column::Text,
+                        note::Column::Starred,
+                        note::Column::BlockedAt,
+                        note::Column::BlockerState,
+                        note::Column::BlockerResolvedAt,
+                        note::Column::NextStepState,
+                        note::Column::NextStepSince,
+                        note::Column::NextStepAt,
+                        note::Column::NextStepSubtask,
+                        note::Column::ActionKind,
+                        note::Column::ActionQuote,
+                        note::Column::ActionBlockedSince,
+                    ])
+                    .to_owned(),
+            )
+            .exec_without_returning(&txn)
+            .await?;
+    }
+    if !changes.note_deletes.is_empty() {
+        note::Entity::delete_many()
+            .filter(note::Column::Id.is_in(changes.note_deletes.iter().map(Uuid::to_string)))
+            .exec(&txn)
+            .await?;
     }
     if !changes.deletes.is_empty() {
         task::Entity::delete_many()
@@ -269,6 +290,8 @@ mod tests {
         t.notes.push(closed);
         b.slots[0] = Some(a);
         b.slots[3] = Some(s);
+        // The notes above are copies; give them their own ids.
+        b.sanitize();
         b
     }
 
@@ -304,6 +327,56 @@ mod tests {
         // Deleting a task takes its subtasks, their notes and slots with it.
         board.delete_task(board.tasks[0].id);
         store.save(&board).unwrap();
+        assert_eq!(reopen(dir.path()), board);
+    }
+
+    #[test]
+    fn moved_comments_keep_their_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut board = sample();
+        let mut store = Store::open_in(dir.path()).unwrap();
+        store.save(&board).unwrap();
+        let (from, to) = (board.tasks[0].id, board.tasks[1].id);
+        let id = board.tasks[0].notes[3].id;
+        board.move_note(from, 3, to).unwrap();
+        store.save(&board).unwrap();
+        let loaded = reopen(dir.path());
+        assert_eq!(loaded, board);
+        assert_eq!(loaded.find_note(id).map(|(t, _)| t), Some(to));
+    }
+
+    #[test]
+    fn migrating_gives_old_comments_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join(DB_FILE).display());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Database::connect(url).await.unwrap();
+            // The schema before comments had ids.
+            Migrator::up(&db, Some(1)).await.unwrap();
+            db.execute_unprepared(
+                "INSERT INTO task (id, title, done, updated_at, folded)
+                     VALUES (0, 'a', false, '2026-10-01 10:00:00+00:00', false);
+                 INSERT INTO note (task_id, position, at, text, starred)
+                     VALUES (0, 0, '2026-10-01 10:00:00+00:00', 'one', false),
+                            (0, 1, '2026-10-01 11:00:00+00:00', 'two', true);
+                 INSERT INTO meta (id, next_id) VALUES (1, 1);",
+            )
+            .await
+            .unwrap();
+            db.close().await.unwrap();
+        });
+        let board = reopen(dir.path());
+        let notes = &board.tasks[0].notes;
+        let texts: Vec<&str> = notes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two"]);
+        assert!(notes[1].starred);
+        assert_ne!(notes[0].id, notes[1].id);
+        assert!(notes.iter().all(|n| n.id.get_version_num() == 4));
+        // The ids are what's stored, not made up on each load.
         assert_eq!(reopen(dir.path()), board);
     }
 

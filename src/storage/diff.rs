@@ -2,14 +2,21 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Board, SLOT_COUNT, Task};
+use uuid::Uuid;
+
+use crate::model::{Board, Note, SLOT_COUNT, Task};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Changes<'a> {
-    /// New or changed tasks, parents before their subtasks so a row's parent
-    /// is always written first. The flag says whether its notes changed.
-    pub upserts: Vec<(&'a Task, bool)>,
+    /// New or changed task rows (notes aside), parents before their subtasks
+    /// so a row's parent is always written first.
+    pub upserts: Vec<&'a Task>,
     pub deletes: Vec<u64>,
+    /// New or changed notes, with their task and position in it. A moved
+    /// note is here with its new task.
+    pub note_upserts: Vec<(u64, usize, &'a Note)>,
+    /// Notes gone from tasks that remain. Those of deleted tasks go with them.
+    pub note_deletes: Vec<Uuid>,
     /// Slots whose task changed: `(index, task)`.
     pub slots: Vec<(usize, Option<u64>)>,
     pub next_id: Option<u64>,
@@ -23,16 +30,46 @@ impl Changes<'_> {
 
 pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
     let before: HashMap<u64, &Task> = old.tasks.iter().map(|t| (t.id, t)).collect();
-    let mut upserts: Vec<(&Task, bool)> = new
+    // New tasks, or ones that changed in any way, notes included.
+    let changed: Vec<(Option<&Task>, &Task)> = new
         .tasks
         .iter()
-        .filter_map(|t| match before.get(&t.id) {
-            None => Some((t, true)),
-            Some(&o) if o != t => Some((t, o.notes != t.notes)),
-            Some(_) => None,
+        .map(|t| (before.get(&t.id).copied(), t))
+        .filter(|(o, t)| *o != Some(*t))
+        .collect();
+
+    let mut upserts: Vec<&Task> = changed
+        .iter()
+        .filter(|(o, t)| !o.is_some_and(|o| same_row(o, t)))
+        .map(|(_, t)| *t)
+        .collect();
+    upserts.sort_by_key(|t| depth(new, t));
+
+    let notes_before: HashMap<Uuid, (u64, usize, &Note)> = changed
+        .iter()
+        .filter_map(|(o, _)| *o)
+        .flat_map(|o| {
+            o.notes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id, (o.id, i, n)))
         })
         .collect();
-    upserts.sort_by_key(|(t, _)| depth(new, t));
+    let note_upserts: Vec<(u64, usize, &Note)> = changed
+        .iter()
+        .flat_map(|(_, t)| t.notes.iter().enumerate().map(|(i, n)| (t.id, i, n)))
+        .filter(|row| notes_before.get(&row.2.id) != Some(row))
+        .collect();
+    let notes_after: HashSet<Uuid> = changed
+        .iter()
+        .flat_map(|(_, t)| t.notes.iter().map(|n| n.id))
+        .collect();
+    let note_deletes = notes_before
+        .keys()
+        .filter(|id| !notes_after.contains(id))
+        .copied()
+        .collect();
+
     let kept: HashSet<u64> = new.tasks.iter().map(|t| t.id).collect();
     Changes {
         upserts,
@@ -42,12 +79,42 @@ pub fn diff<'a>(old: &Board, new: &'a Board) -> Changes<'a> {
             .map(|t| t.id)
             .filter(|id| !kept.contains(id))
             .collect(),
+        note_upserts,
+        note_deletes,
         slots: (0..SLOT_COUNT)
             .filter(|&i| old.slots[i] != new.slots[i])
             .map(|i| (i, new.slots[i]))
             .collect(),
         next_id: (old.next_id != new.next_id).then_some(new.next_id),
     }
+}
+
+/// Whether two versions of a task have the same row, ignoring their notes.
+fn same_row(a: &Task, b: &Task) -> bool {
+    // Destructured so a new field can't be forgotten here.
+    let Task {
+        id,
+        title,
+        notes: _,
+        done,
+        updated_at,
+        created_at,
+        done_at,
+        parent,
+        folded,
+    } = a;
+    (
+        id, title, done, updated_at, created_at, done_at, parent, folded,
+    ) == (
+        &b.id,
+        &b.title,
+        &b.done,
+        &b.updated_at,
+        &b.created_at,
+        &b.done_at,
+        &b.parent,
+        &b.folded,
+    )
 }
 
 /// How many ancestors a task has. Stops at the task count in case of a cycle.
@@ -68,9 +135,10 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+    use crate::model::MessageKind;
 
     fn ids(changes: &Changes) -> Vec<u64> {
-        changes.upserts.iter().map(|(t, _)| t.id).collect()
+        changes.upserts.iter().map(|t| t.id).collect()
     }
 
     #[test]
@@ -90,7 +158,7 @@ mod tests {
         new.task_mut(a).unwrap().title = "renamed".into();
         let c = diff(&old, &new);
         assert_eq!(ids(&c), vec![a]);
-        assert!(!c.upserts[0].1, "notes did not change");
+        assert!(c.note_upserts.is_empty(), "notes did not change");
         assert!(c.deletes.is_empty());
         assert_eq!(c.next_id, None);
     }
@@ -123,5 +191,42 @@ mod tests {
         assert!(c.upserts.is_empty());
         assert_eq!(c.deletes, vec![a, b]);
         assert_eq!(c.slots, vec![(2, None)]);
+    }
+
+    #[test]
+    fn writes_only_the_notes_that_changed() {
+        let now = Utc::now();
+        let mut old = Board::default();
+        let a = old.add_task("a".into(), "one", None, now);
+        let b = old.add_task("b".into(), "", None, now);
+        let t = old.task_mut(a).unwrap();
+        t.post("two", MessageKind::Comment, now);
+        t.post("three", MessageKind::Comment, now);
+        let ids: Vec<Uuid> = t.notes.iter().map(|n| n.id).collect();
+
+        let mut new = old.clone();
+        new.task_mut(a).unwrap().notes[2].text = "three!".into();
+        let c = diff(&old, &new);
+        assert!(c.upserts.is_empty(), "the task row didn't change");
+        let rows: Vec<_> = c
+            .note_upserts
+            .iter()
+            .map(|(t, i, n)| (*t, *i, n.id))
+            .collect();
+        assert_eq!(rows, vec![(a, 2, ids[2])]);
+        assert!(c.note_deletes.is_empty());
+
+        // Deleting the first shifts the rest; moving keeps the id.
+        let mut new = old.clone();
+        new.task_mut(a).unwrap().delete_note(0);
+        new.move_note(a, 1, b).unwrap();
+        let c = diff(&old, &new);
+        let rows: Vec<_> = c
+            .note_upserts
+            .iter()
+            .map(|(t, i, n)| (*t, *i, n.id))
+            .collect();
+        assert_eq!(rows, vec![(a, 0, ids[1]), (b, 0, ids[2])]);
+        assert_eq!(c.note_deletes, vec![ids[0]]);
     }
 }

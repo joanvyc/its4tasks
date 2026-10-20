@@ -1,7 +1,8 @@
-use std::{fmt, iter};
+use std::{collections::HashSet, fmt, iter};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
+use uuid::Uuid;
 
 pub const SLOT_COUNT: usize = 4;
 
@@ -83,6 +84,10 @@ impl MessageKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
+    /// Stays the same when the comment is edited or moved to another task.
+    /// Files from before ids get fresh ones.
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
     pub at: DateTime<Utc>,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +108,7 @@ pub struct Note {
 impl Note {
     fn new(text: String, at: DateTime<Utc>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             at,
             text,
             blocker: None,
@@ -457,6 +463,10 @@ impl Task {
         let mut linked: Vec<usize> = iter::once(idx).chain(partner).collect();
         linked.sort_unstable();
         linked
+    }
+
+    pub fn note_index(&self, id: Uuid) -> Option<usize> {
+        self.notes.iter().position(|n| n.id == id)
     }
 
     /// Insert a comment where its time puts it.
@@ -933,6 +943,19 @@ impl Board {
         Ok(())
     }
 
+    /// The task holding a comment, and the comment's index in it.
+    pub fn find_note(&self, id: Uuid) -> Option<(u64, usize)> {
+        self.tasks
+            .iter()
+            .find_map(|t| t.note_index(id).map(|idx| (t.id, idx)))
+    }
+
+    /// A comment and the task holding it.
+    pub fn note(&self, id: Uuid) -> Option<(u64, &Note)> {
+        let (task, idx) = self.find_note(id)?;
+        Some((task, &self.task(task)?.notes[idx]))
+    }
+
     pub fn task(&self, id: u64) -> Option<&Task> {
         self.tasks.iter().find(|t| t.id == id)
     }
@@ -1000,6 +1023,13 @@ impl Board {
                 && let Some(task) = self.task_mut(id)
             {
                 task.parent = None;
+            }
+        }
+        // Copied comments share an id; give the copies new ones.
+        let mut seen = HashSet::new();
+        for note in self.tasks.iter_mut().flat_map(|t| &mut t.notes) {
+            if !seen.insert(note.id) {
+                note.id = Uuid::new_v4();
             }
         }
         let max_id = self.tasks.iter().map(|t| t.id + 1).max().unwrap_or(0);
@@ -1676,6 +1706,19 @@ mod tests {
         let ids: Vec<_> = b.tasks.iter().map(|t| t.id).collect();
         assert_eq!(ids, [0, 2, 4]);
         assert_eq!(b.slots, [None, Some(4), None, None]);
+    }
+
+    #[test]
+    fn sanitize_gives_copied_notes_new_ids() {
+        let mut b = board_with(1);
+        let t = &mut b.tasks[0];
+        t.post("a", MessageKind::Comment, Utc::now());
+        let copy = t.notes[0].clone();
+        t.notes.push(copy);
+        b.sanitize();
+        let notes = &b.tasks[0].notes;
+        assert_ne!(notes[0].id, notes[1].id);
+        assert_eq!(b.find_note(notes[1].id), Some((b.tasks[0].id, 1)));
     }
 
     #[test]

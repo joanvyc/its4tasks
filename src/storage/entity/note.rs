@@ -5,8 +5,9 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "note")]
 pub struct Model {
-    #[sea_orm(primary_key)]
-    pub id: i32,
+    /// The model's `Note::id`, a UUID as text.
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,
     pub task_id: i64,
     /// Order within the task.
     pub position: i32,

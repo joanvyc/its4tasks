@@ -3,7 +3,7 @@
 // Clerk.load(), Clerk.session.getToken() and Clerk.redirectToSignIn(). Like
 // Clerk, it keeps a session (the `__client` cookie dev-auth's sign-in sets)
 // and hands out short-lived tokens for it, the same one until it's close to
-// expiring.
+// expiring; a session that ends is checked for again every 5 s.
 (() => {
   const origin = new URL(document.currentScript.src).origin;
 
@@ -48,5 +48,12 @@
       window.location.assign(`${origin}/sign-in?redirect=${encodeURIComponent(back)}`);
     },
   };
+  // Like Clerk keeping its client in sync (say, after signing in again in
+  // another tab): a session that comes back is picked up.
+  setInterval(async () => {
+    if (clerk.session !== null) return;
+    const jwt = await fetchToken().catch(() => null);
+    if (jwt) clerk.session = session(jwt);
+  }, 5000);
   window.Clerk = clerk;
 })();

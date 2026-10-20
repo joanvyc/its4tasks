@@ -1020,6 +1020,33 @@ impl TodoApp {
         };
     }
 
+    /// Until the server first answers: rather than an empty board.
+    fn loading(&self, ui: &mut egui::Ui) {
+        CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() / 2.0 - 40.0).max(16.0));
+                ui.spinner();
+                ui.add_space(8.0);
+                ui.weak("Loading your board…");
+                let problem = match self.api.error() {
+                    Some(e) => Some(format!("Can't reach the server: {e}")),
+                    None if self.api.signed_out() => Some("Signed out.".to_owned()),
+                    None => None,
+                };
+                if let Some(problem) = problem {
+                    ui.add_space(12.0);
+                    ui.colored_label(palette(ui.visuals()).blocker, problem);
+                }
+                #[cfg(target_arch = "wasm32")]
+                if self.api.signed_out() && ui.button("Sign in again").clicked() {
+                    crate::client::sign_in_again();
+                }
+            });
+        });
+        // Keep fetching until it answers.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
     /// For a new user: start a board, or bring one.
     fn landing(&mut self, ui: &mut egui::Ui) {
         CentralPanel::default().show(ui, |ui| {
@@ -2069,7 +2096,11 @@ impl eframe::App for TodoApp {
         self.api.poll();
         self.api.refresh();
         self.poll_import();
-        if self.api.loaded() && !self.api.started() {
+        if !self.api.loaded() {
+            self.loading(ui);
+            return;
+        }
+        if !self.api.started() {
             self.landing(ui);
             self.apply(Vec::new());
             return;

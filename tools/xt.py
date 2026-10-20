@@ -29,6 +29,8 @@ x11.XFlush.argtypes = [C.c_void_p]
 xt.XTestFakeMotionEvent.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_ulong]
 xt.XTestFakeButtonEvent.argtypes = [C.c_void_p, C.c_uint, C.c_int, C.c_ulong]
 xt.XTestFakeKeyEvent.argtypes = [C.c_void_p, C.c_uint, C.c_int, C.c_ulong]
+x11.XRaiseWindow.argtypes = [C.c_void_p, C.c_ulong]
+x11.XSetInputFocus.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_ulong]
 
 d = x11.XOpenDisplay(None)
 root = x11.XDefaultRootWindow(d)
@@ -88,6 +90,15 @@ def origin():
     return x.value, y.value
 
 
+def focus():
+    """Raises the window and gives it the keyboard, so input meant for it
+    doesn't go nowhere when the desktop has focused something else."""
+    x11.XRaiseWindow(d, win)
+    x11.XSetInputFocus(d, win, 2, 0)  # RevertToParent, CurrentTime
+    x11.XFlush(d)
+    time.sleep(0.05)
+
+
 def move(x, y):
     ox, oy = origin()
     xt.XTestFakeMotionEvent(d, -1, ox + x, oy + y, 0)
@@ -118,6 +129,7 @@ if cmd == "id":
 elif cmd == "move":
     move(int(args[0]), int(args[1]))
 elif cmd == "click":
+    focus()
     move(int(args[0]), int(args[1]))
     b = int(args[2]) if len(args) > 2 else 1
     xt.XTestFakeButtonEvent(d, b, 1, 0)
@@ -140,6 +152,7 @@ elif cmd == "drag":
     x11.XFlush(d)
     time.sleep(0.3)
 elif cmd == "type":
+    focus()
     for ch in args[0]:
         if ch in SHIFTED:
             key(SHIFTED[ch], shift=True)
@@ -147,6 +160,7 @@ elif cmd == "type":
             key(SPECIAL.get(ch, ch.lower()), shift=ch.isupper())
     time.sleep(0.2)
 elif cmd == "key":
+    focus()
     key(args[0], shift=len(args) > 1 and args[1] == "shift")
     time.sleep(0.3)
 elif cmd == "shot":

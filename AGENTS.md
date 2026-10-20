@@ -11,19 +11,24 @@ It runs as a server, `its4tasks-server`, which keeps every user's board and serv
   - `examples/import_change.rs`: prints the `Import` change for a `board.json`, for seeding test users.
 - `crates/server` (`its4tasks-server`, library and binary):
   - `auth.rs`: who's asking. Users sign in at an outside authority (Clerk or similar) that signs JWTs; the server checks them against the authority's JWKS and knows a user by the token's `(iss, sub)`. The token comes as `Authorization: Bearer` (native, and the browser with Clerk) or in the `__session` cookie (browser). `Auth::Local` is the native app's local mode instead: one random bearer secret, standing for the local user.
-  - `clerk.rs`, `clerk.js`: with Clerk, the page loads Clerk's script and defines `window.its4tasksAuth` (`token()`, `signIn()`), which the web GUI asks for a fresh token before each request. The server then serves the page without checking for a session, and the page sends people to sign in itself.
+  - `clerk.rs`, `clerk.js`: with Clerk, the page loads Clerk's script and defines `window.its4tasksAuth`: `token({ fresh })` and `signIn()`. The startup page and the web GUI ask it for a token before each request. The server then serves the page without checking for a session, and the startup page sends people to sign in itself.
   - `api.rs`: `Api`, a board per user plus saving after each change. An unknown `(iss, sub)` becomes a new user, whose board is empty with `started: false` until they start one or import one. Touching another user's task or comment is `Forbidden`.
   - `storage/`: sea-orm over SQLite (feature `sqlite`, default) or Postgres (feature `postgres`): entities, migrations, and a per-user diff so a save writes only what changed. Every row carries its `owner_id`.
-  - `server.rs`: `GET /api/board`, `POST /api/changes` (401 without a valid token, 403 for others' things), `GET /api/auth` (how native apps sign in), and the web GUI at `/`, which sends visitors without a valid token to the authority's sign-in page.
+  - `server.rs`: `GET /api/board`, `POST /api/changes` (401 without a valid token, 403 for others' things), `POST /api/start` (a new user's welcome board; 409 once started), `POST /api/import` (a `board.json`'s text; the server parses it with `core::import`), and `GET /api/auth` (how native apps sign in). It also serves the web GUI's files, with an ETag and `no-cache`, since their names don't change between builds.
+  - `page/index.html`: the startup page at `/`. Before downloading the board app, it checks sign-in and whether the user has a board. Signed-out visitors go straight to sign-in, with nothing rendered. New users get a plain HTML landing page (start, or import a `board.json`). Everyone else gets the board app, which it loads by importing `/its4tasks.js`. In cookie mode the server sends strangers to the sign-in page before serving it.
   - `main.rs`: configuration from the environment; `README.md` lists it.
   - The web GUI is `crates/gui/dist`, embedded by rust-embed. Debug builds read it from disk, release builds bake it in (see `build.rs`).
 - `crates/gui` (`its4tasks`):
   - `app.rs`: the UI, including the landing page for new users and the "⋯" menu (import, switch board).
-  - `client.rs`: the GUI's side of the API. An edit shows at once: `apply` applies the change to a local copy with `apply_change`, and requests go out one at a time in the background (a thread per request natively, `fetch()` in the browser). Server answers replace the copy's base, with unanswered changes replayed on top. A refused change, or one sent while the server is unreachable, is undone. In the browser, requests carry the token from the page's `its4tasksAuth` if it has one (Clerk), and the session cookie otherwise. A 401 sets `unauthorized()`: the browser then reloads the page (and so goes to sign in), the native app refreshes its token.
+  - `client.rs`: the GUI's side of the API. An edit shows at once: `apply` applies the change to a local copy with `apply_change`, and requests go out one at a time in the background (a thread per request natively, `fetch()` in the browser). Server answers replace the copy's base, with unanswered changes replayed on top. A refused change, or one sent while the server is unreachable, is undone. A change refused with 401 is kept and held instead, as the server didn't apply it.
+    - In the browser, requests carry the token from the page's `its4tasksAuth` if it has one (Clerk), and the session cookie otherwise.
+    - A 401, or no token from the page, sets `unauthorized()`. Requests are held and retried every 2 s, with a fresh token in the browser. The native shell refreshes its token and calls `set_token`.
+    - `signed_out()` is true after 10 s of refusals, and the view bar then says so (with "Sign in again" in the browser).
+    - **The app never reloads the page or redirects on its own.** Doing so loses whatever the user was doing, and Clerk can briefly have no token while it renews one.
   - `files.rs`: picking a `board.json` to import, natively or in the browser.
   - `native/`: the native app's shell. The first time, it asks where the board is (`shell.rs`): a local board, served in-process from `board.sqlite` in the data directory (`local.rs`), or a server, signed in through the browser with OAuth code + PKCE and a loopback redirect (`oauth.rs`). The choice and the refresh token are kept in `config.json` in the config directory (`config.rs`).
   - `main.rs`: the native window, or the browser canvas in `index.html`.
-- `crates/dev-auth` (`its4tasks-dev-auth`): a fake authority for local testing. Anyone signs in as anyone by typing a name; tokens are signed with the test key in `crates/server/tests/fixtures`. It also serves a mock of Clerk's script (`clerk.browser.js`) for trying the Clerk setup; `README.md` has the settings. Never use it, or that key, for real.
+- `crates/dev-auth` (`its4tasks-dev-auth`): a fake authority for local testing. Anyone signs in as anyone by typing a name; tokens are signed with the test key in `crates/server/tests/fixtures`. It also serves a mock of Clerk's script (`clerk.browser.js`) for trying the Clerk setup; `README.md` has the settings. `POST /v1/client/revoke?sub=user_<name>` cuts that user's mock session off, as signing out elsewhere would, and `POST /v1/client/restore?sub=…` brings it back. The user is in the `__client` cookie, which is `user_` plus the lowercased letters and digits of the name typed. Never use it, or that key, for real.
 
 ## Checks
 
@@ -48,7 +53,7 @@ pg_ctl -D "$PG/data" stop
 ## Building the web GUI
 
 ```sh
-(cd crates/gui && trunk build)            # writes crates/gui/dist; a debug server picks it up as is
+(cd crates/gui && trunk build)            # writes crates/gui/dist (its4tasks.js, its4tasks_bg.wasm); a debug server picks it up as is
 (cd crates/gui && trunk build --release)  # then: cargo build --release -p its4tasks-server
 ```
 A release `its4tasks-server` binary contains the GUI and needs nothing else.
@@ -115,7 +120,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    python3 tools/xt.py key Return [shift]  # e.g. Shift+Enter
    python3 tools/xt.py key Escape
    ```
-   The first pointer event after launch only tells egui where the pointer is. Move the pointer once before testing hover. Clicking into a text field puts the cursor where you click: press `End` before deleting what's there.
+   The first pointer event after launch only tells egui where the pointer is. Move the pointer once before testing hover. Clicking into a text field puts the cursor where you click: press `End` before deleting what's there. `click`, `type` and `key` raise the window and give it X input focus first. Even so, take a screenshot after typing to check the text arrived. Synthetic X input only ever reaches X11 windows, never the user's Wayland ones.
 
    **The web GUI** is tested the same way, in a Firefox with its own throwaway profile, so the user's browser is never touched. Run `trunk build` first. The server sends the new profile to dev-auth's sign-in page; sign in there, then point `xt.py` at the app with `XT_WINDOW`:
    ```sh

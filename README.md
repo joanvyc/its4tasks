@@ -142,7 +142,7 @@ Starting dev-auth with `ITS4TASKS_DEV_AUTH_TTL=15` makes its tokens expire quick
 
 ## Bringing a board along
 
-**Import board.json…** in the **⋯** menu adds every task in a `board.json` file to your board. That works for files from older versions of the app too. New users are offered the same thing on their first visit.
+**Import board.json…** in the **⋯** menu adds every task in a `board.json` file to your board. That works for files from older versions of the app too. New users are offered the same on the first page they see: start a new board, or import one.
 
 ## Working on it
 

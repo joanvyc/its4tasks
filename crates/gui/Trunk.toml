@@ -1,5 +1,9 @@
-# `trunk build` (or `--release`) writes the web GUI to dist/, which
-# its4tasks-server serves at / (and embeds in release builds).
+# `trunk build` (or `--release`) writes the web GUI to dist/: the board app
+# as its4tasks.js and its4tasks_bg.wasm, which its4tasks-server serves (and
+# embeds in release builds). The server's own startup page loads them, so
+# their names stay the same from build to build; the server sends them with
+# an ETag instead. The index.html written here isn't served.
 [build]
 target = "index.html"
 dist = "dist"
+filehash = false

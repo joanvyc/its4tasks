@@ -4,22 +4,33 @@
 //! - `POST /api/changes` with a `Change`: an `Applied`, or a `Rejected` with
 //!   404 (no such task or comment), 403 (it's on someone else's board) or
 //!   409 (the board's rules refuse it, or a new id is taken).
+//! - `POST /api/start`: a new user's board, with the welcome tasks; 409 if
+//!   they have one.
+//! - `POST /api/import` with a `board.json`'s text: adds its tasks; 400 if
+//!   it isn't one.
 //! - `GET /api/auth`: how the native app signs in (OAuth), if it can.
 //!   Answered to anyone.
-//! - Anything else: the web GUI's files, built by `trunk build` in
-//!   `crates/gui` and embedded in release builds. `/` is its `index.html`,
-//!   which sends anyone not signed in to the authority's sign-in page first.
+//! - `/`: the startup page (`page/index.html`). It checks sign-in and the
+//!   board before loading anything big: signed-out visitors go to sign in,
+//!   new users get the landing page, and everyone else the board app. The
+//!   authority's sign-in page comes first if the server can tell (see
+//!   `auth::JwtConfig::sign_in`).
+//! - Anything else: the board app's files, built by `trunk build` in
+//!   `crates/gui` and embedded in release builds. Their names don't change
+//!   between builds, so they're sent with an ETag and `no-cache`.
 //!
 //! Without a valid token the API answers 401.
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use its4tasks_core::api::{ApiError, Applied, BoardView, Change, Rejected};
+use its4tasks_core::api::{ApiError, Applied, BoardView, Change, Rejected, now};
+use its4tasks_core::model::Board;
+use its4tasks_core::{import, welcome};
 use rust_embed::Embed;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -40,6 +51,9 @@ struct AppState {
 
 type Shared = Arc<AppState>;
 
+/// The largest `board.json` `/api/import` takes, in bytes.
+const IMPORT_LIMIT: usize = 16 << 20;
+
 /// The web GUI (see build.rs). Debug builds read it from disk on each
 /// request, so a new `trunk build` shows without rebuilding the server.
 #[derive(Embed)]
@@ -57,6 +71,11 @@ pub fn router(api: Api, auth: Auth) -> Router {
     let api = Router::new()
         .route("/board", get(board))
         .route("/changes", post(change))
+        .route("/start", post(start))
+        .route(
+            "/import",
+            post(import_board).layer(DefaultBodyLimit::max(IMPORT_LIMIT)),
+        )
         .route("/auth", get(auth_info));
     Router::new()
         .nest("/api", api)
@@ -141,6 +160,61 @@ async fn change(
     }
 }
 
+/// Starts a new user's board with the welcome tasks.
+async fn start(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let user = match user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return *response,
+    };
+    let mut api = state.api.lock().await;
+    match api.board(&user).await {
+        Ok((true, _)) => (StatusCode::CONFLICT, "You already have a board.").into_response(),
+        Ok((false, _)) => add_board(&mut api, &user, welcome::board(now())).await,
+        Err(e) => internal(e),
+    }
+}
+
+/// Adds the tasks of the `board.json` sent.
+async fn import_board(State(state): State<Shared>, headers: HeaderMap, text: String) -> Response {
+    let user = match user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return *response,
+    };
+    let board = match import::parse(&text) {
+        Ok(board) => board,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("That isn't an its4tasks board.json: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let mut api = state.api.lock().await;
+    add_board(&mut api, &user, board).await
+}
+
+/// Adds `board`'s tasks to the user's, with new ids, and answers with the
+/// user's `BoardView`.
+async fn add_board(api: &mut Api, user: &User, board: Board) -> Response {
+    let change = Change::Import {
+        board: import::fresh_ids(board),
+    };
+    match api.apply(user, change).await {
+        Ok(_) => {}
+        Err(Failure::Api(e)) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
+        Err(e) => return internal(e),
+    }
+    match api.board(user).await {
+        Ok((started, board)) => Json(BoardView {
+            started,
+            board: board.clone(),
+        })
+        .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
 async fn auth_info(State(state): State<Shared>) -> Response {
     match &state.auth {
         Auth::Jwt(jwt) => match &jwt.config.oauth {
@@ -165,43 +239,67 @@ fn internal(e: Failure) -> Response {
         .into_response()
 }
 
+/// The startup page, served at `/`.
+const PAGE: &str = include_str!("page/index.html");
+
 async fn web(State(state): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
-    let path = match uri.path().trim_start_matches('/') {
-        "" => "index.html",
-        path => path,
+    let path = uri.path().trim_start_matches('/');
+    if path.is_empty() || path == "index.html" {
+        return page(&state, &uri, &headers).await;
+    }
+    let Some(file) = Web::get(path) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    // The page needs someone signed in; its code and fonts don't. A page
-    // signed in by Clerk's script sees to that itself (see `clerk`).
+    let etag = format!(
+        "\"{}\"",
+        file.metadata
+            .sha256_hash()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let cache = [
+        (header::ETAG, etag.clone()),
+        (header::CACHE_CONTROL, "no-cache".to_owned()),
+    ];
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|tags| tags.split(',').any(|t| t.trim() == etag));
+    if unchanged {
+        return (StatusCode::NOT_MODIFIED, cache).into_response();
+    }
+    let mime = file.metadata.mimetype().to_owned();
+    (cache, [(header::CONTENT_TYPE, mime)], file.data).into_response()
+}
+
+/// The startup page. It needs someone signed in; the app's code doesn't.
+/// A page signed in by Clerk's script sees to that itself (see `clerk`).
+async fn page(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Response {
     let jwt = match &state.auth {
         Auth::Jwt(jwt) => Some(jwt),
         Auth::Local { .. } => None,
     };
-    if path == "index.html"
-        && let Some(jwt) = jwt
-        && let Some(sign_in) = jwt.config.sign_in(&page_url(&state, &headers, &uri))
-        && state.auth.identify(&headers).await.is_err()
+    if let Some(jwt) = jwt
+        && let Some(sign_in) = jwt.config.sign_in(&page_url(state, headers, uri))
+        && state.auth.identify(headers).await.is_err()
     {
         return Redirect::to(&sign_in).into_response();
     }
-    match Web::get(path) {
-        Some(file) if path == "index.html" => {
-            let mut page = String::from_utf8_lossy(&file.data).into_owned();
-            if let Some(WebSignIn::Clerk(clerk)) = jwt.map(|jwt| &jwt.config.web) {
-                page = page.replacen("</head>", &format!("{}</head>", clerk.script()), 1);
-            }
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response()
+    let page = match jwt.map(|jwt| &jwt.config.web) {
+        Some(WebSignIn::Clerk(clerk)) => {
+            PAGE.replacen("</head>", &format!("{}</head>", clerk.script()), 1)
         }
-        Some(file) => {
-            let mime = file.metadata.mimetype().to_owned();
-            ([(header::CONTENT_TYPE, mime)], file.data).into_response()
-        }
-        None if path == "index.html" => (
-            StatusCode::NOT_FOUND,
-            "The web GUI isn't built: run `trunk build` in crates/gui.",
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+        _ => PAGE.to_owned(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        page,
+    )
+        .into_response()
 }
 
 /// The address of the page asked for, as the browser sees it.
@@ -422,14 +520,15 @@ mod tests {
             headers[header::LOCATION],
             "https://auth.test/sign-in?redirect=http%3A%2F%2Fapp.test%3A7979%2F%3Fx%3D1"
         );
-        // Signed in through the cookie, the page is served (or explains it
-        // isn't built).
+        // Signed in through the cookie, the startup page is served.
         let request = Request::get("/")
             .header(header::COOKIE, format!("__session={}", token("alice")))
             .body(Body::empty())
             .unwrap();
-        let (status, _, _) = call(&app, request).await;
-        assert!(matches!(status, StatusCode::OK | StatusCode::NOT_FOUND));
+        let (status, _, page) = call(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("/its4tasks.js"));
+        assert!(!page.contains("its4tasksAuth ="), "no Clerk here");
         // The page's code needs no sign-in.
         assert_eq!(
             get(&app, "/no/such/file.js", None).await.0,
@@ -453,17 +552,103 @@ mod tests {
         );
         // No redirect: Clerk's script signs in on the page.
         let (status, page) = get(&app, "/", None).await;
-        if status == StatusCode::OK {
-            assert!(page.contains("window.its4tasksAuth"));
-            assert!(page.contains("https://example.clerk.accounts.dev"));
-        } else {
-            assert_eq!(status, StatusCode::NOT_FOUND, "the GUI isn't built");
-        }
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("window.its4tasksAuth"));
+        assert!(page.contains("https://example.clerk.accounts.dev"));
+        // Before the startup page's own script, which uses it.
+        assert!(page.find("window.its4tasksAuth =") < page.find("/its4tasks.js"));
         // The API still wants a token.
         assert_eq!(
             get(&app, "/api/board", None).await.0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    async fn post_text(
+        app: &Router,
+        path: &str,
+        token: Option<&str>,
+        text: &str,
+    ) -> (StatusCode, String) {
+        let mut request = Request::post(path).header(header::CONTENT_TYPE, "text/plain");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let (status, _, body) = call(app, request.body(Body::from(text.to_owned())).unwrap()).await;
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn new_users_start_a_board_once() {
+        let app = app();
+        let alice = token("alice");
+        assert_eq!(
+            post_text(&app, "/api/start", None, "").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) = post_text(&app, "/api/start", Some(&alice), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let started: BoardView = serde_json::from_str(&body).unwrap();
+        assert!(started.started);
+        assert_eq!(started.board.tasks[0].title, "Welcome to its4tasks");
+        // A second click doesn't make a second welcome board.
+        let (status, _) = post_text(&app, "/api/start", Some(&alice), "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(view(&app, &alice).await.board, started.board);
+    }
+
+    #[tokio::test]
+    async fn boards_are_imported_with_new_ids() {
+        let app = app();
+        let bob = token("bob");
+        // An older board.json, with numbered tasks and comments without ids.
+        let old = r#"{"tasks": [{"id": 0, "title": "From the old app",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
+            "done": false, "notes": [{"at": "2026-01-02T00:00:00Z", "text": "still to do"}]}],
+            "slots": [0, null, null, null], "next_id": 1}"#;
+        assert_eq!(
+            post_text(&app, "/api/import", None, old).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) = post_text(&app, "/api/import", Some(&bob), old).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first: BoardView = serde_json::from_str(&body).unwrap();
+        assert!(first.started);
+        assert_eq!(first.board.tasks[0].title, "From the old app");
+        assert_eq!(first.board.tasks[0].notes[0].text, "still to do");
+        assert_eq!(first.board.slots[0], Some(first.board.tasks[0].id));
+        // Again: the same tasks once more, under new ids.
+        let (_, body) = post_text(&app, "/api/import", Some(&bob), old).await;
+        let twice: BoardView = serde_json::from_str(&body).unwrap();
+        assert_eq!(twice.board.tasks.len(), 2);
+        assert_ne!(twice.board.tasks[0].id, twice.board.tasks[1].id);
+        let (status, body) = post_text(&app, "/api/import", Some(&bob), "not json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("board.json"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn app_files_are_revalidated() {
+        // Only with the board app built (debug builds read it from disk).
+        let Some(path) = Web::iter().find(|p| p != "index.html") else {
+            return;
+        };
+        let app = app();
+        let (status, headers, _) = call(
+            &app,
+            Request::get(format!("/{path}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+        let etag = headers[header::ETAG].clone();
+        let request = Request::get(format!("/{path}"))
+            .header(header::IF_NONE_MATCH, etag)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(&app, request).await.0, StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]

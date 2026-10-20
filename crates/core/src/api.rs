@@ -197,6 +197,10 @@ pub struct BoardView {
     /// False for a new user, until they start a board or import one.
     pub started: bool,
     pub board: Board,
+    /// Whose board it is, as the server knows them: so work kept in the
+    /// browser goes back to the same user.
+    #[serde(default)]
+    pub user: Option<Uuid>,
 }
 
 /// What a change did, and the board after it.

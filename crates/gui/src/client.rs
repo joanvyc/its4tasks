@@ -20,6 +20,7 @@ use web_time::Instant;
 
 use crate::api::{self, ApiError, Applied, BoardView, Change, Outcome, Rejected, apply_change};
 use crate::model::Board;
+use uuid::Uuid;
 
 /// Where the native GUI looks for the server unless `$ITS4TASKS_SERVER`
 /// says otherwise. In the browser the server is the page's own.
@@ -109,6 +110,8 @@ pub struct Client {
     /// Whether the server has answered at all, so `board` and `started`
     /// are its.
     loaded: bool,
+    /// Whose board it is, once the server has said.
+    user: Option<Uuid>,
     /// The server's last answer was that nobody's signed in. Requests wait
     /// in `queue` meanwhile, and are retried with a fresh token.
     unauthorized: bool,
@@ -163,6 +166,7 @@ impl Client {
             board: Board::default(),
             started: true,
             loaded: false,
+            user: None,
             unauthorized: false,
             unauthorized_since: None,
             token_gen: 0,
@@ -188,6 +192,21 @@ impl Client {
     /// Whether the server has answered yet.
     pub fn loaded(&self) -> bool {
         self.loaded
+    }
+
+    /// Whose board it is, as the server knows them, once it has said.
+    pub fn user(&self) -> Option<Uuid> {
+        self.user
+    }
+
+    /// The changes held while the server refuses, which it hasn't applied:
+    /// to keep them when the page goes to sign in again. Empty otherwise,
+    /// as changes on their way may have been applied.
+    pub fn held(&self) -> Vec<Change> {
+        if !self.unauthorized {
+            return Vec::new();
+        }
+        self.pending.iter().map(|p| p.change.clone()).collect()
     }
 
     /// Whether the server's last answer was that nobody's signed in.
@@ -381,6 +400,7 @@ impl Client {
                 self.fetching = false;
                 match result {
                     Ok(view) => {
+                        self.user = view.user.or(self.user);
                         self.confirmed = view.board;
                         self.started = view.started || !self.pending.is_empty();
                         self.answered();

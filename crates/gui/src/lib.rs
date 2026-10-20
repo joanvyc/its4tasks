@@ -6,5 +6,6 @@ pub mod client;
 pub mod files;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
+pub mod unsent;
 
 pub use its4tasks_core::{api, import, log, model, welcome};

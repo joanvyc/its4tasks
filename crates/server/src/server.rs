@@ -123,6 +123,7 @@ async fn board(State(state): State<Shared>, headers: HeaderMap) -> Response {
         Ok((started, board)) => Json(BoardView {
             started,
             board: board.clone(),
+            user: Some(user.id),
         })
         .into_response(),
         Err(e) => internal(e),
@@ -209,6 +210,7 @@ async fn add_board(api: &mut Api, user: &User, board: Board) -> Response {
         Ok((started, board)) => Json(BoardView {
             started,
             board: board.clone(),
+            user: Some(user.id),
         })
         .into_response(),
         Err(e) => internal(e),
@@ -591,6 +593,10 @@ mod tests {
         let started: BoardView = serde_json::from_str(&body).unwrap();
         assert!(started.started);
         assert_eq!(started.board.tasks[0].title, "Welcome to its4tasks");
+        // Whose it is, for work the browser keeps; someone else's differs.
+        assert!(started.user.is_some());
+        assert_eq!(view(&app, &alice).await.user, started.user);
+        assert_ne!(view(&app, &token("bob")).await.user, started.user);
         // A second click doesn't make a second welcome board.
         let (status, _) = post_text(&app, "/api/start", Some(&alice), "").await;
         assert_eq!(status, StatusCode::CONFLICT);

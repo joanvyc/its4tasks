@@ -52,6 +52,7 @@
       button.primary { font-weight: 600; }
       button:hover:not(:disabled) { background: var(--button-hover); }
       button:disabled { opacity: 0.55; cursor: default; }
+      .detail { margin-top: 14px; font-size: 0.8rem; overflow-wrap: anywhere; }
       #error { color: var(--error); margin-top: 14px; min-height: 1.4em; overflow-wrap: anywhere; }
     </style>
   </head>
@@ -69,6 +70,7 @@
         <h1 id="problem-title"></h1>
         <p id="problem-text"></p>
         <button id="problem-action" class="primary"></button>
+        <p id="problem-detail" class="detail"></p>
       </div>
       <div id="error" role="alert"></div>
     </div>
@@ -91,11 +93,11 @@
       // Never settles: the browser is on its way elsewhere.
       const leaving = () => new Promise(() => {});
 
-      async function authorization() {
+      async function authorization(fresh = false) {
         if (!auth) return {};
         // A second, fresh try before sending anyone away: Clerk can briefly
         // have no token while it renews one.
-        const token = (await auth.token()) || (await auth.token({ fresh: true }));
+        const token = (!fresh && (await auth.token())) || (await auth.token({ fresh: true }));
         if (!token) {
           await auth.signIn();
           return leaving();
@@ -104,12 +106,16 @@
       }
 
       async function api(method, path, body) {
-        const response = await fetch(path, {
-          method,
-          body,
-          credentials: "same-origin",
-          headers: await authorization(),
-        });
+        const send = async (fresh) =>
+          fetch(path, {
+            method,
+            body,
+            credentials: "same-origin",
+            headers: await authorization(fresh),
+          });
+        let response = await send(false);
+        // Refused: once more with a token fresh from the sign-in service.
+        if (response.status === 401 && auth) response = await send(true);
         if (!response.ok) {
           const text = await response.text();
           throw new Refused(response.status, text || `The server answered ${response.status}.`);
@@ -127,6 +133,8 @@
         $("problem-text").textContent = signedOut
           ? "Sign in again to see your board."
           : e.message || String(e);
+        // Why, for whoever runs the server.
+        $("problem-detail").textContent = signedOut ? e.message : "";
         $("problem-action").textContent = signedOut ? "Sign in" : "Try again";
         $("problem-action").onclick = () =>
           signedOut && auth ? auth.signIn() : window.location.reload();

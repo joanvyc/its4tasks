@@ -18,8 +18,10 @@ use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
     SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
+use crate::unsent::{self, NewTask, Unsent};
 use crate::welcome;
 use uuid::Uuid;
+use web_time::Instant;
 
 const CARD_GAP: f32 = 12.0;
 const CARD_MARGIN: i8 = 14;
@@ -936,6 +938,11 @@ pub struct TodoApp {
     log_starred_only: bool,
     /// Leave done tasks out of the task list.
     hide_closed: bool,
+    /// Whether work kept from before signing in again (`unsent`) has been
+    /// put back.
+    restored: bool,
+    /// When unsent work was last kept.
+    kept: Instant,
 }
 
 /// Sets up fonts and theme. Once, before showing anything.
@@ -974,6 +981,8 @@ impl TodoApp {
             log_period: Period::Day,
             log_starred_only: false,
             hide_closed: false,
+            restored: false,
+            kept: Instant::now(),
         }
     }
 
@@ -983,6 +992,66 @@ impl TodoApp {
 
     pub fn client_mut(&mut self) -> &mut Client {
         &mut self.api
+    }
+
+    /// What isn't on the server yet: refused changes, and drafts.
+    fn unsent(&self) -> Unsent {
+        Unsent {
+            changes: self.api.held(),
+            comment_drafts: unsent::drafts_by_task(&self.api.board().slots, &self.comment_drafts),
+            editing: self.editing.as_ref().map(|e| (e.note, e.text.clone())),
+            new_task: self.new_task.as_ref().map(|d| NewTask {
+                parent: d.parent,
+                from_step: d.from_step,
+                title: d.title.clone(),
+                notes: d.notes.clone(),
+                add_to_focus: d.add_to_focus,
+            }),
+        }
+    }
+
+    /// Keeps unsent work in the browser, for after signing in again.
+    fn keep_unsent(&mut self) {
+        if let Some(user) = self.api.user() {
+            unsent::save(user, &self.unsent());
+        }
+        self.kept = Instant::now();
+    }
+
+    /// Puts back work kept before signing in again, once the board is in.
+    fn restore_unsent(&mut self) {
+        let Some(user) = self.api.user() else {
+            return;
+        };
+        self.restored = true;
+        let Some(kept) = unsent::take(user) else {
+            return;
+        };
+        for change in kept.changes {
+            // Some may no longer apply, say to a task deleted elsewhere.
+            let _ = self.api.apply(change);
+        }
+        let board = self.api.board();
+        unsent::restore_drafts(&board.slots, &mut self.comment_drafts, &kept.comment_drafts);
+        if let Some((note, text)) = kept.editing
+            && board.find_note(note).is_some()
+        {
+            self.editing = Some(NoteEdit {
+                note,
+                text,
+                focus_requested: false,
+            });
+        }
+        if let Some(draft) = kept.new_task {
+            self.new_task = Some(NewTaskDraft {
+                parent: draft.parent,
+                from_step: draft.from_step,
+                title: draft.title,
+                notes: draft.notes,
+                add_to_focus: draft.add_to_focus,
+                focus_requested: false,
+            });
+        }
     }
 
     /// What the app asked for since last asked, if anything.
@@ -1021,7 +1090,7 @@ impl TodoApp {
     }
 
     /// Until the server first answers: rather than an empty board.
-    fn loading(&self, ui: &mut egui::Ui) {
+    fn loading(&mut self, ui: &mut egui::Ui) {
         CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() / 2.0 - 40.0).max(16.0));
@@ -1039,6 +1108,7 @@ impl TodoApp {
                 }
                 #[cfg(target_arch = "wasm32")]
                 if self.api.signed_out() && ui.button("Sign in again").clicked() {
+                    self.keep_unsent();
                     crate::client::sign_in_again();
                 }
             });
@@ -1839,6 +1909,7 @@ impl TodoApp {
                 let problem = if self.api.signed_out() {
                     #[cfg(target_arch = "wasm32")]
                     if ui.button("Sign in again").clicked() {
+                        self.keep_unsent();
                         crate::client::sign_in_again();
                     }
                     Some("Signed out. Your unsent changes are kept.".to_owned())
@@ -2099,6 +2170,11 @@ impl eframe::App for TodoApp {
         if !self.api.loaded() {
             self.loading(ui);
             return;
+        }
+        if !self.restored {
+            self.restore_unsent();
+        } else if self.kept.elapsed() >= Duration::from_secs(1) {
+            self.keep_unsent();
         }
         if !self.api.started() {
             self.landing(ui);

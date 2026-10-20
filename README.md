@@ -95,7 +95,9 @@ A page request without a valid token is sent to the sign-in page. An API request
 - With Clerk, the server serves the page to anyone, because the page itself handles sign-in. The page holds no data: everything comes through the API, which still needs a valid token.
 - `ITS4TASKS_CLERK_FRONTEND_API` overrides the Frontend API's address. It's meant for testing.
 
-This has been tested with a stand-in for Clerk's script that `its4tasks-dev-auth` serves, not yet with a real Clerk application.
+So far this is tested against a stand-in for Clerk's script that `its4tasks-dev-auth` serves, built to match what a real Clerk app sends. If the server refuses Clerk's tokens, its log says why (`refused a token: …`), and so does the "Signed out" page.
+
+If you're signed out while using the app, your unsent changes and drafts are kept in the browser and come back after you sign in again.
 
 ### Deploying on Railway with Clerk
 

@@ -78,6 +78,26 @@ impl Authority {
         let claims = json!({ "iss": self.url, "sub": sub, "iat": now, "exp": now + self.ttl });
         encode(&header, &claims, &self.key).expect("the dev key signs")
     }
+
+    /// A token shaped like a Clerk session token renewed in the page (v2
+    /// claims), for the mock Clerk. Its header has a number in it, as
+    /// Clerk's do, which `encode` can't write.
+    fn clerk_token(&self, sub: &str, origin: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let header = json!({
+            "alg": "RS256", "cat": "cl_dev", "kid": KEY_ID, "oiat": now, "typ": "JWT",
+        });
+        let claims = json!({
+            "azp": origin, "exp": now + self.ttl, "fva": [0, -1], "iat": now,
+            "iss": self.url, "nbf": now - 10, "sid": format!("sess_{sub}"), "sts": "active",
+            "sub": sub, "v": 2,
+        });
+        let part = |v: &serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        let message = format!("{}.{}", part(&header), part(&claims));
+        let signature = jsonwebtoken::crypto::sign(message.as_bytes(), &self.key, Algorithm::RS256)
+            .expect("the dev key signs");
+        format!("{message}.{signature}")
+    }
 }
 
 type Shared = Arc<Authority>;
@@ -202,7 +222,8 @@ async fn client_token(State(a): State<Shared>, headers: HeaderMap) -> Response {
     ];
     match cookie(&headers, CLIENT_COOKIE) {
         Some(sub) if sub.starts_with("user_") && !a.revoked.lock().unwrap().contains(&sub) => {
-            (cors, Json(json!({ "jwt": a.token(&sub) }))).into_response()
+            let jwt = a.clerk_token(&sub, &cors[0].1);
+            (cors, Json(json!({ "jwt": jwt }))).into_response()
         }
         _ => (cors, StatusCode::UNAUTHORIZED).into_response(),
     }
@@ -526,10 +547,14 @@ mod tests {
             "http://127.0.0.1:7979"
         );
         let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            subject_of(answer["jwt"].as_str().unwrap()).await,
-            "user_bob"
-        );
+        let jwt = answer["jwt"].as_str().unwrap();
+        // Like Clerk's: a number in the header, which the server must take.
+        let header = URL_SAFE_NO_PAD
+            .decode(jwt.split('.').next().unwrap())
+            .unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header).unwrap();
+        assert!(header["oiat"].is_number());
+        assert_eq!(subject_of(jwt).await, "user_bob");
         assert_eq!(send(&app, ask(None)).await.0, StatusCode::UNAUTHORIZED);
         // Cut off, then back.
         let post = |path: &str| Request::post(path).body(Body::empty()).unwrap();

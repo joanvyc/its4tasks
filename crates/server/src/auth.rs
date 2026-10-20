@@ -5,12 +5,20 @@
 //!
 //! The native app's local mode has no authority: its in-process server
 //! trusts one random secret instead, which stands for the local user.
+//!
+//! Tokens are read here rather than with `jsonwebtoken::decode`, which only
+//! takes extra header fields that are strings: Clerk's renewed tokens have
+//! numeric ones, and were all refused. jsonwebtoken still checks the
+//! signatures.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::{HeaderMap, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, get_current_timestamp};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -49,9 +57,30 @@ impl Auth {
                 let token = bearer(headers)
                     .or_else(|| cookie(headers, &jwt.config.cookie))
                     .ok_or_else(|| Unauthorized("not signed in".into()))?;
-                jwt.verify(token).await
+                let verified = jwt.verify(token).await;
+                if let Err(Unauthorized(why)) = &verified {
+                    log_refusal(why);
+                }
+                verified
             }
         }
+    }
+}
+
+/// Logs why a token was refused, at most every `LOG_EVERY` seconds: a
+/// refused token usually means a misconfigured authority, and clients
+/// retry often.
+fn log_refusal(why: &str) {
+    const LOG_EVERY: u64 = 10;
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let now = get_current_timestamp();
+    let last = LOGGED.load(Ordering::Relaxed);
+    if now >= last + LOG_EVERY
+        && LOGGED
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        eprintln!("its4tasks-server: refused a token: {why}");
     }
 }
 
@@ -202,7 +231,13 @@ impl Jwt {
 
     pub async fn verify(&self, token: &str) -> Result<Identity, Unauthorized> {
         let fail = |e: &dyn std::fmt::Display| Unauthorized(format!("invalid token: {e}"));
-        let header = decode_header(token).map_err(|e| fail(&e))?;
+        let mut parts = token.split('.');
+        let (Some(header), Some(payload), Some(signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(fail(&"not a JWT"));
+        };
+        let header: TokenHeader = json_part(header).map_err(|e| fail(&format!("header: {e}")))?;
         let kid = header.kid.ok_or_else(|| fail(&"no key id"))?;
         let jwk = self.key(&kid).await?;
         // The algorithm comes from the key, never from the token alone, and
@@ -230,17 +265,19 @@ impl Jwt {
             _ => return Err(fail(&"algorithm doesn't match the key")),
         };
         let key = DecodingKey::from_jwk(&jwk).map_err(|e| fail(&e))?;
-        let mut validation = Validation::new(algorithm);
-        validation.set_issuer(&[&self.config.issuer]);
-        validation.set_required_spec_claims(&["exp", "iss", "sub"]);
-        match &self.config.audience {
-            Some(aud) => validation.set_audience(&[aud]),
-            None => validation.validate_aud = false,
+        let signed = &token[..header_and_payload_len(token)];
+        let valid = jsonwebtoken::crypto::verify(signature, signed.as_bytes(), &key, algorithm)
+            .map_err(|e| fail(&e))?;
+        if !valid {
+            return Err(fail(&"bad signature"));
         }
-        let claims = decode::<Claims>(token, &key, &validation).map_err(|e| fail(&e))?;
+        let claims: Claims = json_part(payload).map_err(|e| fail(&format!("claims: {e}")))?;
+        claims
+            .check(&self.config, get_current_timestamp())
+            .map_err(|e| fail(&e))?;
         Ok(Identity {
-            iss: claims.claims.iss,
-            sub: claims.claims.sub,
+            iss: claims.iss,
+            sub: claims.sub,
         })
     }
 
@@ -289,10 +326,86 @@ async fn fetch_keys(url: String) -> Result<JwkSet, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// How far a token's times may be off: clocks differ, and tokens are used
+/// a moment after being checked.
+const LEEWAY: u64 = 60;
+
+/// The token's header: just what's needed. Other fields are ignored,
+/// whatever their type.
+#[derive(Deserialize)]
+struct TokenHeader {
+    alg: Algorithm,
+    kid: Option<String>,
+}
+
+/// The claims checked. Others are ignored, whatever their type.
 #[derive(Deserialize)]
 struct Claims {
     iss: String,
     sub: String,
+    exp: NumericDate,
+    nbf: Option<NumericDate>,
+    aud: Option<Audience>,
+}
+
+/// Seconds since the epoch, which may be given with a fraction.
+#[derive(Deserialize)]
+#[serde(from = "f64")]
+struct NumericDate(u64);
+
+impl From<f64> for NumericDate {
+    fn from(seconds: f64) -> Self {
+        // Negative and NaN become 0, too big becomes u64::MAX.
+        NumericDate(seconds as u64)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Claims {
+    /// Whether the claims are good at `now` for `config`.
+    fn check(&self, config: &JwtConfig, now: u64) -> Result<(), String> {
+        if self.exp.0.saturating_add(LEEWAY) < now {
+            return Err("token expired".into());
+        }
+        if self
+            .nbf
+            .as_ref()
+            .is_some_and(|nbf| nbf.0 > now.saturating_add(LEEWAY))
+        {
+            return Err("token not valid yet".into());
+        }
+        if self.iss != config.issuer {
+            return Err(format!("issued by {}, not {}", self.iss, config.issuer));
+        }
+        if let Some(expected) = &config.audience {
+            let ok = match &self.aud {
+                Some(Audience::One(aud)) => aud == expected,
+                Some(Audience::Many(auds)) => auds.contains(expected),
+                None => false,
+            };
+            if !ok {
+                return Err("for another audience".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A token's part (header or claims), base64url-decoded and parsed.
+fn json_part<T: for<'de> Deserialize<'de>>(part: &str) -> Result<T, String> {
+    let bytes = URL_SAFE_NO_PAD.decode(part).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+/// The length of `header.payload`, which the signature is over.
+fn header_and_payload_len(token: &str) -> usize {
+    token.rfind('.').unwrap_or(token.len())
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -330,7 +443,163 @@ fn percent_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use jsonwebtoken::EncodingKey;
+    use serde_json::{Value, json};
+
     use super::*;
+
+    const ISSUER: &str = "https://clerk.example.test";
+
+    fn jwt(audience: Option<&str>) -> Jwt {
+        let config = JwtConfig {
+            issuer: ISSUER.into(),
+            jwks_url: String::new(),
+            audience: audience.map(str::to_owned),
+            web: WebSignIn::Redirect(String::new()),
+            cookie: "__session".into(),
+            oauth: None,
+        };
+        let keys = serde_json::from_str(include_str!("../tests/fixtures/dev-jwks.json")).unwrap();
+        Jwt::with_keys(config, keys)
+    }
+
+    /// A token with exactly this header and these claims, signed with the
+    /// test key (or not, with `alg` none).
+    fn token(header: &Value, claims: &Value) -> String {
+        let part = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+        let message = format!("{}.{}", part(header), part(claims));
+        let key =
+            EncodingKey::from_rsa_pem(include_bytes!("../tests/fixtures/dev-key.pem")).unwrap();
+        let signature =
+            jsonwebtoken::crypto::sign(message.as_bytes(), &key, Algorithm::RS256).unwrap();
+        format!("{message}.{signature}")
+    }
+
+    /// The header and claims of a Clerk session token renewed in the page.
+    fn clerk_like(now: u64) -> (Value, Value) {
+        (
+            json!({ "alg": "RS256", "cat": "cl_dev", "kid": "its4tasks-dev", "oiat": now - 600, "typ": "JWT" }),
+            json!({
+                "azp": "https://its4tasks.example.test", "exp": now + 60, "fva": [7, -1],
+                "iat": now, "iss": ISSUER, "nbf": now - 10, "sid": "sess_1", "sts": "active",
+                "sub": "user_x", "v": 2,
+            }),
+        )
+    }
+
+    async fn verify(jwt: &Jwt, token: &str) -> Result<String, String> {
+        jwt.verify(token)
+            .await
+            .map(|i| i.sub)
+            .map_err(|Unauthorized(why)| why)
+    }
+
+    #[tokio::test]
+    async fn takes_headers_with_numbers() {
+        let now = get_current_timestamp();
+        let (header, claims) = clerk_like(now);
+        let token = token(&header, &claims);
+        // What jsonwebtoken itself makes of it, and why we read tokens here.
+        assert!(jsonwebtoken::decode_header(&token).is_err());
+        assert_eq!(verify(&jwt(None), &token).await.unwrap(), "user_x");
+    }
+
+    #[tokio::test]
+    async fn refuses_bad_tokens() {
+        let now = get_current_timestamp();
+        let jwt = jwt(None);
+        let refused = |header: Value, claims: Value| {
+            let jwt = &jwt;
+            async move { verify(jwt, &token(&header, &claims)).await.unwrap_err() }
+        };
+        let (header, claims) = clerk_like(now);
+        let with = |key: &str, value: Value| {
+            let mut claims = claims.clone();
+            claims[key] = value;
+            claims
+        };
+        assert!(
+            refused(header.clone(), with("exp", json!(now - LEEWAY - 5)))
+                .await
+                .contains("expired")
+        );
+        // Within the leeway, an expired token still does.
+        let late = token(&header, &with("exp", json!(now - LEEWAY + 5)));
+        assert!(verify(&jwt, &late).await.is_ok());
+        assert!(
+            refused(header.clone(), with("nbf", json!(now + LEEWAY + 5)))
+                .await
+                .contains("not valid yet")
+        );
+        assert!(
+            refused(header.clone(), with("iss", json!("https://evil.test")))
+                .await
+                .contains("issued by")
+        );
+        // Fractions are fine; a string isn't.
+        assert!(
+            verify(
+                &jwt,
+                &token(&header, &with("exp", json!(now as f64 + 30.5)))
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            refused(header.clone(), with("exp", json!("soon")))
+                .await
+                .contains("claims")
+        );
+        let mut no_sub = claims.clone();
+        no_sub.as_object_mut().unwrap().remove("sub");
+        assert!(refused(header.clone(), no_sub).await.contains("claims"));
+
+        // Signed claims can't be swapped.
+        let good = token(&header, &claims);
+        let other = token(&header, &with("sub", json!("user_y")));
+        let forged = format!(
+            "{}.{}",
+            &other[..header_and_payload_len(&other)],
+            good.rsplit('.').next().unwrap()
+        );
+        assert!(
+            verify(&jwt, &forged)
+                .await
+                .unwrap_err()
+                .contains("bad signature")
+        );
+        // The key decides the algorithm.
+        let mut hs = header.clone();
+        hs["alg"] = json!("HS256");
+        assert!(refused(hs, claims.clone()).await.contains("algorithm"));
+        let mut unknown = header.clone();
+        unknown["kid"] = json!("someone-else");
+        assert!(
+            refused(unknown, claims.clone())
+                .await
+                .contains("unknown key")
+        );
+        for garbage in ["", "a.b", "a.b.c.d", "!!.??.--"] {
+            assert!(verify(&jwt, garbage).await.is_err(), "{garbage:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_the_audience_if_asked() {
+        let now = get_current_timestamp();
+        let (header, mut claims) = clerk_like(now);
+        let jwt = jwt(Some("its4tasks"));
+        assert!(
+            verify(&jwt, &token(&header, &claims))
+                .await
+                .unwrap_err()
+                .contains("audience")
+        );
+        claims["aud"] = json!(["other", "its4tasks"]);
+        assert!(verify(&jwt, &token(&header, &claims)).await.is_ok());
+        claims["aud"] = json!("other");
+        assert!(verify(&jwt, &token(&header, &claims)).await.is_err());
+    }
 
     #[test]
     fn finds_the_token() {

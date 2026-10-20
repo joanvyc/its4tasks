@@ -109,6 +109,8 @@ def key(name, shift=False):
 
 
 SPECIAL = {" ": "space", ",": "comma", ".": "period", "'": "apostrophe", "-": "minus", "/": "slash"}
+# Typed with Shift held (on a US layout).
+SHIFTED = {":": "colon", "_": "underscore", "?": "question", "!": "exclam"}
 
 cmd, args = sys.argv[1], sys.argv[2:]
 if cmd == "id":
@@ -139,7 +141,10 @@ elif cmd == "drag":
     time.sleep(0.3)
 elif cmd == "type":
     for ch in args[0]:
-        key(SPECIAL.get(ch, ch.lower()), shift=ch.isupper())
+        if ch in SHIFTED:
+            key(SHIFTED[ch], shift=True)
+        else:
+            key(SPECIAL.get(ch, ch.lower()), shift=ch.isupper())
     time.sleep(0.2)
 elif cmd == "key":
     key(args[0], shift=len(args) > 1 and args[1] == "shift")

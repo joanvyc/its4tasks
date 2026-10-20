@@ -5,10 +5,10 @@ open blockers, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, next steps (open,
 done, and one on a blocked task, where red wins), a done task closed
 with a message, tasks of different freshness, and subtasks: a parent blocked
-by its subtasks (focused, with one of them) and one that isn't. Run
-its4tasks-server with XDG_DATA_HOME=DATA_HOME to load it: the server imports
-board.json into its SQLite database (board.sqlite) on launch, so seed a fresh
-DATA_HOME.
+by its subtasks (focused, with one of them) and one that isn't. Nothing
+loads it on its own: import it into a test user's board as AGENTS.md shows
+(examples/import_change.rs in its4tasks-core turns it into an Import change),
+or with "Import board.json…" in the app.
 """
 import datetime as dt
 import json

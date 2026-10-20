@@ -68,6 +68,18 @@ pub async fn serve(listener: TcpListener, api: Api, auth: Auth) -> std::io::Resu
     axum::serve(listener, router(api, auth)).await
 }
 
+/// Like `serve`, until `stop` finishes.
+pub async fn serve_until(
+    listener: TcpListener,
+    api: Api,
+    auth: Auth,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(listener, router(api, auth))
+        .with_graceful_shutdown(stop)
+        .await
+}
+
 /// The signed-in user, made now if they're new; or the answer to give
 /// instead.
 async fn user(state: &AppState, headers: &HeaderMap) -> Result<User, Box<Response>> {

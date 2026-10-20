@@ -1,8 +1,6 @@
-//! The its4tasks GUI. It shows the board kept by `its4tasks-server`:
-//! natively at `$ITS4TASKS_SERVER` (by default http://127.0.0.1:7878), and in
-//! the browser on the server that served the page.
-
-use its4tasks::app::TodoApp;
+//! The its4tasks GUI. It shows a board kept by `its4tasks-server`: natively,
+//! a server's or a local one (`native::shell` asks which), and in the
+//! browser, the board of the server that served the page.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
@@ -16,7 +14,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "its4tasks",
         options,
-        Box::new(|cc| Ok(Box::new(TodoApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(its4tasks::native::shell::Shell::new(cc)))),
     )
 }
 
@@ -35,7 +33,7 @@ fn main() {
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(|cc| Ok(Box::new(TodoApp::new(cc)))),
+                Box::new(|cc| Ok(Box::new(its4tasks::app::TodoApp::new(cc)))),
             )
             .await;
         if let Err(e) = started {

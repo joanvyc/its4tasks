@@ -14,6 +14,7 @@ base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 eframe = "0.37.0"
+rfd = "0.17.2"
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 ehttp = { version = "0.7.1", features = ["json"] }
 ureq = { version = "3.4.2", features = ["json"] }
@@ -29,5 +30,6 @@ tower = { version = "0.5.2", features = ["util"] }
 tokio = { version = "1.54.0", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 wasm-bindgen-futures = "0.4.79"
+webbrowser = "1.2.4"
 web-sys = "0.3.106"
 web-time = "1.1.0"

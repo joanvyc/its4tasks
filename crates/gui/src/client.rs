@@ -31,7 +31,7 @@ const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// How long a request may take before the server counts as unreachable.
 /// Native only: in the browser a request takes as long as it takes.
-const TIMEOUT: Duration = Duration::from_secs(5);
+pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientError {
@@ -39,6 +39,9 @@ pub enum ClientError {
     Api(ApiError),
     /// The server couldn't be reached or answered nonsense.
     Http(String),
+    /// The server wants someone signed in: the token is missing, expired
+    /// or not trusted.
+    Unauthorized,
 }
 
 impl fmt::Display for ClientError {
@@ -46,6 +49,7 @@ impl fmt::Display for ClientError {
         match self {
             ClientError::Api(e) => e.fmt(f),
             ClientError::Http(e) => f.write_str(e),
+            ClientError::Unauthorized => f.write_str("not signed in"),
         }
     }
 }
@@ -57,7 +61,7 @@ enum Request {
 
 enum Response {
     /// The server's answer to a change, or why there was none.
-    Sent(u64, Result<Answer, String>),
+    Sent(u64, Result<Answer, ClientError>),
     Fetched(Result<BoardView, ClientError>),
 }
 
@@ -87,8 +91,9 @@ pub struct Client {
     /// back in order.
     queue: VecDeque<Request>,
     in_flight: bool,
-    answer_to: Sender<Response>,
-    answers: Receiver<Response>,
+    /// Answers, each with the `token_gen` its request was sent with.
+    answer_to: Sender<(u64, Response)>,
+    answers: Receiver<(u64, Response)>,
     /// The last board the server sent.
     confirmed: Board,
     pending: VecDeque<Pending>,
@@ -97,6 +102,14 @@ pub struct Client {
     /// Whether the user has a board yet: new users choose to start one or
     /// import one.
     started: bool,
+    /// Whether the server has answered at all, so `board` and `started`
+    /// are its.
+    loaded: bool,
+    /// The server's last answer was that nobody's signed in.
+    unauthorized: bool,
+    /// Counts the tokens set, so that a refusal of an earlier one isn't
+    /// taken for a refusal of this one.
+    token_gen: u64,
     next_seq: u64,
     fetching: bool,
     fetched: Instant,
@@ -142,6 +155,9 @@ impl Client {
             pending: VecDeque::new(),
             board: Board::default(),
             started: true,
+            loaded: false,
+            unauthorized: false,
+            token_gen: 0,
             next_seq: 0,
             fetching: false,
             fetched: Instant::now(),
@@ -159,6 +175,26 @@ impl Client {
     /// False for a new user, until they start a board or import one.
     pub fn started(&self) -> bool {
         self.started
+    }
+
+    /// Whether the server has answered yet.
+    pub fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Whether the server's last answer was that nobody's signed in. Sign
+    /// in again (`set_token`, or in the browser, reload the page).
+    pub fn unauthorized(&self) -> bool {
+        self.unauthorized
+    }
+
+    /// Sends `token` as the bearer token from now on, say after it was
+    /// refreshed.
+    pub fn set_token(&mut self, token: Option<String>) {
+        self.token = token;
+        self.token_gen += 1;
+        // The server hasn't seen this one yet.
+        self.unauthorized = false;
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -248,9 +284,10 @@ impl Client {
         };
         self.in_flight = true;
         let (answer_to, wake) = (self.answer_to.clone(), self.wake.clone());
+        let token_gen = self.token_gen;
         let answer = move |response| {
             // The client may be gone, say while the GUI closes.
-            let _ = answer_to.send(response);
+            let _ = answer_to.send((token_gen, response));
             wake();
         };
         let (timeout, token) = (self.timeout, self.token.clone());
@@ -273,7 +310,7 @@ impl Client {
     /// Records one answer and sends the next request. Answers come in the
     /// order the requests were made, so an answer's board includes every
     /// change sent before it.
-    fn take(&mut self, response: Response) {
+    fn take(&mut self, (token_gen, response): (u64, Response)) {
         self.in_flight = false;
         match response {
             Response::Sent(seq, result) => {
@@ -281,12 +318,12 @@ impl Client {
                 match result {
                     Ok(Answer::Applied(applied)) => {
                         self.confirmed = applied.board;
-                        self.error = None;
+                        self.answered();
                     }
                     Ok(Answer::Refused(rejected)) => {
                         self.notice = Some(format!("Change refused: {}", rejected.error));
                         self.confirmed = rejected.board;
-                        self.error = None;
+                        self.answered();
                     }
                     Err(e) => {
                         // Whether the server saw these is unknown, and some
@@ -294,7 +331,7 @@ impl Client {
                         // so drop them. Answers to them still update
                         // `confirmed`, the server's word.
                         self.pending.clear();
-                        self.error = Some(e);
+                        self.failed(e, token_gen);
                     }
                 }
             }
@@ -304,13 +341,24 @@ impl Client {
                     Ok(view) => {
                         self.confirmed = view.board;
                         self.started = view.started || !self.pending.is_empty();
-                        self.error = None;
+                        self.answered();
                     }
-                    Err(e) => self.error = Some(e.to_string()),
+                    Err(e) => self.failed(e, token_gen),
                 }
             }
         }
         self.next_request();
+    }
+
+    fn answered(&mut self) {
+        self.loaded = true;
+        self.error = None;
+        self.unauthorized = false;
+    }
+
+    fn failed(&mut self, e: ClientError, token_gen: u64) {
+        self.unauthorized = e == ClientError::Unauthorized && token_gen == self.token_gen;
+        self.error = Some(e.to_string());
     }
 
     /// The server's board with the changes still on their way on top.
@@ -393,6 +441,8 @@ fn call(
         None => ehttp::Request::get(url),
         Some(change) => ehttp::Request::post_json(url, &change).expect("a Change serializes"),
     };
+    // ehttp leaves cookies out unless told, unlike the browser's fetch().
+    let request = request.with_credentials(ehttp::Credentials::SameOrigin);
     ehttp::fetch(request, move |response| {
         done(response.map(|r| Reply {
             status: r.status,
@@ -403,6 +453,9 @@ fn call(
 
 fn board_from(reply: Result<Reply, String>) -> Result<BoardView, ClientError> {
     let reply = reply.map_err(ClientError::Http)?;
+    if reply.status == 401 {
+        return Err(ClientError::Unauthorized);
+    }
     if !reply.ok() {
         return Err(ClientError::Http(format!(
             "server answered {}",
@@ -413,12 +466,15 @@ fn board_from(reply: Result<Reply, String>) -> Result<BoardView, ClientError> {
         .map_err(|e| ClientError::Http(format!("unreadable board: {e}")))
 }
 
-fn answer_from(reply: Result<Reply, String>) -> Result<Answer, String> {
-    let reply = reply?;
+fn answer_from(reply: Result<Reply, String>) -> Result<Answer, ClientError> {
+    let reply = reply.map_err(ClientError::Http)?;
+    if reply.status == 401 {
+        return Err(ClientError::Unauthorized);
+    }
     let answer = if reply.ok() {
         serde_json::from_slice(&reply.body).map(Answer::Applied)
     } else {
         serde_json::from_slice(&reply.body).map(Answer::Refused)
     };
-    answer.map_err(|e| format!("server answered {}: {e}", reply.status))
+    answer.map_err(|e| ClientError::Http(format!("server answered {}: {e}", reply.status)))
 }

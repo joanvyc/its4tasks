@@ -1,4 +1,4 @@
-use std::{iter, sync::Arc, time::Duration};
+use std::{iter, sync::Arc, sync::mpsc::Receiver, time::Duration};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Utc};
 use eframe::egui::{
@@ -9,13 +9,16 @@ use eframe::egui::{
     text::{CCursor, LayoutJob},
 };
 
-use crate::api::Change;
+use crate::api::{self, Change};
 use crate::client::Client;
+use crate::files::{self, Picked};
+use crate::import;
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
     SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
+use crate::welcome;
 use uuid::Uuid;
 
 const CARD_GAP: f32 = 12.0;
@@ -896,10 +899,25 @@ enum View {
     Log,
 }
 
+/// What the app asks of whatever runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// Go back to choosing where the board is.
+    SwitchBoard,
+}
+
 pub struct TodoApp {
     /// The board is only read through `api.board()` and changed through
     /// `api.apply`, which go to the server.
     api: Client,
+    /// Whether whatever runs the app can switch to another board, so the
+    /// menu offers it.
+    switchable: bool,
+    request: Option<Request>,
+    /// A `board.json` being picked for importing.
+    picking: Option<Receiver<Picked>>,
+    /// Why the last import failed.
+    import_error: Option<String>,
     filter: String,
     new_task: Option<NewTaskDraft>,
     /// The task waiting for the user to confirm its deletion.
@@ -920,15 +938,30 @@ pub struct TodoApp {
     hide_closed: bool,
 }
 
+/// Sets up fonts and theme. Once, before showing anything.
+pub fn setup(ctx: &egui::Context) {
+    install_fonts(ctx);
+    ctx.set_theme(Theme::Light);
+}
+
 impl TodoApp {
+    /// The app on the board `Client::connect` finds: in the browser, the
+    /// page's server's.
     pub fn new(cc: &eframe::CreationContext) -> Self {
-        install_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_theme(Theme::Light);
+        setup(&cc.egui_ctx);
+        let ctx = cc.egui_ctx.clone();
+        Self::with_client(Client::connect(move || ctx.request_repaint()), false)
+    }
+
+    /// The app on `api`'s board. `switchable` offers switching to another
+    /// board, see `take_request`.
+    pub fn with_client(api: Client, switchable: bool) -> Self {
         Self {
-            api: Client::connect({
-                let ctx = cc.egui_ctx.clone();
-                move || ctx.request_repaint()
-            }),
+            api,
+            switchable,
+            request: None,
+            picking: None,
+            import_error: None,
             filter: String::new(),
             new_task: None,
             confirm_delete: None,
@@ -942,6 +975,95 @@ impl TodoApp {
             log_starred_only: false,
             hide_closed: false,
         }
+    }
+
+    pub fn client(&self) -> &Client {
+        &self.api
+    }
+
+    pub fn client_mut(&mut self) -> &mut Client {
+        &mut self.api
+    }
+
+    /// What the app asked for since last asked, if anything.
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// Asks for a `board.json` to add to the board.
+    fn pick_import(&mut self, ctx: &egui::Context) {
+        if self.picking.is_none() {
+            let ctx = ctx.clone();
+            self.picking = Some(files::pick_board(move || ctx.request_repaint()));
+        }
+    }
+
+    /// Imports the `board.json` picked, once it is.
+    fn poll_import(&mut self) {
+        let Some(picking) = &self.picking else {
+            return;
+        };
+        let Ok(picked) = picking.try_recv() else {
+            return;
+        };
+        self.picking = None;
+        self.import_error = match picked {
+            None => None,
+            Some(Err(e)) => Some(format!("Couldn't import: {e}")),
+            Some(Ok(board)) => self
+                .api
+                .apply(Change::Import {
+                    board: import::fresh_ids(board),
+                })
+                .err()
+                .map(|e| format!("Couldn't import: {e}")),
+        };
+    }
+
+    /// For a new user: start a board, or bring one.
+    fn landing(&mut self, ui: &mut egui::Ui) {
+        CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() / 2.0 - 110.0).max(16.0));
+                ui.heading(RichText::new("Welcome to its4tasks").strong());
+                ui.add_space(8.0);
+                ui.label(
+                    "Your board is empty. Start with a short tour, or bring your tasks along.",
+                );
+                ui.add_space(20.0);
+                let size = Vec2::new(240.0, 34.0);
+                let start =
+                    ui.add(Button::new(RichText::new("Start a new board").strong()).min_size(size));
+                if start.clicked() {
+                    self.change(Change::Import {
+                        board: import::fresh_ids(welcome::board(api::now())),
+                    });
+                }
+                ui.add_space(8.0);
+                let import = ui
+                    .add_enabled(
+                        self.picking.is_none(),
+                        Button::new("Import a board.json…").min_size(size),
+                    )
+                    .on_hover_text("Add the tasks of a board.json saved by an older its4tasks");
+                if import.clicked() {
+                    self.pick_import(ui.ctx());
+                }
+                if self.switchable {
+                    ui.add_space(8.0);
+                    if ui
+                        .add(Button::new("Use another board…").frame(false))
+                        .clicked()
+                    {
+                        self.request = Some(Request::SwitchBoard);
+                    }
+                }
+                if let Some(problem) = self.import_error.as_deref().or(self.api.error()) {
+                    ui.add_space(16.0);
+                    ui.colored_label(palette(ui.visuals()).blocker, problem);
+                }
+            });
+        });
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
@@ -1008,6 +1130,7 @@ impl TodoApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.board_menu(ui);
                 let plus = ui
                     .add(Button::new(RichText::new(" + ").strong()))
                     .on_hover_text("New task");
@@ -1633,6 +1756,24 @@ impl TodoApp {
         }
     }
 
+    /// The "⋯" menu next to "+": importing, and switching boards.
+    fn board_menu(&mut self, ui: &mut egui::Ui) {
+        let button = Button::new(RichText::new(" ⋯ ").strong());
+        egui::containers::menu::MenuButton::from_button(button)
+            .ui(ui, |ui| {
+                let import =
+                    ui.add_enabled(self.picking.is_none(), Button::new("Import board.json…"));
+                if import.clicked() {
+                    self.pick_import(ui.ctx());
+                }
+                if self.switchable && ui.button("Switch board…").clicked() {
+                    self.request = Some(Request::SwitchBoard);
+                }
+            })
+            .0
+            .on_hover_text("More");
+    }
+
     fn view_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.view, View::Board, "Board");
@@ -1666,9 +1807,14 @@ impl TodoApp {
                 if theme != before {
                     ui.ctx().set_theme(theme);
                 }
-                let problem = match (self.api.error(), self.api.notice()) {
-                    (Some(e), _) => Some(format!("Can't reach the server: {e}")),
-                    (None, notice) => notice.map(str::to_owned),
+                let problem = if self.api.unauthorized() {
+                    Some("Signed out".to_owned())
+                } else {
+                    match (self.api.error(), &self.import_error, self.api.notice()) {
+                        (Some(e), _, _) => Some(format!("Can't reach the server: {e}")),
+                        (None, Some(e), _) => Some(e.clone()),
+                        (None, None, notice) => notice.map(str::to_owned),
+                    }
                 };
                 if let Some(problem) = problem {
                     let text = RichText::new(problem).color(palette(ui.visuals()).blocker);
@@ -1914,6 +2060,23 @@ impl eframe::App for TodoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.api.poll();
         self.api.refresh();
+        self.poll_import();
+        // In the browser, signing in again is the server's job: reloading
+        // the page sends the user to the authority. Only once the board
+        // has loaded, though: a page that's refused from the start would
+        // just be served again, and reload forever.
+        #[cfg(target_arch = "wasm32")]
+        if self.api.unauthorized()
+            && self.api.loaded()
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.location().reload();
+        }
+        if self.api.loaded() && !self.api.started() {
+            self.landing(ui);
+            self.apply(Vec::new());
+            return;
+        }
         let mut actions = Vec::new();
         Panel::right("task_list")
             .resizable(true)

@@ -9,7 +9,7 @@ use directories::ProjectDirs;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::model::Board;
+use its4tasks_core::model::Board;
 
 pub const FILE_NAME: &str = "board.json";
 

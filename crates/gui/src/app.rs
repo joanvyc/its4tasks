@@ -1937,6 +1937,7 @@ impl eframe::App for TodoApp {
     }
 
     /// Gives the last changes a moment to reach the server.
+    #[cfg(not(target_arch = "wasm32"))]
     fn on_exit(&mut self) {
         if !self.api.flush(Duration::from_secs(2)) {
             eprintln!("its4tasks: closing with changes the server hasn't confirmed");

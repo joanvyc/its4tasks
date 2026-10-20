@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use axum::extract::Request;
 use axum::middleware::{self, Next};
-use its4tasks::api::Api;
-use its4tasks::server;
+use its4tasks_server::api::Api;
+use its4tasks_server::server;
 use tokio::net::TcpListener;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7878";

@@ -1,21 +1,39 @@
 # Agent notes for its4tasks
 
-its4tasks is an egui/eframe desktop todo app: four focus cards plus a task list, with a daily/weekly log view. It runs as two binaries: `its4tasks-server` keeps the board and serves it over HTTP, and the `its4tasks` GUI is a client of it. The code is in `src/`:
-- `model.rs`: data and rules
-- `log.rs`: log grouping
-- `api.rs`: the only way to change the board. Clients read a `Board` and send serializable `Change`s, which `Api::apply` applies and saves. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4), and changes address comments by id, never by position
-- `server.rs` and `bin/its4tasks-server.rs`: `Api` over HTTP (`GET /board`, `POST /changes`). Listens on `$ITS4TASKS_ADDR`, by default `127.0.0.1:7878`
-- `client.rs`: the GUI's side. An edit shows at once: `apply` applies the change to a local copy with the server's rules (`api::apply_change`), and a worker thread sends it, so the UI never waits on the network. Server answers replace the copy's base, with unanswered changes replayed on top. A refused change, or one sent while the server is unreachable, is undone. Changes that create tasks or comments carry client-picked ids so both sides agree. Talks to `$ITS4TASKS_SERVER`, by default `http://127.0.0.1:7878`
-- `main.rs` and `app.rs`: the GUI
-- `storage/`: SQLite persistence through sea-orm (entities, migrations, and a diff so a save writes only what changed), plus a one-time import of the old `board.json`
+its4tasks is an egui/eframe todo app: four focus cards plus a task list, with a daily/weekly log view. Boards are personal: each user sees only their own, and nothing is shared. For now there is one board and no login; multi-user support (authentication plus a private board per user) is a planned step.
+
+It runs as a server, `its4tasks-server`, which keeps the board and serves both the API and the web GUI. The GUI runs in the browser (WASM) or natively, and is a client of the server. It's a Cargo workspace:
+- `crates/core` (`its4tasks-core`): what both sides share. Must keep building for `wasm32-unknown-unknown`.
+  - `model.rs`: data and rules.
+  - `log.rs`: log grouping.
+  - `api.rs`: the only way to change the board. Clients read a `Board` and send serializable `Change`s, and `apply_change` holds the rules for them. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4). Changes address comments by id, never by position, and changes that create things carry client-picked ids.
+- `crates/server` (`its4tasks-server`):
+  - `api.rs`: `Api`, the board plus saving after each change.
+  - `storage/`: SQLite through sea-orm (entities, migrations, and a diff so a save writes only what changed), plus a one-time import of the old `board.json`.
+  - `server.rs`: `GET /api/board`, `POST /api/changes`, and the web GUI at `/`.
+  - `main.rs`: listens on `$ITS4TASKS_ADDR`, by default `127.0.0.1:7878`.
+  - The web GUI is `crates/gui/dist`, embedded by rust-embed. Debug builds read it from disk, release builds bake it in (see `build.rs`).
+- `crates/gui` (`its4tasks`):
+  - `app.rs`: the UI.
+  - `main.rs`: the native window, or the browser canvas in `index.html`.
+  - `client.rs`: the GUI's side of the API. An edit shows at once: `apply` applies the change to a local copy with `apply_change`, and requests go out one at a time in the background (a thread per request natively, `fetch()` in the browser). Server answers replace the copy's base, with unanswered changes replayed on top. A refused change, or one sent while the server is unreachable, is undone. The native GUI talks to `$ITS4TASKS_SERVER` (by default `http://127.0.0.1:7878`), the web GUI to the server that served it.
 
 ## Checks
 
-Before finishing a change, run these. Both must pass with no warnings.
+Before finishing a change, run these. All must pass with no warnings.
 ```sh
-cargo fmt && cargo clippy --all-targets && cargo test
+cargo fmt --all && cargo clippy --workspace --all-targets \
+  && cargo clippy -p its4tasks --target wasm32-unknown-unknown && cargo test --workspace
 ```
 Keep logic in `model.rs`/`log.rs`, where it can be unit-tested, rather than in `app.rs`. `app.rs` never mutates the model: a new kind of edit gets a `Change` variant in `api.rs`.
+
+## Building the web GUI
+
+```sh
+(cd crates/gui && trunk build)            # writes crates/gui/dist; a debug server picks it up as is
+(cd crates/gui && trunk build --release)  # then: cargo build --release -p its4tasks-server
+```
+A release `its4tasks-server` binary contains the GUI and needs nothing else.
 
 ## Testing visual changes
 
@@ -38,7 +56,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    APP=$!
    sleep 2.5
    ```
-   `curl -s 127.0.0.1:7979/board` shows what the server holds. A change POSTed with curl, as another client would, shows up in the GUI within about 2 s. To check behaviour on a slow network, start the server with `ITS4TASKS_DELAY_MS=800`, which holds back every answer that long. Edits should still show at once.
+   `curl -s 127.0.0.1:7979/api/board` shows what the server holds. A change POSTed with curl, as another client would, shows up in the GUI within about 2 s. To check behaviour on a slow network, start the server with `ITS4TASKS_DELAY_MS=800`, which holds back every answer that long. Edits should still show at once.
 
 3. **Screenshot and look at the result:**
    ```sh
@@ -57,7 +75,17 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    ```
    The first pointer event after launch only tells egui where the pointer is. Move the pointer once before testing hover.
 
-5. **Rebuild before each look, and stop the app when done.** `cargo clippy` doesn't produce a new binary, so run `cargo build` before relaunching. When finished, run `kill $APP $SERVER`. Don't use `pkill`: the user may have their real instance open.
+   **The web GUI** is tested the same way, in a Firefox with its own throwaway profile, so the user's browser is never touched. Run `trunk build` first. Then point `xt.py` at the Firefox window with `XT_WINDOW`:
+   ```sh
+   FF=$(mktemp -d)
+   env -u WAYLAND_DISPLAY MOZ_ENABLE_WAYLAND=0 firefox --no-remote --profile "$FF" --kiosk http://127.0.0.1:7979/ &
+   BROWSER=$!
+   sleep 10
+   XT_WINDOW="its4tasks " python3 tools/xt.py shot web.png
+   ```
+   Kiosk mode fills the screen, so the browser canvas starts at (0, 0). Key presses go to the focused window, and a native GUI open on top of the browser takes the clicks meant for the browser where they overlap.
+
+5. **Rebuild before each look, and stop the app when done.** `cargo clippy` doesn't produce a new binary, so run `cargo build` before relaunching. When finished, run `kill $APP $SERVER` (and `$BROWSER`). Don't use `pkill`: the user may have their real instance open.
 
 Check for:
 - overlapping or clipped widgets

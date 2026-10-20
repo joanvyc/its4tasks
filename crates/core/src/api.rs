@@ -1,20 +1,19 @@
 //! The only way to change the board: a client reads a `Board` and sends
-//! `Change`s, which travel over HTTP as JSON (see `server`).
+//! `Change`s, which travel over HTTP as JSON (`GET /api/board`,
+//! `POST /api/changes`, answered with `Applied` or `Rejected`).
 //!
 //! `apply_change` holds the rules. The server applies a change with it, and
-//! the GUI applies the same change to its own copy straight away (see
-//! `client`). For both to agree, changes that create a task or comment carry
-//! the new ids, picked by the client.
+//! the GUI applies the same change to its own copy straight away. For both
+//! to agree, changes that create a task or comment carry the new ids, picked
+//! by the client.
 
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use sea_orm::DbErr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::{Board, MessageKind, MoveError, Task};
-use crate::storage::Store;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Change {
@@ -173,47 +172,19 @@ impl fmt::Display for ApiError {
     }
 }
 
-/// The board and its rules, kept by the server. Clients reach it over HTTP
-/// (see `server` and `client`).
-pub struct Api {
-    board: Board,
-    /// `None` for a board that isn't saved anywhere.
-    store: Option<Store>,
+/// What a change did, and the board after it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Applied {
+    pub outcome: Outcome,
+    pub board: Board,
 }
 
-impl Api {
-    /// The board saved in the data directory.
-    pub async fn open() -> Result<Api, DbErr> {
-        let store = Store::open().await?;
-        Ok(Api {
-            board: store.load(),
-            store: Some(store),
-        })
-    }
-
-    /// A board that isn't saved anywhere.
-    #[cfg(test)]
-    pub fn new(board: Board) -> Api {
-        Api { board, store: None }
-    }
-
-    pub fn board(&self) -> &Board {
-        &self.board
-    }
-
-    pub async fn apply(&mut self, change: Change) -> Result<Outcome, ApiError> {
-        self.apply_at(change, Utc::now()).await
-    }
-
-    async fn apply_at(&mut self, change: Change, now: DateTime<Utc>) -> Result<Outcome, ApiError> {
-        let outcome = apply_change(&mut self.board, change, now)?;
-        if let Some(store) = &mut self.store
-            && let Err(e) = store.save(&self.board).await
-        {
-            eprintln!("its4tasks: failed to save: {e}");
-        }
-        Ok(outcome)
-    }
+/// Why a change was turned down, and the board it was turned down by:
+/// often the client's copy was out of date.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Rejected {
+    pub error: ApiError,
+    pub board: Board,
 }
 
 /// Applies a change to a board as of `now`: the board's rules, shared by the
@@ -375,115 +346,10 @@ fn note(b: &mut Board, id: Uuid) -> Result<(&mut Task, usize), ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeDelta;
-
     use super::*;
 
-    async fn add(api: &mut Api, title: &str, focus: bool) -> Uuid {
-        let change = Change::add_task(title.into(), String::new(), None, focus);
-        match api.apply(change).await {
-            Ok(Outcome::Created(id)) => id,
-            other => panic!("expected a new task, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn add_task_can_focus_it() {
-        let mut api = Api::new(Board::default());
-        let a = add(&mut api, "a", true).await;
-        let b = add(&mut api, "b", false).await;
-        assert_eq!(api.board().slot_of(a), Some(0));
-        assert_eq!(api.board().slot_of(b), None);
-    }
-
-    #[tokio::test]
-    async fn rename_touches_the_task() {
-        let mut api = Api::new(Board::default());
-        let id = add(&mut api, "a", false).await;
-        let later = Utc::now() + TimeDelta::hours(1);
-        let rename = Change::Rename {
-            task: id,
-            title: "b".into(),
-        };
-        assert_eq!(api.apply_at(rename, later).await, Ok(Outcome::Done));
-        let t = api.board().task(id).unwrap();
-        assert_eq!((t.title.as_str(), t.updated_at), ("b", later));
-    }
-
-    #[tokio::test]
-    async fn reports_why_a_change_failed() {
-        let mut api = Api::new(Board::default());
-        let a = add(&mut api, "a", false).await;
-        let b = add(&mut api, "b", false).await;
-        let post = Change::post(a, "hi".into(), MessageKind::Comment);
-        api.apply(post).await.unwrap();
-        api.apply(Change::SetDone {
-            task: b,
-            done: true,
-        })
-        .await
-        .unwrap();
-        let moved = Change::MoveNote {
-            note: api.board().task(a).unwrap().notes[0].id,
-            to: b,
-        };
-        assert_eq!(
-            api.apply(moved).await,
-            Err(ApiError::Move(MoveError::TargetClosed))
-        );
-        assert_eq!(
-            api.apply(Change::ToggleFold {
-                task: Uuid::from_u128(99)
-            })
-            .await,
-            Err(ApiError::UnknownTask(Uuid::from_u128(99)))
-        );
-        let gone = Uuid::new_v4();
-        assert_eq!(
-            api.apply(Change::ToggleStar { note: gone }).await,
-            Err(ApiError::UnknownNote(gone))
-        );
-    }
-
-    #[tokio::test]
-    async fn comments_keep_their_id_when_others_go() {
-        let mut api = Api::new(Board::default());
-        let a = add(&mut api, "a", false).await;
-        for text in ["first", "second"] {
-            let post = Change::post(a, text.into(), MessageKind::Comment);
-            api.apply(post).await.unwrap();
-        }
-        let ids: Vec<Uuid> = api
-            .board()
-            .task(a)
-            .unwrap()
-            .notes
-            .iter()
-            .map(|n| n.id)
-            .collect();
-        // With indices, the edit would have landed on "first"'s old slot.
-        api.apply(Change::DeleteNote { note: ids[0] })
-            .await
-            .unwrap();
-        let edit = Change::EditNote {
-            note: ids[1],
-            text: "second, edited".into(),
-        };
-        api.apply(edit).await.unwrap();
-        let notes = &api.board().task(a).unwrap().notes;
-        assert_eq!(notes.len(), 1);
-        assert_eq!(
-            (notes[0].id, notes[0].text.as_str()),
-            (ids[1], "second, edited")
-        );
-        assert_eq!(
-            api.apply(Change::ToggleStar { note: ids[0] }).await,
-            Err(ApiError::UnknownNote(ids[0]))
-        );
-    }
-
-    #[tokio::test]
-    async fn changes_round_trip_through_json() {
+    #[test]
+    fn changes_round_trip_through_json() {
         let change = Change::post(
             Uuid::from_u128(3),
             "/block waiting".into(),
@@ -491,29 +357,6 @@ mod tests {
         );
         let json = serde_json::to_string(&change).unwrap();
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
-    }
-
-    #[tokio::test]
-    async fn taken_ids_are_refused() {
-        let mut api = Api::new(Board::default());
-        let a = add(&mut api, "a", false).await;
-        let again = Change::AddTask {
-            id: a,
-            note_id: Uuid::new_v4(),
-            title: "b".into(),
-            notes: String::new(),
-            parent: None,
-            focus: false,
-        };
-        assert_eq!(api.apply(again).await, Err(ApiError::Duplicate(a)));
-        let post = Change::post(a, "hi".into(), MessageKind::Comment);
-        api.apply(post.clone()).await.unwrap();
-        // The same post sent twice, say after a lost answer.
-        let Change::Post { id, .. } = post else {
-            unreachable!()
-        };
-        assert_eq!(api.apply(post).await, Err(ApiError::Duplicate(id)));
-        assert_eq!(api.board().task(a).unwrap().notes.len(), 1);
     }
 
     #[test]

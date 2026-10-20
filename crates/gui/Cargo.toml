@@ -1,0 +1,26 @@
+[package]
+name = "its4tasks"
+description = "The its4tasks GUI, natively or in the browser, talking to its4tasks-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+its4tasks-core.workspace = true
+chrono.workspace = true
+eframe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+web-time.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ehttp.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = ["console", "Document", "HtmlCanvasElement", "Window"] }
+
+[dev-dependencies]
+its4tasks-server.workspace = true
+tokio.workspace = true

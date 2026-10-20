@@ -1,0 +1,22 @@
+[package]
+name = "its4tasks-server"
+description = "Keeps the board in SQLite and serves it, and the web GUI, over HTTP"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+its4tasks-core.workspace = true
+axum.workspace = true
+chrono.workspace = true
+directories.workspace = true
+rust-embed.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

@@ -22,9 +22,9 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 use uuid::Uuid;
 
-use crate::model::{Board, Note, SLOT_COUNT};
 use diff::{Changes, diff};
 use entity::{note, slot, task};
+use its4tasks_core::model::{Board, Note, SLOT_COUNT};
 use migration::Migrator;
 
 const DB_FILE: &str = "board.sqlite";
@@ -208,7 +208,7 @@ mod tests {
     use chrono::{TimeDelta, Utc};
 
     use super::*;
-    use crate::model::{Blocker, NextStep, NoteAction};
+    use its4tasks_core::model::{Blocker, NextStep, NoteAction};
 
     /// A board using every kind of note state, subtasks and slots.
     fn sample() -> Board {

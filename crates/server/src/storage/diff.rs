@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::model::{Board, Note, SLOT_COUNT, Task};
+use its4tasks_core::model::{Board, Note, SLOT_COUNT, Task};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Changes<'a> {
@@ -133,7 +133,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::model::MessageKind;
+    use its4tasks_core::model::MessageKind;
 
     fn ids(changes: &Changes) -> Vec<Uuid> {
         changes.upserts.iter().map(|t| t.id).collect()

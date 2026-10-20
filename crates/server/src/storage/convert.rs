@@ -4,7 +4,7 @@ use sea_orm::{DbErr, IntoActiveModel};
 use uuid::Uuid;
 
 use super::entity::{note, task};
-use crate::model::{Blocker, NextStep, Note, NoteAction, Task};
+use its4tasks_core::model::{Blocker, NextStep, Note, NoteAction, Task};
 
 pub fn task_row(t: &Task) -> task::ActiveModel {
     task::Model {

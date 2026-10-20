@@ -48,6 +48,15 @@ cargo build --release -p its4tasks-server --no-default-features --features postg
 
 Both features can be on at once. The result is `target/release/its4tasks-server`, a single binary that needs nothing else.
 
+Or build a container image with the `Dockerfile`. It builds both the web app and the server, for Postgres by default:
+
+```sh
+docker build -t its4tasks .                             # Postgres
+docker build --build-arg FEATURES=sqlite -t its4tasks . # SQLite
+```
+
+The container listens on `$PORT` (8080 if unset) unless `ITS4TASKS_ADDR` says otherwise.
+
 ### Configure
 
 Everything is set through environment variables.
@@ -87,6 +96,16 @@ A page request without a valid token is sent to the sign-in page. An API request
 - `ITS4TASKS_CLERK_FRONTEND_API` overrides the Frontend API's address. It's meant for testing.
 
 This has been tested with a stand-in for Clerk's script that `its4tasks-dev-auth` serves, not yet with a real Clerk application.
+
+### Deploying on Railway with Clerk
+
+1. Create a project with a Postgres database and a service from this repository. Railway finds the `Dockerfile` and builds it.
+2. Set the service's variables:
+   - `ITS4TASKS_CLERK_PUBLISHABLE_KEY`: your Clerk publishable key.
+   - `DATABASE_URL`: `${{Postgres.DATABASE_URL}}`, a reference to the database's connection string.
+3. Generate a domain for the service, or add your own. A `pk_live_` key needs a domain under the one your Clerk production app is set up for. A `pk_test_` key works on the `*.up.railway.app` address.
+
+Railway sets `PORT` and the container listens on it. For SQLite instead of Postgres, build with `FEATURES=sqlite` (a build argument, set as a variable of the same name). Then mount a volume, say at `/data`, and set `DATABASE_URL=sqlite:///data/boards.sqlite?mode=rwc`. Railway mounts volumes owned by root and the container runs as a regular user, so also set `RAILWAY_RUN_UID=0`.
 
 ### Connect the desktop app
 

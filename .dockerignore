@@ -1,0 +1,4 @@
+# Built inside the image; keep the build context small.
+target
+crates/gui/dist
+.git

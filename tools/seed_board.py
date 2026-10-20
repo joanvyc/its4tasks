@@ -25,6 +25,7 @@ def note(text, at, blocked_at=None, resolved=None, starred=False, action=None, s
     d = {"at": at, "text": text}
     if step:
         d["next_step"] = {"Done": {"since": step, "at": step_done}} if step_done else {"Open": {"since": step}}
+        starred = True  # The app stars next steps, like blockers.
     if action:
         d["action"] = action
     if blocked_at:

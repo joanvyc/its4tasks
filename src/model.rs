@@ -151,6 +151,12 @@ impl Note {
         }
     }
 
+    /// Next steps are starred, like blockers, so they show up in the starred log.
+    fn make_step(&mut self, now: DateTime<Utc>) {
+        self.next_step = Some(NextStep::Open { since: now });
+        self.starred = true;
+    }
+
     /// Blocking comments are starred so they show up in the starred log.
     fn block(&mut self, now: DateTime<Utc>) {
         self.blocker = Some(Blocker::Open);
@@ -214,7 +220,7 @@ impl Task {
 
     /// Post a comment from the comment box. Blank text is ignored.
     /// - `Star` posts it starred.
-    /// - `Next` posts it as an open next step.
+    /// - `Next` posts it as an open next step (starred).
     /// - `Block` posts it as an open blocker (a plain comment if something is
     ///   already blocking; see `can_block`).
     /// - `Unblock` resolves the open blocker, with this as the message
@@ -229,7 +235,7 @@ impl Task {
         match kind {
             MessageKind::Comment => {}
             MessageKind::Star => note.starred = true,
-            MessageKind::Next => note.next_step = Some(NextStep::Open { since: now }),
+            MessageKind::Next => note.make_step(now),
             MessageKind::Block if self.can_block() => note.block(now),
             MessageKind::Block => {}
             MessageKind::Unblock => {
@@ -315,12 +321,12 @@ impl Task {
         }
     }
 
-    /// Turn a plain comment into an open next step.
+    /// Turn a plain comment into an open next step (starred).
     pub fn mark_next_step(&mut self, idx: usize, now: DateTime<Utc>) {
         if let Some(note) = self.notes.get_mut(idx)
             && note.is_plain()
         {
-            note.next_step = Some(NextStep::Open { since: now });
+            note.make_step(now);
             self.touch(now);
         }
     }
@@ -1198,8 +1204,8 @@ mod tests {
         t.post("write it up", MessageKind::Next, t0 + h(1));
         assert_eq!(t.state(), TaskState::Ready);
         assert_eq!(t.notes[0].next_step, Some(NextStep::Open { since: t0 }));
-        // Not auto-starred, unlike blockers.
-        assert!(!t.notes[0].starred);
+        // Starred, like blockers.
+        assert!(t.notes[0].starred);
         assert_eq!(t.open_steps().count(), 2);
 
         t.toggle_step(0, t0 + h(2));
@@ -1312,7 +1318,6 @@ mod tests {
             t0,
         );
         t.mark_next_step(0, t0 + h(1));
-        t.toggle_star(0);
         t.post("call Bob", MessageKind::Next, t0 + h(2));
 
         let id = b

@@ -32,6 +32,7 @@ pub enum NoteAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Comment,
+    Star,
     Block,
     Unblock,
     Close,
@@ -41,6 +42,7 @@ impl MessageKind {
     pub fn label(self) -> &'static str {
         match self {
             MessageKind::Comment => "Comment",
+            MessageKind::Star => "Star",
             MessageKind::Block => "Block",
             MessageKind::Unblock => "Unblock",
             MessageKind::Close => "Close",
@@ -161,6 +163,7 @@ impl Task {
     }
 
     /// Post a comment from the comment box. Blank text is ignored.
+    /// - `Star` posts it starred.
     /// - `Block` posts it as an open blocker (a plain comment if something is
     ///   already blocking; see `can_block`).
     /// - `Unblock` resolves the open blocker, with this as the message
@@ -174,6 +177,7 @@ impl Task {
         let mut note = Note::new(text.to_owned(), now);
         match kind {
             MessageKind::Comment => {}
+            MessageKind::Star => note.starred = true,
             MessageKind::Block if self.can_block() => note.block(now),
             MessageKind::Block => {}
             MessageKind::Unblock => {
@@ -210,7 +214,7 @@ impl Task {
 
     /// What the comment box offers for this task, the default first.
     pub fn message_kinds(&self) -> Vec<MessageKind> {
-        let mut kinds = vec![MessageKind::Comment];
+        let mut kinds = vec![MessageKind::Comment, MessageKind::Star];
         kinds.push(if self.can_block() {
             MessageKind::Block
         } else {
@@ -335,14 +339,16 @@ pub enum Command {
     Block,
     Unblock,
     Close,
+    Star,
     Subtask,
 }
 
 /// Names a command can be typed as.
-const COMMANDS: [(&str, Command); 5] = [
+const COMMANDS: [(&str, Command); 6] = [
     ("block", Command::Block),
     ("unblock", Command::Unblock),
     ("close", Command::Close),
+    ("star", Command::Star),
     ("sub-task", Command::Subtask),
     ("subtask", Command::Subtask),
 ];
@@ -354,6 +360,7 @@ impl Command {
             Command::Block => Some(MessageKind::Block),
             Command::Unblock => Some(MessageKind::Unblock),
             Command::Close => Some(MessageKind::Close),
+            Command::Star => Some(MessageKind::Star),
             Command::Subtask => None,
         }
     }
@@ -373,7 +380,7 @@ impl fmt::Display for CommandError {
         match self {
             CommandError::Unknown(name) => write!(
                 f,
-                "Unknown command {name}. Try /block, /unblock, /close or /sub-task"
+                "Unknown command {name}. Try /block, /unblock, /close, /star or /sub-task"
             ),
             CommandError::NothingToUnblock => write!(f, "Nothing to unblock: no open blocker"),
             CommandError::AlreadyBlocked => {
@@ -964,7 +971,12 @@ mod tests {
         let t = b.task_mut(0).unwrap();
         assert_eq!(
             t.message_kinds(),
-            [MessageKind::Comment, MessageKind::Block, MessageKind::Close]
+            [
+                MessageKind::Comment,
+                MessageKind::Star,
+                MessageKind::Block,
+                MessageKind::Close
+            ]
         );
         t.post("need access", MessageKind::Block, t0);
         // Already blocked: posted as a plain comment.
@@ -974,6 +986,7 @@ mod tests {
             t.message_kinds(),
             [
                 MessageKind::Comment,
+                MessageKind::Star,
                 MessageKind::Unblock,
                 MessageKind::Close
             ]
@@ -1029,6 +1042,19 @@ mod tests {
     }
 
     #[test]
+    fn star_posts_a_starred_comment() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.post("nice idea", MessageKind::Star, now);
+        let note = &t.notes[0];
+        assert!(note.starred);
+        assert_eq!(note.blocker, None);
+        assert_eq!(note.action, None);
+        assert_eq!(t.state(), TaskState::Active);
+    }
+
+    #[test]
     fn close_marks_done_with_a_message() {
         let mut b = board_with(1);
         let now = Utc::now();
@@ -1041,7 +1067,7 @@ mod tests {
         assert_eq!(t.notes[0].action, Some(NoteAction::Closed));
         assert_eq!(
             t.message_kinds(),
-            [MessageKind::Comment, MessageKind::Block]
+            [MessageKind::Comment, MessageKind::Star, MessageKind::Block]
         );
 
         let json = serde_json::to_string(&b).unwrap();
@@ -1264,6 +1290,16 @@ mod tests {
             Ok(Submit::NewSubtask("Write tests"))
         );
         assert_eq!(t.parse_input("/subtask").result, Ok(Submit::NewSubtask("")));
+        assert_eq!(
+            t.parse_input("/star").result,
+            Ok(Submit::SetKind(MessageKind::Star))
+        );
+        let p = t.parse_input("/star nice idea");
+        assert_eq!(
+            p.result,
+            Ok(Submit::Post(Some(MessageKind::Star), "nice idea"))
+        );
+        assert_eq!(p.preview(), Some(Command::Star));
 
         t.post("x", MessageKind::Block, Utc::now());
         assert_eq!(
@@ -1309,7 +1345,7 @@ mod tests {
         assert_eq!(p.token_len, Some(7));
         assert_eq!(
             p.result.unwrap_err().to_string(),
-            "Unknown command /blockx. Try /block, /unblock, /close or /sub-task"
+            "Unknown command /blockx. Try /block, /unblock, /close, /star or /sub-task"
         );
         assert!(t.parse_input("/").partial);
     }

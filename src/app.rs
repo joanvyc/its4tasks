@@ -276,6 +276,7 @@ fn state_text_color(state: TaskState, visuals: &Visuals) -> Color32 {
 fn kind_color(kind: MessageKind, visuals: &Visuals) -> Color32 {
     match kind {
         MessageKind::Comment => visuals.weak_text_color(),
+        MessageKind::Star => palette(visuals).star,
         MessageKind::Block => palette(visuals).blocker,
         MessageKind::Unblock | MessageKind::Close => palette(visuals).resolved,
     }
@@ -284,6 +285,7 @@ fn kind_color(kind: MessageKind, visuals: &Visuals) -> Color32 {
 fn kind_hint(kind: MessageKind) -> &'static str {
     match kind {
         MessageKind::Comment => "Post a plain comment",
+        MessageKind::Star => "Post a starred comment: it shows in the starred log",
         MessageKind::Block => "Post as blocking: the task stays blocked until resolved",
         MessageKind::Unblock => "Resolve the blocker, with this as the message",
         MessageKind::Close => "Mark the task done, with this as the message",
@@ -1116,6 +1118,7 @@ impl TodoApp {
                     );
                     let hint = match *kind {
                         MessageKind::Comment => "Add a comment… (Enter to post, / for commands)",
+                        MessageKind::Star => "Something worth remembering… (Enter to post)",
                         MessageKind::Block => "Describe what you're waiting for… (Enter to post)",
                         MessageKind::Unblock => "What unblocked it?… (Enter to post)",
                         MessageKind::Close => "Closing note… (Enter to post)",

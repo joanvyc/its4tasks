@@ -1,17 +1,18 @@
 use std::{iter, sync::Arc, time::Duration};
 
-use chrono::{DateTime, Datelike, Local, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Utc};
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, ComboBox, FontData, FontDefinitions, FontFamily,
-    FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Popup, Rect, RichText,
-    ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, TextFormat, TextStyle, Theme,
-    UiBuilder, Vec2, Visuals, text::LayoutJob,
+    self, Align, Button, CentralPanel, Color32, ComboBox, DragAndDrop, FontData, FontDefinitions,
+    FontFamily, FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Popup,
+    Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit, TextFormat,
+    TextStyle, Theme, UiBuilder, Vec2, Visuals,
+    text::{CCursor, LayoutJob},
 };
 
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
-    Blocker, Board, MessageKind, Note, NoteAction, SLOT_COUNT, Task, TaskState, headline,
-    short_duration, shown_in_list, split_title, staleness,
+    Blocker, Board, Command, CommandError, MessageKind, Note, NoteAction, SLOT_COUNT, Submit, Task,
+    TaskState, headline, short_duration, split_title, staleness,
 };
 use crate::storage;
 
@@ -23,12 +24,14 @@ const COMMENT_RADIUS: f32 = 4.0;
 const ROW_RADIUS: f32 = 4.0;
 const ROW_GLOW_WIDTH: f32 = 6.0;
 /// Fixed so the comment box doesn't shift when the message kind changes.
-const KIND_PICKER_WIDTH: f32 = 96.0;
+const KIND_PICKER_WIDTH: f32 = 104.0;
 /// Longest quote of a resolved blocker shown in its Unblock message.
 const QUOTE_CHARS: usize = 60;
 const COMMENT_GLOW_WIDTH: f32 = 8.0;
 const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
 const LOG_TIME_WIDTH: f32 = 64.0;
+/// How far each level of subtasks is indented in the task list.
+const SUBTASK_INDENT: f32 = 16.0;
 
 /// Accent colours for each theme. The light ones are darker so they read on white.
 #[derive(Clone, Copy)]
@@ -38,6 +41,8 @@ struct Palette {
     blocker: Color32,
     star: Color32,
     resolved: Color32,
+    /// A valid `/command` in the comment box.
+    command: Color32,
 }
 
 const DARK: Palette = Palette {
@@ -46,6 +51,7 @@ const DARK: Palette = Palette {
     blocker: Color32::from_rgb(215, 85, 75),
     star: Color32::from_rgb(235, 195, 40),
     resolved: Color32::from_rgb(110, 180, 110),
+    command: Color32::from_rgb(110, 165, 245),
 };
 
 const LIGHT: Palette = Palette {
@@ -54,6 +60,7 @@ const LIGHT: Palette = Palette {
     blocker: Color32::from_rgb(200, 55, 45),
     star: Color32::from_rgb(215, 160, 0),
     resolved: Color32::from_rgb(40, 135, 60),
+    command: Color32::from_rgb(30, 100, 210),
 };
 
 fn palette(visuals: &Visuals) -> Palette {
@@ -124,10 +131,29 @@ fn comment_input_bg(visuals: &Visuals) -> Color32 {
     }
 }
 
+/// The task's menu entries, shared by the "⋯" button and the list's right-click menu.
+fn task_menu_items(ui: &mut egui::Ui, task_id: u64, is_subtask: bool, actions: &mut Vec<Action>) {
+    if ui.button("Add subtask…").clicked() {
+        actions.push(Action::AddSubtask(task_id, String::new()));
+    }
+    if is_subtask && ui.button("Make root task").clicked() {
+        actions.push(Action::SetParent(task_id, None));
+    }
+    if ui.button("Delete…").clicked() {
+        actions.push(Action::Delete(task_id));
+    }
+}
+
 /// A "⋯" button opening the task's menu. Shown when `visible` or while the
 /// menu is open; otherwise its space is kept empty so nothing shifts. The dots
 /// are painted so they sit on the row's center line, like the focus dot.
-fn task_menu(ui: &mut egui::Ui, task_id: u64, visible: bool, actions: &mut Vec<Action>) {
+fn task_menu(
+    ui: &mut egui::Ui,
+    task_id: u64,
+    is_subtask: bool,
+    visible: bool,
+    actions: &mut Vec<Action>,
+) {
     let id = ui.make_persistent_id(("task_menu", task_id));
     let open = Popup::is_id_open(ui.ctx(), id.with("popup"));
     let (rect, _) = ui.allocate_exact_size(Vec2::new(20.0, 16.0), Sense::hover());
@@ -151,24 +177,46 @@ fn task_menu(ui: &mut egui::Ui, task_id: u64, visible: bool, actions: &mut Vec<A
         ui.painter().circle_filled(center, 1.5, color);
     }
     let response = response.on_hover_text("More");
-    Popup::menu(&response).show(|ui| {
-        if ui.button("Delete…").clicked() {
-            actions.push(Action::Delete(task_id));
-        }
-    });
+    Popup::menu(&response).show(|ui| task_menu_items(ui, task_id, is_subtask, actions));
 }
 
 /// What the delete confirmation says will go.
-fn delete_prompt(task: &Task) -> String {
-    let what = match task.notes.len() {
-        0 => String::new(),
-        1 => " and its comment".to_owned(),
-        n => format!(" and its {n} comments"),
+fn delete_prompt(task: &Task, subtasks: usize) -> String {
+    let plural = |n: usize, what: &str| match n {
+        1 => format!("its {what}"),
+        n => format!("its {n} {what}s"),
+    };
+    let what: Vec<String> = [(task.notes.len(), "comment"), (subtasks, "subtask")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| plural(n, what))
+        .collect();
+    let what = match what.as_slice() {
+        [] => String::new(),
+        what => format!(" and {}", what.join(" and ")),
     };
     format!(
         "\"{}\"{what} will be deleted. This can't be undone.",
         task.title
     )
+}
+
+/// Why a blocked task is blocked and for how long, for hover texts.
+fn blocked_text(board: &Board, task: &Task, now: DateTime<Utc>) -> Option<String> {
+    let blocked_for = board.blocked_for(task.id, now)?;
+    let mut reasons: Vec<String> = task
+        .open_blocker()
+        .map(|n| n.text.clone())
+        .into_iter()
+        .collect();
+    if board.blocked_by_subtasks(task.id) {
+        reasons.push("all subtasks are blocked".to_owned());
+    }
+    Some(format!(
+        "Blocked for {}: {}",
+        short_duration(blocked_for),
+        reasons.join("\nand ")
+    ))
 }
 
 /// An on/off switch whose track turns `on_color` when on.
@@ -305,7 +353,7 @@ fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
 
 /// One entry of a card's comment log: timestamp/blocker line, then the text,
 /// or a text box while `edit` is being written. `hovered` reveals the star,
-/// edit and "mark as blocking" buttons.
+/// edit and "mark as blocking" buttons; the last only when `can_block`.
 #[allow(clippy::too_many_arguments)]
 fn comment(
     ui: &mut egui::Ui,
@@ -313,6 +361,7 @@ fn comment(
     idx: usize,
     task_id: u64,
     hovered: bool,
+    can_block: bool,
     edit: Option<&mut NoteEdit>,
     now: DateTime<Utc>,
     actions: &mut Vec<Action>,
@@ -388,7 +437,10 @@ fn comment(
                 Some(Blocker::Resolved { .. }) => {}
                 None => {
                     let block = ui
-                        .add_visible(hovered, Button::new("⛔ Mark blocking").small())
+                        .add_visible(
+                            hovered && can_block,
+                            Button::new("⛔ Mark blocking").small(),
+                        )
                         .on_hover_text("Turn this comment into a blocker");
                     if block.clicked() {
                         actions.push(Action::MarkBlocking(task_id, idx));
@@ -501,8 +553,52 @@ fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
     job
 }
 
+/// A task's title and entries in the log, with its subtasks as indented
+/// subsections below.
+fn log_group(
+    ui: &mut egui::Ui,
+    group: &log::TaskGroup,
+    page: NaiveDate,
+    is_subtask: bool,
+    time_format: &str,
+) {
+    ui.indent(("log_task", page, group.task_id), |ui| {
+        let title = RichText::new(&group.title).strong().family(bold());
+        if is_subtask {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(RichText::new("↳").weak());
+                ui.label(title);
+            });
+        } else {
+            ui.label(title);
+        }
+        ui.add_space(2.0);
+        for entry in &group.entries {
+            ui.horizontal_top(|ui| {
+                let time = entry.at.with_timezone(&Local).format(time_format);
+                let (rect, _) = ui.allocate_exact_size(
+                    Vec2::new(LOG_TIME_WIDTH, ui.text_style_height(&TextStyle::Body)),
+                    Sense::hover(),
+                );
+                ui.put(
+                    rect,
+                    Label::new(RichText::new(time.to_string()).small().weak()),
+                );
+                ui.add(Label::new(log_entry_job(entry, ui)).wrap());
+            });
+        }
+        for sub in &group.subgroups {
+            ui.add_space(4.0);
+            log_group(ui, sub, page, true, time_format);
+        }
+    });
+}
+
 #[derive(Default)]
 struct NewTaskDraft {
+    /// Creating a subtask of this task.
+    parent: Option<u64>,
     title: String,
     notes: String,
     add_to_focus: bool,
@@ -525,6 +621,9 @@ enum Action {
     Unfocus(usize),
     /// Ask for confirmation, then delete.
     Delete(u64),
+    /// Open the new task dialog for a subtask of this task, with this title.
+    AddSubtask(u64, String),
+    SetParent(u64, Option<u64>),
     DeleteNote(u64, usize),
     MarkBlocking(u64, usize),
     Resolve(u64, usize),
@@ -551,6 +650,9 @@ pub struct TodoApp {
     comment_drafts: [String; SLOT_COUNT],
     /// What posting from each card's comment box does.
     comment_kind: [MessageKind; SLOT_COUNT],
+    /// Why the last command typed into each card's comment box failed, for
+    /// the task it was typed for.
+    comment_error: [Option<(u64, String)>; SLOT_COUNT],
     editing: Option<NoteEdit>,
     view: View,
     log_period: Period,
@@ -571,6 +673,7 @@ impl TodoApp {
             confirm_delete: None,
             comment_drafts: Default::default(),
             comment_kind: [MessageKind::Comment; SLOT_COUNT],
+            comment_error: Default::default(),
             editing: None,
             view: View::Board,
             log_period: Period::Day,
@@ -590,6 +693,16 @@ impl TodoApp {
                 Action::FocusInto(slot, id) => self.board.focus_into(slot, id),
                 Action::Unfocus(slot) => self.board.unfocus(slot),
                 Action::Delete(id) => self.confirm_delete = Some(id),
+                Action::AddSubtask(id, title) => {
+                    self.new_task = Some(NewTaskDraft {
+                        parent: Some(id),
+                        title,
+                        ..Default::default()
+                    });
+                }
+                Action::SetParent(id, parent) => {
+                    self.board.set_parent(id, parent);
+                }
                 Action::DeleteNote(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
                         task.delete_note(idx);
@@ -668,13 +781,7 @@ impl TodoApp {
         });
         ui.add_space(4.0);
 
-        let shown: Vec<u64> = self
-            .board
-            .tasks
-            .iter()
-            .filter(|t| shown_in_list(t, &self.filter, self.hide_closed))
-            .map(|t| t.id)
-            .collect();
+        let shown = self.board.list_rows(&self.filter, self.hide_closed);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
@@ -707,15 +814,21 @@ impl TodoApp {
                 ui.add_space(8.0);
                 ui.weak("No tasks yet. Press + to create one.");
             }
-            for id in shown {
+            for (id, depth) in shown {
                 let slot = self.board.slot_of(id);
+                // Read from the whole board before borrowing the task mutably.
+                let blocker = self
+                    .board
+                    .task(id)
+                    .and_then(|t| blocked_text(&self.board, t, now));
+                // Whether a task dragged over this row may become its subtask.
+                let can_adopt = |dragged: u64| self.board.can_set_parent(dragged, Some(id));
+                let hovered_payload =
+                    DragAndDrop::payload::<u64>(ui.ctx()).filter(|d| can_adopt(**d));
                 let Some(task) = self.board.task_mut(id) else {
                     continue;
                 };
-                let blocker = match task.state() {
-                    TaskState::Blocked => task.open_blocker().map(|n| n.text.clone()),
-                    TaskState::Active | TaskState::Done => None,
-                };
+                let is_subtask = task.parent.is_some();
                 let glow = ui.painter().add(Shape::Noop);
                 let row = Frame::new()
                     .corner_radius(ROW_RADIUS)
@@ -726,6 +839,7 @@ impl TodoApp {
                     let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y + 4.0);
                     ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
                         let row_hovered = ui.rect_contains_pointer(ui.max_rect());
+                        ui.add_space(depth as f32 * SUBTASK_INDENT);
                         let color = if task.done {
                             ui.visuals().weak_text_color()
                         } else {
@@ -736,7 +850,7 @@ impl TodoApp {
                         ui.painter().rect_filled(bar, 2.0, color);
                         let mut hover = updated_text(task, now);
                         if let Some(text) = &blocker {
-                            hover = format!("Blocked: {text}\n{hover}");
+                            hover = format!("{text}\n{hover}");
                         }
                         bar_response.on_hover_text(hover);
                         let mut done = task.done;
@@ -763,7 +877,7 @@ impl TodoApp {
                                 }
                             }
                             // Always laid out, so titles don't reflow on hover.
-                            task_menu(ui, id, row_hovered, actions);
+                            task_menu(ui, id, is_subtask, row_hovered, actions);
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 let mut text = RichText::new(&task.title);
                                 if task.done {
@@ -774,20 +888,32 @@ impl TodoApp {
                                         ui.add(Label::new(text).truncate().selectable(false))
                                     })
                                     .response
-                                    .on_hover_text("Drag onto a card to focus");
+                                    .on_hover_text(
+                                        "Drag onto a card to focus, or onto a task to make it a subtask",
+                                    );
                                 label.context_menu(|ui| {
-                                    if ui.button("Delete…").clicked() {
-                                        actions.push(Action::Delete(id));
-                                    }
+                                    task_menu_items(ui, id, is_subtask, actions);
                                 });
                             });
                         });
                     })
                 });
+                let rect = shown.response.rect;
                 if blocker.is_some() {
                     let color = blocked_glow_color(ui.visuals());
-                    let shape = inner_glow(shown.response.rect, ROW_RADIUS, ROW_GLOW_WIDTH, color);
+                    let shape = inner_glow(rect, ROW_RADIUS, ROW_GLOW_WIDTH, color);
                     ui.painter().set(glow, shape);
+                }
+                // Dropping a task onto a row makes it a subtask of that row.
+                if hovered_payload.is_some() && ui.rect_contains_pointer(rect) {
+                    let stroke = Stroke::new(2.0, ui.visuals().selection.bg_fill);
+                    ui.painter()
+                        .rect_stroke(rect, ROW_RADIUS, stroke, StrokeKind::Inside);
+                    if ui.input(|i| i.pointer.any_released())
+                        && let Some(dragged) = DragAndDrop::take_payload::<u64>(ui.ctx())
+                    {
+                        actions.push(Action::SetParent(*dragged, Some(id)));
+                    }
                 }
             }
         });
@@ -813,6 +939,7 @@ impl TodoApp {
 
     fn card(&mut self, ui: &mut egui::Ui, slot: usize, cell: Vec2, actions: &mut Vec<Action>) {
         let visuals = ui.visuals().clone();
+        let colors = palette(&visuals);
         let now = Utc::now();
         let task_id = self.board.slots[slot];
         let task = task_id.and_then(|id| self.board.task(id));
@@ -820,7 +947,15 @@ impl TodoApp {
             Some(task) if !task.done => Stroke::new(2.0, freshness_color(task, now, &visuals)),
             _ => Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         };
-        let blocked = task.is_some_and(|t| t.state() == TaskState::Blocked);
+        // Read from the whole board before the task is borrowed mutably below.
+        let state = task_id.map(|id| self.board.state(id));
+        let blocked = state == Some(TaskState::Blocked);
+        let blocked_since = task_id.and_then(|id| self.board.blocked_since(id));
+        let by_subtasks = task_id.is_some_and(|id| self.board.blocked_by_subtasks(id));
+        let parent_title = task
+            .and_then(|t| t.parent)
+            .and_then(|p| self.board.task(p))
+            .map(|p| p.title.clone());
         let has_task = task.is_some();
         // The background (and glow) is painted into this slot once the card's rect
         // is known, so it stays behind the card's contents.
@@ -854,7 +989,7 @@ impl TodoApp {
                     {
                         actions.push(Action::Unfocus(slot));
                     }
-                    task_menu(ui, task.id, true, actions);
+                    task_menu(ui, task.id, task.parent.is_some(), true, actions);
                     let title = TextEdit::singleline(&mut task.title)
                         .font(TextStyle::Heading)
                         .frame(Frame::NONE)
@@ -866,13 +1001,24 @@ impl TodoApp {
                 });
             });
             ui.horizontal(|ui| {
-                let state = task.state();
-                ui.label(
+                let state = state.unwrap_or(TaskState::Active);
+                let label = ui.label(
                     RichText::new(state.label())
                         .small()
                         .strong()
                         .color(state_text_color(state, &visuals)),
                 );
+                if let Some(since) = blocked_since {
+                    let mut text = format!("· for {}", short_duration(now - since));
+                    if by_subtasks {
+                        text.push_str(" · all subtasks blocked");
+                    }
+                    let color = state_text_color(state, &visuals);
+                    let hover = format!("Blocked since {}", local_time(since));
+                    label.on_hover_text(&hover);
+                    ui.label(RichText::new(text).small().color(color))
+                        .on_hover_text(hover);
+                }
                 ui.label(RichText::new("·").small().weak());
                 let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                 ui.painter()
@@ -883,6 +1029,13 @@ impl TodoApp {
                         .weak(),
                 )
                 .on_hover_text(updated_text(task, now));
+                if let Some(title) = &parent_title {
+                    ui.label(RichText::new("·").small().weak());
+                    ui.add(
+                        Label::new(RichText::new(format!("↳ {title}")).small().weak()).truncate(),
+                    )
+                    .on_hover_text(format!("Subtask of {title}"));
+                }
             });
             ui.separator();
 
@@ -897,10 +1050,19 @@ impl TodoApp {
                 if !kinds.contains(kind) {
                     *kind = MessageKind::Comment;
                 }
+                let error = &mut self.comment_error[slot];
+                if error.as_ref().is_some_and(|(id, _)| *id != task.id) {
+                    *error = None;
+                }
+                if let Some((_, text)) = error {
+                    ui.label(RichText::new(text.as_str()).small().color(colors.blocker));
+                }
                 let submit = ui.memory(|m| m.has_focus(input_id))
                     && ui.input_mut(|i| {
                         !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter)
                     });
+                // A fully typed command shows in the picker what Enter will do.
+                let preview = task.parse_input(draft).preview();
                 // In a bottom-up layout a row only reserves its initial height and
                 // then grows downward past the card's edge, so reserve the comment
                 // box's height up front: 2 to 6 lines, as measured last frame.
@@ -920,8 +1082,19 @@ impl TodoApp {
                         picker_row,
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            let selected =
-                                RichText::new(kind.label()).color(kind_color(*kind, &visuals));
+                            // Keeps the column's width when the label is short.
+                            ui.set_min_width(KIND_PICKER_WIDTH);
+                            let (selected, hint) = match preview {
+                                Some(Command::Subtask) => (
+                                    RichText::new("Subtask").color(colors.command),
+                                    "Open the new subtask dialog",
+                                ),
+                                command => {
+                                    let k = command.and_then(Command::kind).unwrap_or(*kind);
+                                    let text = RichText::new(k.label());
+                                    (text.color(kind_color(k, &visuals)), kind_hint(k))
+                                }
+                            };
                             ComboBox::from_id_salt(("comment_kind", slot))
                                 .selected_text(selected)
                                 .width(KIND_PICKER_WIDTH - ui.spacing().item_spacing.x)
@@ -938,41 +1111,94 @@ impl TodoApp {
                                     }
                                 })
                                 .response
-                                .on_hover_text(kind_hint(*kind));
+                                .on_hover_text(hint);
                         },
                     );
                     let hint = match *kind {
-                        MessageKind::Comment => "Add a comment… (Enter to post)",
+                        MessageKind::Comment => "Add a comment… (Enter to post, / for commands)",
                         MessageKind::Block => "Describe what you're waiting for… (Enter to post)",
                         MessageKind::Unblock => "What unblocked it?… (Enter to post)",
                         MessageKind::Close => "Closing note… (Enter to post)",
+                    };
+                    // Colours a leading `/command`: blue if Enter can run it, red if not.
+                    let task = &*task;
+                    let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                        let text = text.as_str();
+                        let parsed = task.parse_input(text);
+                        let token = parsed.token_len.unwrap_or(0);
+                        let color = if parsed.result.is_ok() {
+                            colors.command
+                        } else {
+                            colors.blocker
+                        };
+                        let font = TextStyle::Body.resolve(ui.style());
+                        let normal = ui.visuals().text_color();
+                        let mut job = LayoutJob::default();
+                        job.append(&text[..token], 0.0, TextFormat::simple(font.clone(), color));
+                        job.append(&text[token..], 0.0, TextFormat::simple(font, normal));
+                        job.wrap.max_width = wrap_width;
+                        // Dropping it would make the cursor jump back while typing.
+                        job.keep_trailing_whitespace = true;
+                        ui.fonts_mut(|f| f.layout_job(job))
                     };
                     let edit = ScrollArea::vertical()
                         .id_salt(("comment_input_scroll", slot))
                         .max_height(max_height)
                         .show(ui, |ui| {
-                            ui.add(
-                                TextEdit::multiline(draft)
-                                    .id(input_id)
-                                    .hint_text(hint)
-                                    .background_color(comment_input_bg(&visuals))
-                                    .margin(COMMENT_INPUT_MARGIN)
-                                    .desired_rows(2)
-                                    .desired_width(f32::INFINITY),
-                            )
+                            TextEdit::multiline(draft)
+                                .id(input_id)
+                                .hint_text(hint)
+                                .background_color(comment_input_bg(&visuals))
+                                .margin(COMMENT_INPUT_MARGIN)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter)
+                                .show(ui)
                         })
                         .inner;
-                    let height = edit.rect.height().clamp(min_height, max_height);
+                    let response = &edit.response.response;
+                    if response.changed() {
+                        *error = None;
+                    }
+                    // Explain an invalid command on hover, unless it's still
+                    // being typed.
+                    let parsed = task.parse_input(draft);
+                    if let (Some(len), Err(e)) = (parsed.token_len, &parsed.result)
+                        && !parsed.partial
+                    {
+                        let chars = draft[..len].chars().count();
+                        let galley = &edit.galley;
+                        let token = galley
+                            .pos_from_cursor(CCursor::new(0))
+                            .union(galley.pos_from_cursor(CCursor::new(chars)))
+                            .translate(edit.galley_pos.to_vec2());
+                        ui.interact(token, input_id.with("command"), Sense::hover())
+                            .on_hover_text(e.to_string());
+                    }
+                    let height = response.rect.height().clamp(min_height, max_height);
                     if (height - row_height).abs() > 0.5 {
                         ui.data_mut(|d| d.insert_temp(height_id, height));
                         ui.ctx().request_discard("comment box resized");
                     }
                 });
                 if submit && !draft.trim().is_empty() {
-                    task.post(draft, *kind, now);
-                    draft.clear();
-                    *kind = MessageKind::Comment;
-                    self.dirty = true;
+                    match task.parse_input(draft).result {
+                        Ok(Submit::Post(k, text)) => {
+                            task.post(text, k.unwrap_or(*kind), now);
+                            draft.clear();
+                            *kind = MessageKind::Comment;
+                            self.dirty = true;
+                        }
+                        Ok(Submit::SetKind(k)) => {
+                            *kind = k;
+                            draft.clear();
+                        }
+                        Ok(Submit::NewSubtask(title)) => {
+                            actions.push(Action::AddSubtask(task.id, title.to_owned()));
+                            draft.clear();
+                        }
+                        Err(e) => *error = Some((task.id, e.to_string())),
+                    }
                 }
                 ui.add_space(4.0);
 
@@ -991,6 +1217,7 @@ impl TodoApp {
                                     .editing
                                     .as_mut()
                                     .filter(|e| e.task_id == id && e.idx == idx);
+                                let can_block = task.can_block();
                                 let frame = match note.blocker {
                                     // Highlighted with a glow painted below.
                                     Some(Blocker::Open) => Frame::new(),
@@ -1012,7 +1239,10 @@ impl TodoApp {
                                         let glow = ui.painter().add(Shape::Noop);
                                         let shown = frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            comment(ui, note, idx, id, hovered, edit, now, actions);
+                                            comment(
+                                                ui, note, idx, id, hovered, can_block, edit, now,
+                                                actions,
+                                            );
                                         });
                                         if note.is_open_blocker() {
                                             ui.painter().set(
@@ -1038,7 +1268,14 @@ impl TodoApp {
                                             }
                                         }
                                         Some(Blocker::Resolved { .. }) => {
-                                            if ui.button("Reopen blocker").clicked() {
+                                            let reopen = Button::new("Reopen blocker");
+                                            if ui
+                                                .add_enabled(can_block, reopen)
+                                                .on_disabled_hover_text(
+                                                    CommandError::AlreadyBlocked.to_string(),
+                                                )
+                                                .clicked()
+                                            {
                                                 actions.push(Action::MarkBlocking(id, idx));
                                             }
                                             if ui.button("Not blocking").clicked() {
@@ -1046,7 +1283,14 @@ impl TodoApp {
                                             }
                                         }
                                         None => {
-                                            if ui.button("Mark as blocking").clicked() {
+                                            let mark = Button::new("Mark as blocking");
+                                            if ui
+                                                .add_enabled(can_block, mark)
+                                                .on_disabled_hover_text(
+                                                    CommandError::AlreadyBlocked.to_string(),
+                                                )
+                                                .clicked()
+                                            {
                                                 actions.push(Action::MarkBlocking(id, idx));
                                             }
                                         }
@@ -1150,27 +1394,7 @@ impl TodoApp {
                 ui.separator();
                 for group in &page.groups {
                     ui.add_space(6.0);
-                    ui.indent(("log_task", page.start, group.task_id), |ui| {
-                        ui.label(RichText::new(&group.title).strong().family(bold()));
-                        ui.add_space(2.0);
-                        for entry in &group.entries {
-                            ui.horizontal_top(|ui| {
-                                let time = entry.at.with_timezone(&Local).format(time_format);
-                                let (rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(
-                                        LOG_TIME_WIDTH,
-                                        ui.text_style_height(&TextStyle::Body),
-                                    ),
-                                    Sense::hover(),
-                                );
-                                ui.put(
-                                    rect,
-                                    Label::new(RichText::new(time.to_string()).small().weak()),
-                                );
-                                ui.add(Label::new(log_entry_job(entry, ui)).wrap());
-                            });
-                        }
-                    });
+                    log_group(ui, group, page.start, false, time_format);
                 }
             }
             ui.add_space(8.0);
@@ -1183,7 +1407,7 @@ impl TodoApp {
             return;
         };
         let id = task.id;
-        let prompt = delete_prompt(task);
+        let prompt = delete_prompt(task, self.board.descendants(id).len());
         let mut confirm = false;
         let mut cancel = false;
         let modal = Modal::new(Id::unique("delete_task_modal")).show(ctx, |ui| {
@@ -1218,11 +1442,25 @@ impl TodoApp {
         let Some(draft) = &mut self.new_task else {
             return;
         };
+        let parent_title = draft
+            .parent
+            .and_then(|id| self.board.task(id))
+            .map(|t| t.title.clone());
         let mut submit = false;
         let mut cancel = false;
         let modal = Modal::new(Id::unique("new_task_modal")).show(ctx, |ui| {
             ui.set_width(420.0);
-            ui.heading("New task");
+            match &parent_title {
+                Some(title) => {
+                    ui.heading("New subtask");
+                    ui.add(
+                        Label::new(RichText::new(format!("Subtask of: {title}")).weak()).truncate(),
+                    );
+                }
+                None => {
+                    ui.heading("New task");
+                }
+            }
             ui.add_space(8.0);
             let title = ui.add(
                 TextEdit::singleline(&mut draft.title)
@@ -1263,9 +1501,12 @@ impl TodoApp {
 
         if submit && !draft.title.trim().is_empty() {
             let draft = self.new_task.take().unwrap_or_default();
-            let id = self
-                .board
-                .add_task(draft.title.trim().to_owned(), &draft.notes, Utc::now());
+            let id = self.board.add_task(
+                draft.title.trim().to_owned(),
+                &draft.notes,
+                draft.parent,
+                Utc::now(),
+            );
             if draft.add_to_focus {
                 self.board.focus(id);
             }

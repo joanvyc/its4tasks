@@ -3,7 +3,8 @@
 Creates DATA_HOME/focal/board.json with ~12 days of history relative to now:
 an open blocker, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, a done task closed
-with a message, tasks of different freshness. Run the app with
+with a message, tasks of different freshness, and subtasks: a parent blocked
+by its subtasks (focused, with one of them) and one that isn't. Run the app with
 XDG_DATA_HOME=DATA_HOME to load it.
 """
 import datetime as dt
@@ -58,11 +59,28 @@ tasks = [
     dict(title="Read paper on CRDTs", created_at=ago(hours=5), updated_at=ago(hours=2),
          notes=[note("Section 3 is the interesting part", ago(hours=2))]),
 ]
+# Subtasks: a parent blocked because all its open subtasks are (one of them
+# has a done subtask of its own, which doesn't count), and an unblocked parent.
+tasks += [
+    dict(title="Ship v2 release", created_at=ago(days=6), updated_at=ago(days=6), notes=[]),  # 6
+    dict(title="Update docs", parent=6, created_at=ago(days=6), updated_at=ago(days=1), notes=[
+        note("Waiting on screenshots from design", ago(days=1), ago(days=1), starred=True),
+    ]),  # 7
+    dict(title="Security review", parent=6, created_at=ago(days=5), updated_at=ago(days=3), notes=[
+        note("Security team is booked until next week", ago(days=3), ago(days=3), starred=True),
+    ]),  # 8
+    dict(title="Scan dependencies", parent=8, created_at=ago(days=5), updated_at=ago(days=4), done=True,
+         done_at=ago(days=4), notes=[note("No findings", ago(days=4), action="Closed")]),  # 9
+    dict(title="Bump version", parent=6, created_at=ago(days=6), updated_at=ago(hours=6), done=True,
+         done_at=ago(hours=6), notes=[]),  # 10
+    dict(title="Book flights", parent=2, created_at=ago(days=5), updated_at=ago(days=4),
+         notes=[note("Compare train vs plane", ago(days=4))]),  # 11
+]
 for i, t in enumerate(tasks):
     t["id"] = i
     t.setdefault("done", False)
 
 path = pathlib.Path(sys.argv[1]) / "focal" / "board.json"
 path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps({"tasks": tasks, "slots": [0, 1, 2, 3], "next_id": len(tasks)}, indent=1))
+path.write_text(json.dumps({"tasks": tasks, "slots": [0, 6, 2, 7], "next_id": len(tasks)}, indent=1))
 print(path)

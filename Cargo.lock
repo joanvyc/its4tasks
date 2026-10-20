@@ -2700,6 +2700,7 @@ dependencies = [
  "ehttp",
  "its4tasks-core",
  "its4tasks-server",
+ "js-sys",
  "rfd",
  "serde",
  "serde_json",
@@ -2745,6 +2746,7 @@ name = "its4tasks-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "chrono",
  "directories",
  "its4tasks-core",

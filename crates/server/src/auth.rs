@@ -14,6 +14,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::clerk::Clerk;
 use crate::storage::LOCAL;
 
 /// Someone the authority vouches for.
@@ -63,12 +64,24 @@ pub struct JwtConfig {
     pub jwks_url: String,
     /// The `aud` tokens must have, if any.
     pub audience: Option<String>,
-    /// The browser's sign-in page; `{redirect}` becomes the page to return to.
-    pub sign_in_url: String,
+    /// How the browser signs in.
+    pub web: WebSignIn,
     /// The cookie the browser's token is in.
     pub cookie: String,
     /// How the native app signs in, if it can.
     pub oauth: Option<OAuth>,
+}
+
+/// How the browser signs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSignIn {
+    /// The server sends people without a valid token to this page, where
+    /// `{redirect}` becomes the page to come back to. The authority sets the
+    /// token's cookie for the server's domain.
+    Redirect(String),
+    /// Clerk's script on the page signs people in and keeps their token
+    /// fresh, and the page sends it along.
+    Clerk(Clerk),
 }
 
 /// How a native app signs in: OAuth 2 authorization code with PKCE, for a
@@ -82,16 +95,33 @@ pub struct OAuth {
 }
 
 impl JwtConfig {
-    /// From `ITS4TASKS_AUTH_*` and `ITS4TASKS_OAUTH_*`; `None` without an
-    /// issuer. Errors name what's missing.
+    /// From `ITS4TASKS_AUTH_*`, `ITS4TASKS_CLERK_*` and `ITS4TASKS_OAUTH_*`;
+    /// `None` without an issuer or Clerk key. Errors name what's missing.
     pub fn from_env() -> Result<Option<JwtConfig>, String> {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        let Some(issuer) = var("ITS4TASKS_AUTH_ISSUER") else {
-            return Ok(None);
+        let clerk = match var("ITS4TASKS_CLERK_PUBLISHABLE_KEY") {
+            Some(key) => Some(Clerk::new(
+                &key,
+                var("ITS4TASKS_CLERK_FRONTEND_API").as_deref(),
+            )?),
+            None => None,
+        };
+        // Clerk's tokens come from its Frontend API.
+        let issuer = match (var("ITS4TASKS_AUTH_ISSUER"), &clerk) {
+            (Some(issuer), _) => issuer,
+            (None, Some(clerk)) => clerk.frontend_api.clone(),
+            (None, None) => return Ok(None),
         };
         let issuer = issuer.trim_end_matches('/').to_owned();
-        let sign_in_url = var("ITS4TASKS_AUTH_SIGN_IN_URL")
-            .ok_or("ITS4TASKS_AUTH_SIGN_IN_URL is needed to send browsers to sign in")?;
+        let web = match (clerk, var("ITS4TASKS_AUTH_SIGN_IN_URL")) {
+            (Some(clerk), _) => WebSignIn::Clerk(clerk),
+            (None, Some(url)) => WebSignIn::Redirect(url),
+            (None, None) => {
+                return Err("set ITS4TASKS_AUTH_SIGN_IN_URL, or \
+                            ITS4TASKS_CLERK_PUBLISHABLE_KEY, for browsers to sign in"
+                    .into());
+            }
+        };
         let oauth = match (
             var("ITS4TASKS_OAUTH_AUTHORIZE_URL"),
             var("ITS4TASKS_OAUTH_TOKEN_URL"),
@@ -115,16 +145,19 @@ impl JwtConfig {
                 .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json")),
             issuer,
             audience: var("ITS4TASKS_AUTH_AUDIENCE"),
-            sign_in_url,
+            web,
             cookie: var("ITS4TASKS_AUTH_COOKIE").unwrap_or_else(|| "__session".to_owned()),
             oauth,
         }))
     }
 
-    /// The sign-in page, coming back to `back` afterwards.
-    pub fn sign_in(&self, back: &str) -> String {
-        self.sign_in_url
-            .replace("{redirect}", &percent_encode(back))
+    /// The page to send browsers without a valid token to, coming back to
+    /// `back` afterwards; `None` if the page signs in by itself.
+    pub fn sign_in(&self, back: &str) -> Option<String> {
+        match &self.web {
+            WebSignIn::Redirect(url) => Some(url.replace("{redirect}", &percent_encode(back))),
+            WebSignIn::Clerk(_) => None,
+        }
     }
 }
 
@@ -315,13 +348,13 @@ mod tests {
             issuer: "https://auth.test".into(),
             jwks_url: String::new(),
             audience: None,
-            sign_in_url: "https://auth.test/sign-in?redirect_url={redirect}".into(),
+            web: WebSignIn::Redirect("https://auth.test/sign-in?redirect_url={redirect}".into()),
             cookie: "__session".into(),
             oauth: None,
         };
         assert_eq!(
-            config.sign_in("http://127.0.0.1:7979/?a=b"),
-            "https://auth.test/sign-in?redirect_url=http%3A%2F%2F127.0.0.1%3A7979%2F%3Fa%3Db"
+            config.sign_in("http://127.0.0.1:7979/?a=b").as_deref(),
+            Some("https://auth.test/sign-in?redirect_url=http%3A%2F%2F127.0.0.1%3A7979%2F%3Fa%3Db")
         );
     }
 }

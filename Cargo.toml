@@ -15,6 +15,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 eframe = "0.37.0"
 rfd = "0.17.2"
+js-sys = "0.3.106"
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 ehttp = { version = "0.7.1", features = ["json"] }
 ureq = { version = "3.4.2", features = ["json"] }

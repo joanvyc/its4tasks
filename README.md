@@ -57,8 +57,9 @@ Everything is set through environment variables.
 | `DATABASE_URL` | Where boards are kept, e.g. `sqlite:///var/lib/its4tasks/boards.sqlite?mode=rwc` or `postgres://user:password@host/its4tasks`. The default is `server.sqlite` in the data directory. Tables are created and migrated on start. |
 | `ITS4TASKS_ADDR` | The address to listen on. The default is `127.0.0.1:7878`. |
 | `ITS4TASKS_PUBLIC_URL` | The address people reach the server at, e.g. `https://tasks.example.com`. It's used to send them back after they sign in. Without it, the server uses the `Host` and `X-Forwarded-Proto` headers. |
-| `ITS4TASKS_AUTH_ISSUER` | **Required.** The sign-in service's issuer, the `iss` of its tokens. |
-| `ITS4TASKS_AUTH_SIGN_IN_URL` | **Required.** Its sign-in page. `{redirect}` is replaced with the page to come back to, e.g. `https://accounts.example.com/sign-in?redirect_url={redirect}`. |
+| `ITS4TASKS_CLERK_PUBLISHABLE_KEY` | Sign in with Clerk, see below. With it, the two settings after this one are optional. |
+| `ITS4TASKS_AUTH_ISSUER` | The sign-in service's issuer, the `iss` of its tokens. **Required** without Clerk. |
+| `ITS4TASKS_AUTH_SIGN_IN_URL` | Its sign-in page. `{redirect}` is replaced with the page to come back to, e.g. `https://accounts.example.com/sign-in?redirect_url={redirect}`. **Required** without Clerk. |
 | `ITS4TASKS_AUTH_JWKS_URL` | Its public keys. The default is `{issuer}/.well-known/jwks.json`. |
 | `ITS4TASKS_AUTH_AUDIENCE` | If set, tokens must have this `aud`. |
 | `ITS4TASKS_AUTH_COOKIE` | The cookie browsers carry the token in. The default is `__session`. |
@@ -76,7 +77,16 @@ its4tasks has no passwords of its own. Sign-in is the job of the outside service
 
 A page request without a valid token is sent to the sign-in page. An API request without one gets `401`, and one that touches another user's tasks gets `403`.
 
-So far this has been tested only with the bundled stand-in service, `its4tasks-dev-auth`. Clerk, for example, issues 60-second session tokens and keeps them fresh with its own script on the page, which the web app doesn't load yet. Check how your service sets and refreshes the session cookie before you rely on it.
+### Signing in with Clerk
+
+[Clerk](https://clerk.com) session tokens last a minute and are kept fresh by Clerk's own script in the page. Set `ITS4TASKS_CLERK_PUBLISHABLE_KEY` to your Clerk application's publishable key (`pk_live_…` or `pk_test_…`), and the server adds that script to the web app's page. The web app then asks it for a fresh token before each request and sends it as `Authorization: Bearer`. Someone who isn't signed in is sent to your Clerk sign-in page, and comes back afterwards.
+
+- The issuer defaults to the Clerk Frontend API named in the key, so `ITS4TASKS_AUTH_ISSUER` and `ITS4TASKS_AUTH_SIGN_IN_URL` aren't needed.
+- Clerk's production keys only work on the domain the Clerk application is set up for, or its subdomains. Serve its4tasks there, or set its domain up in Clerk as a satellite.
+- With Clerk, the server serves the page to anyone, because the page itself handles sign-in. The page holds no data: everything comes through the API, which still needs a valid token.
+- `ITS4TASKS_CLERK_FRONTEND_API` overrides the Frontend API's address. It's meant for testing.
+
+This has been tested with a stand-in for Clerk's script that `its4tasks-dev-auth` serves, not yet with a real Clerk application.
 
 ### Connect the desktop app
 
@@ -101,6 +111,15 @@ DATABASE_URL="sqlite://$(mktemp -d)/server.sqlite?mode=rwc" \
 ```
 
 Open <http://127.0.0.1:7979/> and sign in with any name. A second browser profile, signed in with another name, gets a separate board. The desktop app can connect to `http://127.0.0.1:7979` the same way.
+
+dev-auth also stands in for Clerk's script, to try the Clerk setup. Start the server with these settings instead of the `ITS4TASKS_AUTH_*` ones. The key is `127.0.0.1:7980$` in base64.
+
+```sh
+ITS4TASKS_CLERK_PUBLISHABLE_KEY=pk_test_MTI3LjAuMC4xOjc5ODAk \
+ITS4TASKS_CLERK_FRONTEND_API=http://127.0.0.1:7980
+```
+
+Starting dev-auth with `ITS4TASKS_DEV_AUTH_TTL=15` makes its tokens expire quickly, to watch the page renew them.
 
 ## Bringing a board along
 

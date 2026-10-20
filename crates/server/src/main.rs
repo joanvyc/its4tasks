@@ -3,7 +3,8 @@
 //! HTTP. Listens on `$ITS4TASKS_ADDR`, by default 127.0.0.1:7878.
 //!
 //! People sign in with an outside authority, set with `$ITS4TASKS_AUTH_*`
-//! and, for the native app, `$ITS4TASKS_OAUTH_*` (see `auth::JwtConfig`).
+//! (or `$ITS4TASKS_CLERK_*`) and, for the native app, `$ITS4TASKS_OAUTH_*`
+//! (see `auth::JwtConfig`).
 //!
 //! For testing, `$ITS4TASKS_DELAY_MS` holds every answer back that long, as
 //! a slow network would.
@@ -37,8 +38,9 @@ async fn main() -> ExitCode {
         Ok(Some(config)) => Auth::Jwt(Box::new(Jwt::new(config))),
         Ok(None) => {
             eprintln!(
-                "its4tasks-server: set ITS4TASKS_AUTH_ISSUER and ITS4TASKS_AUTH_SIGN_IN_URL \
-                 to the authority people sign in with (see AGENTS.md)"
+                "its4tasks-server: set ITS4TASKS_AUTH_ISSUER and ITS4TASKS_AUTH_SIGN_IN_URL, \
+                 or ITS4TASKS_CLERK_PUBLISHABLE_KEY, for the service people sign in with \
+                 (see README.md)"
             );
             return ExitCode::FAILURE;
         }

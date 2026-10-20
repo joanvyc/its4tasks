@@ -13,6 +13,7 @@ postgres = ["sea-orm/sqlx-postgres", "sea-orm-migration/sqlx-postgres"]
 [dependencies]
 its4tasks-core.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 directories.workspace = true
 jsonwebtoken.workspace = true

@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::api::{Api, Failure};
-use crate::auth::{Auth, Unauthorized};
+use crate::auth::{Auth, Unauthorized, WebSignIn};
 use crate::storage::User;
 
 struct AppState {
@@ -170,15 +170,27 @@ async fn web(State(state): State<Shared>, uri: Uri, headers: HeaderMap) -> Respo
         "" => "index.html",
         path => path,
     };
-    // The page needs someone signed in; its code and fonts don't.
+    // The page needs someone signed in; its code and fonts don't. A page
+    // signed in by Clerk's script sees to that itself (see `clerk`).
+    let jwt = match &state.auth {
+        Auth::Jwt(jwt) => Some(jwt),
+        Auth::Local { .. } => None,
+    };
     if path == "index.html"
-        && let Auth::Jwt(jwt) = &state.auth
+        && let Some(jwt) = jwt
+        && let Some(sign_in) = jwt.config.sign_in(&page_url(&state, &headers, &uri))
         && state.auth.identify(&headers).await.is_err()
     {
-        let back = page_url(&state, &headers, &uri);
-        return Redirect::to(&jwt.config.sign_in(&back)).into_response();
+        return Redirect::to(&sign_in).into_response();
     }
     match Web::get(path) {
+        Some(file) if path == "index.html" => {
+            let mut page = String::from_utf8_lossy(&file.data).into_owned();
+            if let Some(WebSignIn::Clerk(clerk)) = jwt.map(|jwt| &jwt.config.web) {
+                page = page.replacen("</head>", &format!("{}</head>", clerk.script()), 1);
+            }
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response()
+        }
         Some(file) => {
             let mime = file.metadata.mimetype().to_owned();
             ([(header::CONTENT_TYPE, mime)], file.data).into_response()
@@ -226,7 +238,7 @@ mod tests {
             issuer: ISSUER.into(),
             jwks_url: String::new(),
             audience: None,
-            sign_in_url: "https://auth.test/sign-in?redirect={redirect}".into(),
+            web: WebSignIn::Redirect("https://auth.test/sign-in?redirect={redirect}".into()),
             cookie: "__session".into(),
             oauth: Some(OAuth {
                 issuer: ISSUER.into(),
@@ -422,6 +434,35 @@ mod tests {
         assert_eq!(
             get(&app, "/no/such/file.js", None).await.0,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_signed_in_by_clerk_loads_it() {
+        let keys: JwkSet =
+            serde_json::from_str(include_str!("../tests/fixtures/dev-jwks.json")).unwrap();
+        let clerk =
+            crate::clerk::Clerk::new("pk_test_ZXhhbXBsZS5jbGVyay5hY2NvdW50cy5kZXYk", None).unwrap();
+        let config = JwtConfig {
+            web: WebSignIn::Clerk(clerk),
+            ..config()
+        };
+        let app = router(
+            Api::new(),
+            Auth::Jwt(Box::new(Jwt::with_keys(config, keys))),
+        );
+        // No redirect: Clerk's script signs in on the page.
+        let (status, page) = get(&app, "/", None).await;
+        if status == StatusCode::OK {
+            assert!(page.contains("window.its4tasksAuth"));
+            assert!(page.contains("https://example.clerk.accounts.dev"));
+        } else {
+            assert_eq!(status, StatusCode::NOT_FOUND, "the GUI isn't built");
+        }
+        // The API still wants a token.
+        assert_eq!(
+            get(&app, "/api/board", None).await.0,
+            StatusCode::UNAUTHORIZED
         );
     }
 

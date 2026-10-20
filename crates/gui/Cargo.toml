@@ -26,6 +26,7 @@ webbrowser.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ehttp.workspace = true
+js-sys.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = ["console", "Document", "HtmlCanvasElement", "Location", "Window"] }
 

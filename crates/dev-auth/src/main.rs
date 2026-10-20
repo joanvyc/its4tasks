@@ -12,6 +12,12 @@
 //!   same host gets it, as Clerk sets it for the app's own domain.
 //! - `GET /authorize`, `POST /token`: OAuth 2 authorization code with PKCE
 //!   (S256) and refresh tokens, for the native app.
+//! - A mock of Clerk's script, at the path Clerk serves it from
+//!   (`/npm/@clerk/clerk-js@6/dist/clerk.browser.js`), with
+//!   `GET /v1/client/token` for its tokens: signing in also sets a
+//!   long-lived `__client` cookie, and that gets fresh tokens, as a Clerk
+//!   session does. Point `$ITS4TASKS_CLERK_FRONTEND_API` at dev-auth to try
+//!   its4tasks-server's Clerk support.
 //!
 //! Listens on `$ITS4TASKS_DEV_AUTH_ADDR`, by default 127.0.0.1:7980.
 //! Tokens last `$ITS4TASKS_DEV_AUTH_TTL` seconds, by default an hour.
@@ -20,8 +26,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Query, State};
-use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{AppendHeaders, Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
@@ -35,6 +41,9 @@ use uuid::Uuid;
 const KEY: &[u8] = include_bytes!("../../server/tests/fixtures/dev-key.pem");
 const JWKS: &str = include_str!("../../server/tests/fixtures/dev-jwks.json");
 const KEY_ID: &str = "its4tasks-dev";
+const CLERK_JS: &str = include_str!("clerk.browser.js");
+/// The session cookie the mock Clerk's tokens come from.
+const CLIENT_COOKIE: &str = "__client";
 const DEFAULT_ADDR: &str = "127.0.0.1:7980";
 
 struct Authority {
@@ -76,6 +85,11 @@ fn app(authority: Authority) -> Router {
         .route("/sign-in", get(sign_in_form).post(sign_in))
         .route("/authorize", get(authorize_form).post(authorize))
         .route("/token", axum::routing::post(token))
+        .route(
+            "/npm/@clerk/clerk-js@6/dist/clerk.browser.js",
+            get(clerk_js),
+        )
+        .route("/v1/client/token", get(client_token))
         .with_state(Arc::new(authority))
 }
 
@@ -142,9 +156,60 @@ async fn sign_in(State(a): State<Shared>, Form(f): Form<SignIn>) -> Response {
     if !local(&f.redirect) {
         return not_local();
     }
-    let token = a.token(&subject(&f.name));
-    let cookie = format!("__session={token}; Path=/; HttpOnly; SameSite=Lax");
-    ([(header::SET_COOKIE, cookie)], Redirect::to(&f.redirect)).into_response()
+    let sub = subject(&f.name);
+    let token = a.token(&sub);
+    let session = format!("__session={token}; Path=/; HttpOnly; SameSite=Lax");
+    let client = format!("{CLIENT_COOKIE}={sub}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
+    (
+        AppendHeaders([(header::SET_COOKIE, session), (header::SET_COOKIE, client)]),
+        Redirect::to(&f.redirect),
+    )
+        .into_response()
+}
+
+/// The mock of Clerk's script. Pages load it cross-origin.
+async fn clerk_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        CLERK_JS,
+    )
+        .into_response()
+}
+
+/// A fresh token for the `__client` session, for the mock Clerk script on
+/// a page of this machine.
+async fn client_token(State(a): State<Shared>, headers: HeaderMap) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .filter(|o| local(o))
+        .unwrap_or("null")
+        .to_owned();
+    let cors = [
+        (header::ACCESS_CONTROL_ALLOW_ORIGIN, origin),
+        (header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".to_owned()),
+        (header::VARY, "Origin".to_owned()),
+    ];
+    match cookie(&headers, CLIENT_COOKIE) {
+        Some(sub) if sub.starts_with("user_") => {
+            (cors, Json(json!({ "jwt": a.token(&sub) }))).into_response()
+        }
+        _ => (cors, StatusCode::UNAUTHORIZED).into_response(),
+    }
+}
+
+/// The cookie called `name`, if the request carries it.
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|c| c.trim().strip_prefix(name)?.strip_prefix('='))
+        .map(str::to_owned)
 }
 
 #[derive(Deserialize)]
@@ -353,7 +418,7 @@ fn escape_query(s: &str) -> String {
 mod tests {
     use axum::body::Body;
     use axum::http::Request;
-    use its4tasks_server::auth::{Jwt, JwtConfig};
+    use its4tasks_server::auth::{Jwt, JwtConfig, WebSignIn};
     use tower::ServiceExt;
 
     use super::*;
@@ -395,12 +460,61 @@ mod tests {
             issuer: URL.into(),
             jwks_url: String::new(),
             audience: None,
-            sign_in_url: String::new(),
+            web: WebSignIn::Redirect(String::new()),
             cookie: "__session".into(),
             oauth: None,
         };
         let jwt = Jwt::with_keys(config, serde_json::from_str(JWKS).unwrap());
         jwt.verify(token).await.unwrap().sub
+    }
+
+    #[tokio::test]
+    async fn the_mock_clerk_gives_tokens_for_the_session() {
+        let app = authority();
+        let (_, headers, _) = send(
+            &app,
+            form(
+                "/sign-in",
+                "name=Bob&redirect=http%3A%2F%2F127.0.0.1%3A7979%2F",
+            ),
+        )
+        .await;
+        let client = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|c| c.to_str().ok()?.split(';').next())
+            .find(|c| c.starts_with("__client="))
+            .unwrap()
+            .to_owned();
+        let ask = |cookie: Option<&str>| {
+            let mut request =
+                Request::get("/v1/client/token").header(header::ORIGIN, "http://127.0.0.1:7979");
+            if let Some(cookie) = cookie {
+                request = request.header(header::COOKIE, cookie);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        let (status, headers, body) = send(&app, ask(Some(&client))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "http://127.0.0.1:7979"
+        );
+        let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            subject_of(answer["jwt"].as_str().unwrap()).await,
+            "user_bob"
+        );
+        assert_eq!(send(&app, ask(None)).await.0, StatusCode::UNAUTHORIZED);
+        let (status, _, script) = send(
+            &app,
+            Request::get("/npm/@clerk/clerk-js@6/dist/clerk.browser.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(script.contains("window.Clerk"));
     }
 
     #[tokio::test]

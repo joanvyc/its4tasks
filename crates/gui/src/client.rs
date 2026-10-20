@@ -427,8 +427,9 @@ fn call(
 }
 
 /// GETs `url`, or POSTs `change` to it as JSON, with the browser's
-/// `fetch()`, and hands the reply to `done` when it arrives. The browser
-/// sends the session cookie, so there's no token.
+/// `fetch()`, and hands the reply to `done` when it arrives. It's signed in
+/// with the page's token if the page has a way to get one (see
+/// `page_token`), and otherwise with the session cookie.
 #[cfg(target_arch = "wasm32")]
 fn call(
     url: String,
@@ -442,13 +443,75 @@ fn call(
         Some(change) => ehttp::Request::post_json(url, &change).expect("a Change serializes"),
     };
     // ehttp leaves cookies out unless told, unlike the browser's fetch().
-    let request = request.with_credentials(ehttp::Credentials::SameOrigin);
-    ehttp::fetch(request, move |response| {
+    let mut request = request.with_credentials(ehttp::Credentials::SameOrigin);
+    wasm_bindgen_futures::spawn_local(async move {
+        match page_token().await {
+            Err(e) => return done(Err(e)),
+            Ok(PageToken::Cookie) => {}
+            Ok(PageToken::Bearer(token)) => {
+                request
+                    .headers
+                    .insert("Authorization", format!("Bearer {token}"));
+            }
+            // On its way to sign in.
+            Ok(PageToken::SignedOut) => {
+                return done(Ok(Reply {
+                    status: 401,
+                    body: Vec::new(),
+                }));
+            }
+        }
+        let response = ehttp::fetch_async(request).await;
         done(response.map(|r| Reply {
             status: r.status,
             body: r.bytes,
         }));
     });
+}
+
+/// How a request from the page is signed in.
+#[cfg(target_arch = "wasm32")]
+enum PageToken {
+    /// With the session cookie: the page has no `its4tasksAuth`.
+    Cookie,
+    Bearer(String),
+    /// Nobody is: the browser has been sent to sign in.
+    SignedOut,
+}
+
+/// A token from the page's `window.its4tasksAuth`, which the server adds
+/// for sign-in services that keep tokens fresh in the page, such as Clerk:
+/// `token()` gives a promise of a fresh token, or of null when signed out,
+/// and `signIn()` goes to sign in.
+#[cfg(target_arch = "wasm32")]
+async fn page_token() -> Result<PageToken, String> {
+    use eframe::wasm_bindgen::{JsCast, JsValue};
+    use js_sys::{Function, Promise, Reflect};
+
+    let failed = |e: JsValue| format!("signing in: {e:?}");
+    let window = web_sys::window().ok_or("no window")?;
+    let auth = Reflect::get(&window, &"its4tasksAuth".into()).map_err(failed)?;
+    if auth.is_undefined() || auth.is_null() {
+        return Ok(PageToken::Cookie);
+    }
+    let call = |name: &str| -> Result<JsValue, String> {
+        let method: Function = Reflect::get(&auth, &name.into())
+            .map_err(failed)?
+            .dyn_into()
+            .map_err(failed)?;
+        method.call0(&auth).map_err(failed)
+    };
+    let promise: Promise = call("token")?.dyn_into().map_err(failed)?;
+    let token = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(failed)?;
+    match token.as_string() {
+        Some(token) => Ok(PageToken::Bearer(token)),
+        None => {
+            call("signIn")?;
+            Ok(PageToken::SignedOut)
+        }
+    }
 }
 
 fn board_from(reply: Result<Reply, String>) -> Result<BoardView, ClientError> {

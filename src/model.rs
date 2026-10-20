@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, iter};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -331,6 +331,60 @@ impl Task {
             self.notes.remove(idx);
         }
     }
+
+    /// The comment and the one tied to it, which always move together: a
+    /// resolved blocker and the Unblock message that resolved it. Paired by
+    /// time, since the message only keeps a copy of the blocker. In order.
+    pub fn linked_notes(&self, idx: usize) -> Vec<usize> {
+        let Some(note) = self.notes.get(idx) else {
+            return Vec::new();
+        };
+        let resolves = |blocker: &Note, message: &Note| match (blocker.blocker, &message.action) {
+            (Some(Blocker::Resolved { at }), Some(NoteAction::Unblocked { blocked_since, .. })) => {
+                message.at == at && *blocked_since == blocker.blocked_since()
+            }
+            _ => false,
+        };
+        let partner =
+            self.notes.iter().enumerate().position(|(i, other)| {
+                i != idx && (resolves(note, other) || resolves(other, note))
+            });
+        let mut linked: Vec<usize> = iter::once(idx).chain(partner).collect();
+        linked.sort_unstable();
+        linked
+    }
+
+    /// Insert a comment where its time puts it.
+    fn insert_note(&mut self, note: Note) {
+        let at = self.notes.partition_point(|n| n.at <= note.at);
+        self.notes.insert(at, note);
+    }
+}
+
+/// Why a comment can't move to a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveError {
+    NotFound,
+    SameTask,
+    TargetClosed,
+    CloseNote,
+    AlreadyBlocked,
+    BlockedBeforeResolved,
+}
+
+impl fmt::Display for MoveError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            MoveError::NotFound => "The comment or task no longer exists",
+            MoveError::SameTask => "The comment is already on this task",
+            MoveError::TargetClosed => "The task is closed",
+            MoveError::CloseNote => "A closing comment can't be moved: it closed its task",
+            MoveError::AlreadyBlocked => "Already blocked: it has an open blocker",
+            MoveError::BlockedBeforeResolved => {
+                "Its open blocker started before this blocker was resolved"
+            }
+        })
+    }
 }
 
 /// A `/command` typed at the start of the comment box.
@@ -657,6 +711,57 @@ impl Board {
             visit(self, task, 0, filter, hide_closed, &mut rows);
         }
         rows
+    }
+
+    /// Whether the comment can move from one task to another, and if so which
+    /// comments go with it (see `Task::linked_notes`). One task blocks on one
+    /// thing at a time: an open blocker can't join a blocked task, and a
+    /// resolved one can't join a task blocked since before it was resolved.
+    pub fn can_move_note(&self, from: u64, idx: usize, to: u64) -> Result<Vec<usize>, MoveError> {
+        let source = self.task(from).ok_or(MoveError::NotFound)?;
+        let note = source.notes.get(idx).ok_or(MoveError::NotFound)?;
+        let target = self.task(to).ok_or(MoveError::NotFound)?;
+        if note.action == Some(NoteAction::Closed) {
+            return Err(MoveError::CloseNote);
+        }
+        if from == to {
+            return Err(MoveError::SameTask);
+        }
+        if target.done {
+            return Err(MoveError::TargetClosed);
+        }
+        let linked = source.linked_notes(idx);
+        if let Some(open) = target.open_blocker() {
+            for note in linked.iter().map(|&i| &source.notes[i]) {
+                match note.blocker {
+                    Some(Blocker::Open) => return Err(MoveError::AlreadyBlocked),
+                    Some(Blocker::Resolved { at }) if open.blocked_since() < at => {
+                        return Err(MoveError::BlockedBeforeResolved);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(linked)
+    }
+
+    /// Move the comment, and any tied to it, to another task, keeping the
+    /// target's comments in time order. Counts as an update of the target
+    /// only as of the moved comments' own times.
+    pub fn move_note(&mut self, from: u64, idx: usize, to: u64) -> Result<(), MoveError> {
+        let linked = self.can_move_note(from, idx, to)?;
+        let source = self.task_mut(from).ok_or(MoveError::NotFound)?;
+        let moved: Vec<Note> = linked
+            .iter()
+            .rev()
+            .map(|&i| source.notes.remove(i))
+            .collect();
+        let target = self.task_mut(to).ok_or(MoveError::NotFound)?;
+        for note in moved {
+            target.updated_at = target.updated_at.max(note.at);
+            target.insert_note(note);
+        }
+        Ok(())
     }
 
     pub fn task(&self, id: u64) -> Option<&Task> {
@@ -1252,6 +1357,111 @@ mod tests {
         assert_eq!(b, back);
         let t: Task = serde_json::from_str(r#"{"id":0,"title":"t"}"#).unwrap();
         assert_eq!(t.parent, None);
+    }
+
+    fn texts(b: &Board, id: u64) -> Vec<&str> {
+        b.task(id)
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn move_note_lands_in_time_order_and_touches_target() {
+        let t0 = Utc::now();
+        let h = TimeDelta::hours;
+        let mut b = board_with(2);
+        b.task_mut(0)
+            .unwrap()
+            .post("wrong task", MessageKind::Comment, t0 + h(2));
+        let target = b.task_mut(1).unwrap();
+        target.post("before", MessageKind::Comment, t0 + h(1));
+        target.post("after", MessageKind::Comment, t0 + h(3));
+        target.updated_at = t0;
+        assert_eq!(b.move_note(0, 0, 1), Ok(()));
+        assert!(texts(&b, 0).is_empty());
+        assert_eq!(texts(&b, 1), ["before", "wrong task", "after"]);
+        assert_eq!(b.task(1).unwrap().updated_at, t0 + h(2));
+    }
+
+    #[test]
+    fn a_blocker_and_its_resolve_message_move_together() {
+        let t0 = Utc::now();
+        let h = TimeDelta::hours;
+        let mut b = board_with(2);
+        let t = b.task_mut(0).unwrap();
+        t.post("need access", MessageKind::Block, t0);
+        t.post("plain", MessageKind::Comment, t0 + h(1));
+        t.post("got it", MessageKind::Unblock, t0 + h(2));
+        assert_eq!(t.linked_notes(0), [0, 2]);
+        assert_eq!(t.linked_notes(2), [0, 2]);
+        assert_eq!(t.linked_notes(1), [1]);
+        assert_eq!(b.move_note(0, 2, 1), Ok(()));
+        assert_eq!(texts(&b, 0), ["plain"]);
+        assert_eq!(texts(&b, 1), ["need access", "got it"]);
+
+        // Resolved with the button: no message to take along.
+        let t = b.task_mut(0).unwrap();
+        t.set_blocking(0, t0 + h(3));
+        t.resolve(0, t0 + h(4));
+        assert_eq!(t.linked_notes(0), [0]);
+    }
+
+    #[test]
+    fn moving_an_open_blocker_needs_an_unblocked_target() {
+        let now = Utc::now();
+        let mut b = board_with(3);
+        b.task_mut(0).unwrap().post("a", MessageKind::Block, now);
+        b.task_mut(1).unwrap().post("b", MessageKind::Block, now);
+        assert_eq!(b.move_note(0, 0, 1), Err(MoveError::AlreadyBlocked));
+        assert_eq!(b.move_note(0, 0, 2), Ok(()));
+        assert_eq!(b.state(0), TaskState::Active);
+        assert_eq!(b.state(2), TaskState::Blocked);
+    }
+
+    #[test]
+    fn a_resolved_blocker_cannot_overlap_the_targets_open_one() {
+        let t0 = Utc::now();
+        let h = TimeDelta::hours;
+        let mut b = board_with(3);
+        let t = b.task_mut(0).unwrap();
+        t.post("old", MessageKind::Block, t0);
+        t.post("done", MessageKind::Unblock, t0 + h(2));
+        // Blocked since before "old" was resolved, and since after.
+        b.task_mut(1)
+            .unwrap()
+            .post("x", MessageKind::Block, t0 + h(1));
+        b.task_mut(2)
+            .unwrap()
+            .post("y", MessageKind::Block, t0 + h(3));
+        assert_eq!(
+            b.can_move_note(0, 0, 1),
+            Err(MoveError::BlockedBeforeResolved)
+        );
+        assert_eq!(
+            b.can_move_note(0, 1, 1),
+            Err(MoveError::BlockedBeforeResolved)
+        );
+        assert_eq!(b.move_note(0, 1, 2), Ok(()));
+        assert_eq!(texts(&b, 2), ["old", "done", "y"]);
+    }
+
+    #[test]
+    fn closed_targets_close_notes_and_the_same_task_are_refused() {
+        let now = Utc::now();
+        let mut b = board_with(3);
+        b.task_mut(0).unwrap().post("c", MessageKind::Comment, now);
+        b.task_mut(1).unwrap().set_done(true, now);
+        b.task_mut(2)
+            .unwrap()
+            .post("shipped", MessageKind::Close, now);
+        assert_eq!(b.can_move_note(0, 0, 0), Err(MoveError::SameTask));
+        assert_eq!(b.can_move_note(0, 0, 1), Err(MoveError::TargetClosed));
+        assert_eq!(b.can_move_note(2, 0, 0), Err(MoveError::CloseNote));
+        assert_eq!(b.can_move_note(0, 5, 2), Err(MoveError::NotFound));
+        assert_eq!(b.can_move_note(0, 0, 99), Err(MoveError::NotFound));
     }
 
     #[test]

@@ -2,17 +2,17 @@ use std::{iter, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Utc};
 use eframe::egui::{
-    self, Align, Button, CentralPanel, Color32, ComboBox, DragAndDrop, FontData, FontDefinitions,
-    FontFamily, FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers, Panel, Popup,
-    Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit, TextFormat,
-    TextStyle, Theme, UiBuilder, Vec2, Visuals,
+    self, Align, Atom, Button, CentralPanel, Color32, ComboBox, DragAndDrop, FontData,
+    FontDefinitions, FontFamily, FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers,
+    Panel, Popup, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer,
+    TextEdit, TextFormat, TextStyle, Theme, UiBuilder, Vec2, Visuals,
     text::{CCursor, LayoutJob},
 };
 
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
-    Blocker, Board, Command, CommandError, MessageKind, Note, NoteAction, SLOT_COUNT, Submit, Task,
-    TaskState, headline, short_duration, split_title, staleness,
+    Blocker, Board, Command, CommandError, MessageKind, MoveError, Note, NoteAction, SLOT_COUNT,
+    Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
 use crate::storage;
 
@@ -144,9 +144,7 @@ fn task_menu_items(ui: &mut egui::Ui, task_id: u64, is_subtask: bool, actions: &
     }
 }
 
-/// A "⋯" button opening the task's menu. Shown when `visible` or while the
-/// menu is open; otherwise its space is kept empty so nothing shifts. The dots
-/// are painted so they sit on the row's center line, like the focus dot.
+/// The task's "⋯" menu. See `dots_menu`.
 fn task_menu(
     ui: &mut egui::Ui,
     task_id: u64,
@@ -155,6 +153,15 @@ fn task_menu(
     actions: &mut Vec<Action>,
 ) {
     let id = ui.make_persistent_id(("task_menu", task_id));
+    dots_menu(ui, id, visible, |ui| {
+        task_menu_items(ui, task_id, is_subtask, actions);
+    });
+}
+
+/// A "⋯" button opening a menu. Shown when `visible` or while the menu is
+/// open; otherwise its space is kept empty so nothing shifts. The dots are
+/// painted so they sit on the row's center line, like the focus dot.
+fn dots_menu(ui: &mut egui::Ui, id: Id, visible: bool, add_contents: impl FnOnce(&mut egui::Ui)) {
     let open = Popup::is_id_open(ui.ctx(), id.with("popup"));
     let (rect, _) = ui.allocate_exact_size(Vec2::new(20.0, 16.0), Sense::hover());
     if !visible && !open {
@@ -177,7 +184,75 @@ fn task_menu(
         ui.painter().circle_filled(center, 1.5, color);
     }
     let response = response.on_hover_text("More");
-    Popup::menu(&response).show(|ui| task_menu_items(ui, task_id, is_subtask, actions));
+    Popup::menu(&response).show(add_contents);
+}
+
+/// A comment's menu entries, shared by its "⋯" button and its right-click menu.
+fn comment_menu_items(
+    ui: &mut egui::Ui,
+    note: &Note,
+    task_id: u64,
+    idx: usize,
+    can_block: bool,
+    actions: &mut Vec<Action>,
+) {
+    match note.blocker {
+        Some(Blocker::Open) => {
+            if ui
+                .button("✔ Resolve")
+                .on_hover_text("Mark this blocker as resolved")
+                .clicked()
+            {
+                actions.push(Action::Resolve(task_id, idx));
+            }
+            if ui.button("Not blocking").clicked() {
+                actions.push(Action::Unblock(task_id, idx));
+            }
+        }
+        Some(Blocker::Resolved { .. }) => {
+            let reopen = Button::new("Reopen blocker");
+            if ui
+                .add_enabled(can_block, reopen)
+                .on_disabled_hover_text(CommandError::AlreadyBlocked.to_string())
+                .clicked()
+            {
+                actions.push(Action::MarkBlocking(task_id, idx));
+            }
+            if ui.button("Not blocking").clicked() {
+                actions.push(Action::Unblock(task_id, idx));
+            }
+        }
+        None => {
+            let mark = Button::new("⛔ Mark as blocking");
+            if ui
+                .add_enabled(can_block, mark)
+                .on_hover_text("Turn this comment into a blocker")
+                .on_disabled_hover_text(CommandError::AlreadyBlocked.to_string())
+                .clicked()
+            {
+                actions.push(Action::MarkBlocking(task_id, idx));
+            }
+        }
+    }
+    if ui.button("Edit").clicked() {
+        actions.push(Action::StartEdit(task_id, idx));
+    }
+    let star = if note.starred { "Unstar" } else { "Star" };
+    if ui.button(star).clicked() {
+        actions.push(Action::ToggleStar(task_id, idx));
+    }
+    let movable = note.action != Some(NoteAction::Closed);
+    if ui
+        .add_enabled(movable, Button::new("Move to task…"))
+        .on_hover_text("Move it to another task, e.g. if it was posted on the wrong one")
+        .on_disabled_hover_text(MoveError::CloseNote.to_string())
+        .clicked()
+    {
+        actions.push(Action::StartMove(task_id, idx));
+    }
+    if ui.button("Delete").clicked() {
+        actions.push(Action::DeleteNote(task_id, idx));
+    }
 }
 
 /// What the delete confirmation says will go.
@@ -330,6 +405,30 @@ fn action_job(action: &NoteAction, note: &Note, ui: &egui::Ui) -> LayoutJob {
     job
 }
 
+/// One line for a comment in the move dialog: what kind it is and its headline.
+fn moved_note_job(note: &Note, ui: &egui::Ui) -> LayoutJob {
+    let font = TextStyle::Body.resolve(ui.style());
+    let format = |color| TextFormat::simple(font.clone(), color);
+    let colors = palette(ui.visuals());
+    let mut job = LayoutJob::default();
+    if note.starred {
+        job.append("★ ", 0.0, format(colors.star));
+    }
+    let marker = match (note.blocker, &note.action) {
+        (Some(Blocker::Open), _) => Some(("⛔ Blocking: ", colors.blocker)),
+        (Some(Blocker::Resolved { .. }), _) => Some(("Resolved blocker: ", colors.blocker)),
+        (_, Some(NoteAction::Unblocked { .. })) => {
+            Some(("✔ Resolved it with message: ", colors.resolved))
+        }
+        _ => None,
+    };
+    if let Some((marker, color)) = marker {
+        job.append(marker, 0.0, format(color));
+    }
+    job.append(headline(&note.text), 0.0, format(ui.visuals().text_color()));
+    job
+}
+
 fn local_time(at: DateTime<Utc>) -> String {
     at.with_timezone(&Local)
         .format("%Y-%m-%d %H:%M")
@@ -354,8 +453,8 @@ fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
 }
 
 /// One entry of a card's comment log: timestamp/blocker line, then the text,
-/// or a text box while `edit` is being written. `hovered` reveals the star,
-/// edit and "mark as blocking" buttons; the last only when `can_block`.
+/// or a text box while `edit` is being written. `hovered` reveals the star
+/// and the "⋯" menu, whose "mark as blocking" is enabled only when `can_block`.
 #[allow(clippy::too_many_arguments)]
 fn comment(
     ui: &mut egui::Ui,
@@ -420,35 +519,10 @@ fn comment(
             if star.clicked() {
                 actions.push(Action::ToggleStar(task_id, idx));
             }
-            let edit_button = ui
-                .add_visible(hovered && edit.is_none(), Button::new("Edit").small())
-                .on_hover_text("Edit this comment");
-            if edit_button.clicked() {
-                actions.push(Action::StartEdit(task_id, idx));
-            }
-            match note.blocker {
-                Some(Blocker::Open) => {
-                    if ui
-                        .small_button("✔ Resolve")
-                        .on_hover_text("Mark this blocker as resolved")
-                        .clicked()
-                    {
-                        actions.push(Action::Resolve(task_id, idx));
-                    }
-                }
-                Some(Blocker::Resolved { .. }) => {}
-                None => {
-                    let block = ui
-                        .add_visible(
-                            hovered && can_block,
-                            Button::new("⛔ Mark blocking").small(),
-                        )
-                        .on_hover_text("Turn this comment into a blocker");
-                    if block.clicked() {
-                        actions.push(Action::MarkBlocking(task_id, idx));
-                    }
-                }
-            }
+            let id = ui.make_persistent_id(("comment_menu", task_id, idx));
+            dots_menu(ui, id, hovered && edit.is_none(), |ui| {
+                comment_menu_items(ui, note, task_id, idx, can_block, actions);
+            });
         });
     });
     if let Some(edit) = edit {
@@ -615,6 +689,13 @@ struct NoteEdit {
     focus_requested: bool,
 }
 
+/// A comment waiting for the user to pick the task it moves to.
+struct NoteMove {
+    from: u64,
+    idx: usize,
+    target: Option<u64>,
+}
+
 /// Changes requested while drawing, applied once drawing is done so we don't
 /// mutate the board while iterating over it.
 enum Action {
@@ -632,6 +713,8 @@ enum Action {
     Unblock(u64, usize),
     ToggleStar(u64, usize),
     StartEdit(u64, usize),
+    /// Open the dialog for moving a comment to another task.
+    StartMove(u64, usize),
     SaveEdit,
     CancelEdit,
 }
@@ -656,6 +739,7 @@ pub struct TodoApp {
     /// the task it was typed for.
     comment_error: [Option<(u64, String)>; SLOT_COUNT],
     editing: Option<NoteEdit>,
+    moving: Option<NoteMove>,
     view: View,
     log_period: Period,
     log_starred_only: bool,
@@ -677,6 +761,7 @@ impl TodoApp {
             comment_kind: [MessageKind::Comment; SLOT_COUNT],
             comment_error: Default::default(),
             editing: None,
+            moving: None,
             view: View::Board,
             log_period: Period::Day,
             log_starred_only: false,
@@ -739,6 +824,13 @@ impl TodoApp {
                         idx,
                         text: note.text.clone(),
                         focus_requested: false,
+                    });
+                }
+                Action::StartMove(from, idx) => {
+                    self.moving = Some(NoteMove {
+                        from,
+                        idx,
+                        target: None,
                     });
                 }
                 Action::SaveEdit => {
@@ -1261,53 +1353,7 @@ impl TodoApp {
                                     })
                                     .response;
                                 entry.context_menu(|ui| {
-                                    match note.blocker {
-                                        Some(Blocker::Open) => {
-                                            if ui.button("Resolve").clicked() {
-                                                actions.push(Action::Resolve(id, idx));
-                                            }
-                                            if ui.button("Not blocking").clicked() {
-                                                actions.push(Action::Unblock(id, idx));
-                                            }
-                                        }
-                                        Some(Blocker::Resolved { .. }) => {
-                                            let reopen = Button::new("Reopen blocker");
-                                            if ui
-                                                .add_enabled(can_block, reopen)
-                                                .on_disabled_hover_text(
-                                                    CommandError::AlreadyBlocked.to_string(),
-                                                )
-                                                .clicked()
-                                            {
-                                                actions.push(Action::MarkBlocking(id, idx));
-                                            }
-                                            if ui.button("Not blocking").clicked() {
-                                                actions.push(Action::Unblock(id, idx));
-                                            }
-                                        }
-                                        None => {
-                                            let mark = Button::new("Mark as blocking");
-                                            if ui
-                                                .add_enabled(can_block, mark)
-                                                .on_disabled_hover_text(
-                                                    CommandError::AlreadyBlocked.to_string(),
-                                                )
-                                                .clicked()
-                                            {
-                                                actions.push(Action::MarkBlocking(id, idx));
-                                            }
-                                        }
-                                    }
-                                    if ui.button("Edit").clicked() {
-                                        actions.push(Action::StartEdit(id, idx));
-                                    }
-                                    let star = if note.starred { "Unstar" } else { "Star" };
-                                    if ui.button(star).clicked() {
-                                        actions.push(Action::ToggleStar(id, idx));
-                                    }
-                                    if ui.button("Delete").clicked() {
-                                        actions.push(Action::DeleteNote(id, idx));
-                                    }
+                                    comment_menu_items(ui, note, id, idx, can_block, actions);
                                 });
                                 ui.add_space(4.0);
                             }
@@ -1440,6 +1486,89 @@ impl TodoApp {
         }
     }
 
+    /// Pick the task a comment moves to: the open tasks as in the task list,
+    /// greyed out where it can't go, then the comments that will move.
+    fn move_modal(&mut self, ctx: &egui::Context) {
+        let Some(moving) = &mut self.moving else {
+            return;
+        };
+        let (from, idx) = (moving.from, moving.idx);
+        let Some(source) = self.board.task(from).filter(|t| idx < t.notes.len()) else {
+            self.moving = None;
+            return;
+        };
+        let rows = self.board.list_rows("", true);
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = Modal::new(Id::unique("move_note_modal")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Move comment");
+            ui.add(Label::new(RichText::new(format!("From: {}", source.title)).weak()).truncate());
+            ui.add_space(8.0);
+            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (id, depth) in rows {
+                    let Some(task) = self.board.task(id) else {
+                        continue;
+                    };
+                    let allowed = self.board.can_move_note(from, idx, id);
+                    ui.horizontal(|ui| {
+                        ui.add_space(depth as f32 * SUBTASK_INDENT);
+                        let selected = moving.target == Some(id);
+                        let mut title = RichText::new(&task.title);
+                        if task.done {
+                            title = title.strikethrough();
+                        }
+                        // The growing atom keeps the title on the left, so
+                        // subtasks line up under their indent.
+                        let row = Button::selectable(selected, (title, Atom::grow()))
+                            .truncate()
+                            .min_size(Vec2::new(ui.available_width(), 0.0));
+                        let response = ui.add_enabled(allowed.is_ok(), row);
+                        let response = match allowed {
+                            Err(e) => response.on_disabled_hover_text(e.to_string()),
+                            Ok(_) => response,
+                        };
+                        if response.clicked() {
+                            moving.target = Some(id);
+                        }
+                    });
+                }
+            });
+            ui.separator();
+            ui.label(RichText::new("Will move:").small().weak());
+            for i in source.linked_notes(idx) {
+                let note = &source.notes[i];
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(local_time(note.at)).small().weak());
+                    ui.add(Label::new(moved_note_job(note, ui)).truncate());
+                });
+            }
+            ui.add_space(12.0);
+            // Right-aligned; added right to left, so Cancel comes first.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                let can_move = moving.target.is_some();
+                if ui.add_enabled(can_move, Button::new("Move")).clicked() {
+                    confirm = true;
+                }
+            });
+        });
+        if confirm && let Some(to) = moving.target {
+            if self.board.move_note(from, idx, to).is_ok() {
+                // The comment indices of both tasks have shifted.
+                self.editing
+                    .take_if(|e| e.task_id == from || e.task_id == to);
+                self.dirty = true;
+            }
+            self.moving = None;
+        } else if cancel || modal.should_close() {
+            self.moving = None;
+        }
+    }
+
     fn new_task_modal(&mut self, ctx: &egui::Context) {
         let has_free_slot = self.board.has_free_slot();
         let Some(draft) = &mut self.new_task else {
@@ -1537,6 +1666,7 @@ impl eframe::App for TodoApp {
         });
         self.new_task_modal(&ui.ctx().clone());
         self.delete_modal(&ui.ctx().clone());
+        self.move_modal(&ui.ctx().clone());
         self.apply(actions);
         self.save_if_dirty();
         // Keep the freshness colors drifting while the app sits idle.

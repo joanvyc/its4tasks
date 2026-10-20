@@ -1,7 +1,7 @@
 """Write a sample its4tasks board for visual testing: seed_board.py DATA_HOME
 
 Creates DATA_HOME/its4tasks/board.json with ~12 days of history relative to now:
-an open blocker, resolved blockers (one with an Unblock message), multi-line
+open blockers, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, a done task closed
 with a message, tasks of different freshness, and subtasks: a parent blocked
 by its subtasks (focused, with one of them) and one that isn't. Run the app with
@@ -52,7 +52,10 @@ tasks = [
              action={"Unblocked": {"quote": BUDGET, "blocked_since": ago(days=6, hours=20)}}),
         note("Booked the venue", ago(days=5), starred=True),
     ]),
-    dict(title="Renew passport", created_at=ago(days=12), updated_at=ago(days=12), notes=[]),
+    # Blocked since before "Plan offsite"'s blocker was resolved, so that pair can't move here.
+    dict(title="Renew passport", created_at=ago(days=12), updated_at=ago(days=6), notes=[
+        note("Waiting for a photo appointment", ago(days=6), ago(days=6), starred=True),
+    ]),
     dict(title="Buy groceries", created_at=ago(days=10), updated_at=ago(days=2), done=True, done_at=ago(days=2),
          notes=[note("Milk, eggs, coffee", ago(days=10)),
                 note("All bought, coffee was on sale", ago(days=2), action="Closed")]),

@@ -1,0 +1,5 @@
+# Railway: build with the Dockerfile, never Railpack (which can't build the
+# web GUI and the server together). Overrides the service's dashboard settings.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"

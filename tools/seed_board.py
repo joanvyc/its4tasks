@@ -65,7 +65,8 @@ tasks = [
 # Subtasks: a parent blocked because all its open subtasks are (one of them
 # has a done subtask of its own, which doesn't count), and an unblocked parent.
 tasks += [
-    dict(title="Ship v2 release", created_at=ago(days=6), updated_at=ago(days=6), notes=[]),  # 6
+    # Folded, but its subtask "Update docs" stays listed: it's on the board.
+    dict(title="Ship v2 release", created_at=ago(days=6), updated_at=ago(days=6), folded=True, notes=[]),  # 6
     dict(title="Update docs", parent=6, created_at=ago(days=6), updated_at=ago(days=1), notes=[
         note("Waiting on screenshots from design", ago(days=1), ago(days=1), starred=True),
     ]),  # 7

@@ -1,4 +1,4 @@
-"""Drive the its4tasks X window: xt.py id | move X Y | click X Y [button] | type TEXT | key NAME [shift] | shot PATH
+"""Drive the its4tasks X window: xt.py id | move X Y | click X Y [button] | drag X1 Y1 X2 Y2 | type TEXT | key NAME [shift] | shot PATH
 
 Coordinates are relative to the window (same as a `shot` image).
 """
@@ -88,6 +88,19 @@ elif cmd == "click":
     x11.XFlush(d)
     time.sleep(0.05)
     xt.XTestFakeButtonEvent(d, b, 0, 0)
+    x11.XFlush(d)
+    time.sleep(0.3)
+elif cmd == "drag":
+    x1, y1, x2, y2 = map(int, args[:4])
+    move(x1, y1)
+    xt.XTestFakeButtonEvent(d, 1, 1, 0)
+    x11.XFlush(d)
+    time.sleep(0.1)
+    # In steps, so egui sees the drag start and the hover over the target.
+    for i in range(1, 11):
+        move(x1 + (x2 - x1) * i // 10, y1 + (y2 - y1) * i // 10)
+    time.sleep(0.2)
+    xt.XTestFakeButtonEvent(d, 1, 0, 0)
     x11.XFlush(d)
     time.sleep(0.3)
 elif cmd == "type":

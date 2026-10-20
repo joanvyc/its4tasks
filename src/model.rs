@@ -149,6 +149,9 @@ pub struct Task {
     /// The task this is a subtask of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<u64>,
+    /// Its subtasks are hidden in the task list (unless on the board).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folded: bool,
 }
 
 impl Task {
@@ -258,6 +261,11 @@ impl Task {
             note.blocker = None;
             note.blocked_at = None;
         }
+    }
+
+    /// Doesn't count as an update.
+    pub fn toggle_fold(&mut self) {
+        self.folded = !self.folded;
     }
 
     /// Doesn't count as an update.
@@ -557,6 +565,7 @@ impl Board {
             created_at: Some(now),
             done_at: None,
             parent,
+            folded: false,
         };
         task.post(first_note, MessageKind::Comment, now);
         self.tasks.push(task);
@@ -688,7 +697,8 @@ impl Board {
     }
 
     /// The task list: tasks in tree order with their depth. A task shows if it
-    /// passes `shown_in_list`, or if one of its subtasks shows.
+    /// passes `shown_in_list`, or if one of its subtasks shows. Below a folded
+    /// task only subtasks on the board pass; folds don't apply while filtering.
     pub fn list_rows(&self, filter: &str, hide_closed: bool) -> Vec<(u64, usize)> {
         fn visit(
             board: &Board,
@@ -696,21 +706,38 @@ impl Board {
             depth: usize,
             filter: &str,
             hide_closed: bool,
+            folded_above: bool,
             rows: &mut Vec<(u64, usize)>,
         ) {
             let at = rows.len();
+            let folded = folded_above || (task.folded && filter.trim().is_empty());
             for child in board.children(task.id) {
-                visit(board, child, depth + 1, filter, hide_closed, rows);
+                visit(board, child, depth + 1, filter, hide_closed, folded, rows);
             }
-            if rows.len() > at || shown_in_list(task, filter, hide_closed) {
+            let passes = shown_in_list(task, filter, hide_closed)
+                && (!folded_above || board.slot_of(task.id).is_some());
+            if rows.len() > at || passes {
                 rows.insert(at, (task.id, depth));
             }
         }
         let mut rows = Vec::new();
         for task in self.tasks.iter().filter(|t| t.parent.is_none()) {
-            visit(self, task, 0, filter, hide_closed, &mut rows);
+            visit(self, task, 0, filter, hide_closed, false, &mut rows);
         }
         rows
+    }
+
+    /// How many subtasks, at any depth, a fold keeps out of `rows` (as built
+    /// by `list_rows` with no filter).
+    pub fn hidden_subtasks(&self, id: u64, rows: &[(u64, usize)], hide_closed: bool) -> usize {
+        self.descendants(id)
+            .into_iter()
+            .filter(|d| {
+                self.task(*d)
+                    .is_some_and(|t| shown_in_list(t, "", hide_closed))
+                    && !rows.iter().any(|(r, _)| r == d)
+            })
+            .count()
     }
 
     /// Whether the comment can move from one task to another, and if so which
@@ -928,6 +955,7 @@ mod tests {
             created_at: None,
             done_at: None,
             parent: None,
+            folded: false,
         };
         t.post("send to Alice", MessageKind::Comment, Utc::now());
         assert!(matches_filter(&t, ""));
@@ -1347,6 +1375,42 @@ mod tests {
         b.task_mut(2).unwrap().set_done(true, Utc::now());
         // 0 is closed but stays to hold its open subtasks.
         assert_eq!(b.list_rows("", true), [(0, 0), (1, 1), (3, 2), (4, 0)]);
+    }
+
+    #[test]
+    fn folding_hides_subtasks_except_those_on_the_board() {
+        let mut b = tree();
+        b.task_mut(0).unwrap().toggle_fold();
+        let rows = b.list_rows("", false);
+        assert_eq!(rows, [(0, 0), (4, 0)]);
+        assert_eq!(b.hidden_subtasks(0, &rows, false), 3);
+        // A focused subtask stays, with the path down to it.
+        b.focus(3);
+        let rows = b.list_rows("", false);
+        assert_eq!(rows, [(0, 0), (1, 1), (3, 2), (4, 0)]);
+        assert_eq!(b.hidden_subtasks(0, &rows, false), 1);
+        // Folding a leaf changes nothing.
+        b.task_mut(4).unwrap().toggle_fold();
+        assert_eq!(b.list_rows("", false), rows);
+    }
+
+    #[test]
+    fn filtering_ignores_folds() {
+        let mut b = tree();
+        b.task_mut(0).unwrap().toggle_fold();
+        assert_eq!(b.list_rows("task 2", false), [(0, 0), (2, 1)]);
+        assert_eq!(b.list_rows("  ", false), [(0, 0), (4, 0)]);
+    }
+
+    #[test]
+    fn folded_round_trips_and_old_files_load_unfolded() {
+        let mut b = tree();
+        b.task_mut(1).unwrap().toggle_fold();
+        let json = serde_json::to_string(&b).unwrap();
+        let back: Board = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
+        let t: Task = serde_json::from_str(r#"{"id":0,"title":"t"}"#).unwrap();
+        assert!(!t.folded);
     }
 
     #[test]

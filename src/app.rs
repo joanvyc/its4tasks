@@ -255,6 +255,25 @@ fn comment_menu_items(
     }
 }
 
+/// A small triangle pointing right when folded, down when not. Painted so it
+/// sits on the row's center line, unlike a ▸/▾ glyph.
+fn fold_arrow(center: egui::Pos2, folded: bool, color: Color32) -> Shape {
+    let points = if folded {
+        [
+            Vec2::new(-2.5, -4.0),
+            Vec2::new(3.5, 0.0),
+            Vec2::new(-2.5, 4.0),
+        ]
+    } else {
+        [
+            Vec2::new(-4.0, -2.5),
+            Vec2::new(4.0, -2.5),
+            Vec2::new(0.0, 3.5),
+        ]
+    };
+    Shape::convex_polygon(points.map(|p| center + p).to_vec(), color, Stroke::NONE)
+}
+
 /// What the delete confirmation says will go.
 fn delete_prompt(task: &Task, subtasks: usize) -> String {
     let plural = |n: usize, what: &str| match n {
@@ -908,8 +927,15 @@ impl TodoApp {
                 ui.add_space(8.0);
                 ui.weak("No tasks yet. Press + to create one.");
             }
-            for (id, depth) in shown {
+            for &(id, depth) in &shown {
                 let slot = self.board.slot_of(id);
+                let has_subtasks = self.board.children(id).next().is_some();
+                // Only shown while folds apply, i.e. without a filter.
+                let hidden = self
+                    .board
+                    .task(id)
+                    .filter(|t| t.folded && self.filter.trim().is_empty())
+                    .map(|_| self.board.hidden_subtasks(id, &shown, self.hide_closed));
                 // Read from the whole board before borrowing the task mutably.
                 let blocker = self
                     .board
@@ -952,6 +978,26 @@ impl TodoApp {
                             task.set_done(done, now);
                             self.dirty = true;
                         }
+                        // Kept for tasks without subtasks too, so titles line up.
+                        let (arrow, _) =
+                            ui.allocate_exact_size(Vec2::new(12.0, 16.0), Sense::hover());
+                        let mut toggle_fold = false;
+                        if has_subtasks {
+                            let response = ui
+                                .interact(arrow, Id::unique(("fold", id)), Sense::click())
+                                .on_hover_text(if task.folded {
+                                    "Unfold subtasks"
+                                } else {
+                                    "Fold subtasks"
+                                });
+                            toggle_fold |= response.clicked();
+                            let color = if response.hovered() {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            ui.painter().add(fold_arrow(arrow.center(), task.folded, color));
+                        }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if slot.is_some() {
                                 // Painted rather than a "●" glyph, which sits on the text
@@ -972,24 +1018,42 @@ impl TodoApp {
                             }
                             // Always laid out, so titles don't reflow on hover.
                             task_menu(ui, id, is_subtask, row_hovered, actions);
+                            if let Some(n) = hidden.filter(|n| *n > 0) {
+                                let plural = if n == 1 { "" } else { "s" };
+                                ui.label(RichText::new(n.to_string()).small().weak())
+                                    .on_hover_text(format!("{n} subtask{plural} hidden"));
+                            }
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 let mut text = RichText::new(&task.title);
                                 if task.done {
                                     text = text.strikethrough().weak();
                                 }
-                                let label = ui
-                                    .dnd_drag_source(Id::unique(("task", id)), id, |ui| {
-                                        ui.add(Label::new(text).truncate().selectable(false))
-                                    })
-                                    .response
-                                    .on_hover_text(
-                                        "Drag onto a card to focus, or onto a task to make it a subtask",
-                                    );
+                                let drag_id = Id::unique(("task", id));
+                                let dragged = ui.dnd_drag_source(drag_id, id, |ui| {
+                                    ui.add(Label::new(text).truncate().selectable(false))
+                                });
+                                let mut response = dragged.response;
+                                if has_subtasks {
+                                    // Same id as the drag source, so egui merges the senses:
+                                    // a press without moving is a click, else a drag.
+                                    response = ui.interact(response.rect, drag_id, Sense::click());
+                                    toggle_fold |= response.clicked();
+                                }
+                                let hint = if has_subtasks {
+                                    "Click to fold or unfold · drag onto a card to focus, or onto a task to make it a subtask"
+                                } else {
+                                    "Drag onto a card to focus, or onto a task to make it a subtask"
+                                };
+                                let label = response.on_hover_text(hint);
                                 label.context_menu(|ui| {
                                     task_menu_items(ui, id, is_subtask, actions);
                                 });
                             });
                         });
+                        if toggle_fold {
+                            task.toggle_fold();
+                            self.dirty = true;
+                        }
                     })
                 });
                 let rect = shown.response.rect;

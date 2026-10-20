@@ -1,9 +1,11 @@
 // Signs the web GUI in with Clerk (https://clerk.com). Clerk's own script
 // keeps the session going and hands out short-lived session tokens, which
 // the GUI asks for before each request:
-//   its4tasksAuth.token(): a Promise of a fresh token, or null if signed out.
+//   its4tasksAuth.token({ fresh }): a Promise of a token, or null if there's
+//   no session; `fresh` skips Clerk's cache, for retrying after a refusal.
 //   its4tasksAuth.signIn(): sends the browser to Clerk's sign-in page, and
-//   back here afterwards.
+//   back here afterwards. Only on the user's say-so: Clerk can briefly have
+//   no session while it renews one.
 // The server fills in the two constants below.
 window.its4tasksAuth = (() => {
   const frontendApi = __FRONTEND_API__;
@@ -18,9 +20,20 @@ window.its4tasksAuth = (() => {
     document.head.appendChild(script);
   });
   return {
-    async token() {
+    async token({ fresh = false } = {}) {
       const clerk = await ready;
-      return clerk.session ? await clerk.session.getToken() : null;
+      if (!clerk.session) {
+        console.warn("its4tasks: Clerk has no session");
+        return null;
+      }
+      try {
+        const token = await clerk.session.getToken({ skipCache: fresh });
+        if (!token) console.warn("its4tasks: Clerk gave no session token");
+        return token || null;
+      } catch (e) {
+        console.warn("its4tasks: getting a session token from Clerk failed:", e);
+        return null;
+      }
     },
     async signIn() {
       const clerk = await ready;

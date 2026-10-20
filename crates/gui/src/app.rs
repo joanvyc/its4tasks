@@ -1807,8 +1807,16 @@ impl TodoApp {
                 if theme != before {
                     ui.ctx().set_theme(theme);
                 }
-                let problem = if self.api.unauthorized() {
-                    Some("Signed out".to_owned())
+                // Refusals while a token is renewed are retried quietly; only
+                // a lasting one is shown. Unsent changes are kept meanwhile.
+                let problem = if self.api.signed_out() {
+                    #[cfg(target_arch = "wasm32")]
+                    if ui.button("Sign in again").clicked() {
+                        crate::client::sign_in_again();
+                    }
+                    Some("Signed out. Your unsent changes are kept.".to_owned())
+                } else if self.api.unauthorized() {
+                    None
                 } else {
                     match (self.api.error(), &self.import_error, self.api.notice()) {
                         (Some(e), _, _) => Some(format!("Can't reach the server: {e}")),
@@ -2061,17 +2069,6 @@ impl eframe::App for TodoApp {
         self.api.poll();
         self.api.refresh();
         self.poll_import();
-        // In the browser, signing in again is the server's job: reloading
-        // the page sends the user to the authority. Only once the board
-        // has loaded, though: a page that's refused from the start would
-        // just be served again, and reload forever.
-        #[cfg(target_arch = "wasm32")]
-        if self.api.unauthorized()
-            && self.api.loaded()
-            && let Some(window) = web_sys::window()
-        {
-            let _ = window.location().reload();
-        }
         if self.api.loaded() && !self.api.started() {
             self.landing(ui);
             self.apply(Vec::new());

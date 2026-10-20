@@ -17,12 +17,14 @@
 //!   `GET /v1/client/token` for its tokens: signing in also sets a
 //!   long-lived `__client` cookie, and that gets fresh tokens, as a Clerk
 //!   session does. Point `$ITS4TASKS_CLERK_FRONTEND_API` at dev-auth to try
-//!   its4tasks-server's Clerk support.
+//!   its4tasks-server's Clerk support. `POST /v1/client/revoke?sub=…` cuts
+//!   a subject's session off, as signing out elsewhere would, and
+//!   `POST /v1/client/restore?sub=…` brings it back.
 //!
 //! Listens on `$ITS4TASKS_DEV_AUTH_ADDR`, by default 127.0.0.1:7980.
 //! Tokens last `$ITS4TASKS_DEV_AUTH_TTL` seconds, by default an hour.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Query, State};
@@ -56,6 +58,8 @@ struct Authority {
     codes: Mutex<HashMap<String, Grant>>,
     /// Refresh tokens, by token, with the subject they're for.
     refresh: Mutex<HashMap<String, String>>,
+    /// Subjects whose mock Clerk session is cut off for now.
+    revoked: Mutex<HashSet<String>>,
 }
 
 /// What an authorization code stands for.
@@ -90,6 +94,8 @@ fn app(authority: Authority) -> Router {
             get(clerk_js),
         )
         .route("/v1/client/token", get(client_token))
+        .route("/v1/client/revoke", axum::routing::post(revoke))
+        .route("/v1/client/restore", axum::routing::post(restore))
         .with_state(Arc::new(authority))
 }
 
@@ -106,6 +112,7 @@ async fn main() {
         key: EncodingKey::from_rsa_pem(KEY).expect("the dev key parses"),
         codes: Mutex::new(HashMap::new()),
         refresh: Mutex::new(HashMap::new()),
+        revoked: Mutex::new(HashSet::new()),
     };
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -194,11 +201,28 @@ async fn client_token(State(a): State<Shared>, headers: HeaderMap) -> Response {
         (header::VARY, "Origin".to_owned()),
     ];
     match cookie(&headers, CLIENT_COOKIE) {
-        Some(sub) if sub.starts_with("user_") => {
+        Some(sub) if sub.starts_with("user_") && !a.revoked.lock().unwrap().contains(&sub) => {
             (cors, Json(json!({ "jwt": a.token(&sub) }))).into_response()
         }
         _ => (cors, StatusCode::UNAUTHORIZED).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct SubjectQuery {
+    sub: String,
+}
+
+/// Cuts a subject's mock Clerk session off, for testing signing out.
+async fn revoke(State(a): State<Shared>, Query(q): Query<SubjectQuery>) -> StatusCode {
+    a.revoked.lock().unwrap().insert(q.sub);
+    StatusCode::NO_CONTENT
+}
+
+/// Undoes `revoke`.
+async fn restore(State(a): State<Shared>, Query(q): Query<SubjectQuery>) -> StatusCode {
+    a.revoked.lock().unwrap().remove(&q.sub);
+    StatusCode::NO_CONTENT
 }
 
 /// The cookie called `name`, if the request carries it.
@@ -432,6 +456,7 @@ mod tests {
             key: EncodingKey::from_rsa_pem(KEY).unwrap(),
             codes: Mutex::new(HashMap::new()),
             refresh: Mutex::new(HashMap::new()),
+            revoked: Mutex::new(HashSet::new()),
         })
     }
 
@@ -506,6 +531,15 @@ mod tests {
             "user_bob"
         );
         assert_eq!(send(&app, ask(None)).await.0, StatusCode::UNAUTHORIZED);
+        // Cut off, then back.
+        let post = |path: &str| Request::post(path).body(Body::empty()).unwrap();
+        send(&app, post("/v1/client/revoke?sub=user_bob")).await;
+        assert_eq!(
+            send(&app, ask(Some(&client))).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        send(&app, post("/v1/client/restore?sub=user_bob")).await;
+        assert_eq!(send(&app, ask(Some(&client))).await.0, StatusCode::OK);
         let (status, _, script) = send(
             &app,
             Request::get("/npm/@clerk/clerk-js@6/dist/clerk.browser.js")

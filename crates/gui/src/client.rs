@@ -29,6 +29,10 @@ pub const DEFAULT_SERVER: &str = "http://127.0.0.1:7878";
 /// (say, the same board open in a browser).
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
+/// How long the server must keep refusing before the user counts as signed
+/// out. Shorter refusals happen while a token is renewed, and are retried.
+const SIGNED_OUT_AFTER: Duration = Duration::from_secs(10);
+
 /// How long a request may take before the server counts as unreachable.
 /// Native only: in the browser a request takes as long as it takes.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
@@ -105,8 +109,11 @@ pub struct Client {
     /// Whether the server has answered at all, so `board` and `started`
     /// are its.
     loaded: bool,
-    /// The server's last answer was that nobody's signed in.
+    /// The server's last answer was that nobody's signed in. Requests wait
+    /// in `queue` meanwhile, and are retried with a fresh token.
     unauthorized: bool,
+    /// Since when the server has been refusing, for `signed_out`.
+    unauthorized_since: Option<Instant>,
     /// Counts the tokens set, so that a refusal of an earlier one isn't
     /// taken for a refusal of this one.
     token_gen: u64,
@@ -157,6 +164,7 @@ impl Client {
             started: true,
             loaded: false,
             unauthorized: false,
+            unauthorized_since: None,
             token_gen: 0,
             next_seq: 0,
             fetching: false,
@@ -182,19 +190,30 @@ impl Client {
         self.loaded
     }
 
-    /// Whether the server's last answer was that nobody's signed in. Sign
-    /// in again (`set_token`, or in the browser, reload the page).
+    /// Whether the server's last answer was that nobody's signed in.
+    /// Requests are held until a new token (`set_token`, or in the browser,
+    /// the page's) works.
     pub fn unauthorized(&self) -> bool {
         self.unauthorized
     }
 
+    /// Whether the server has refused for long enough that the user must
+    /// have been signed out, rather than a token being renewed.
+    pub fn signed_out(&self) -> bool {
+        self.unauthorized
+            && self
+                .unauthorized_since
+                .is_some_and(|since| since.elapsed() >= SIGNED_OUT_AFTER)
+    }
+
     /// Sends `token` as the bearer token from now on, say after it was
-    /// refreshed.
+    /// refreshed, and sends what was held for want of one.
     pub fn set_token(&mut self, token: Option<String>) {
         self.token = token;
         self.token_gen += 1;
         // The server hasn't seen this one yet.
         self.unauthorized = false;
+        self.next_request(false);
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -236,9 +255,22 @@ impl Client {
         }
     }
 
-    /// Fetches the board if it hasn't been fetched for a while.
+    /// Fetches the board if it hasn't been fetched for a while. While the
+    /// server refuses, retries instead, with a fresh token in the browser.
     pub fn refresh(&mut self) {
-        if !self.fetching && self.fetched.elapsed() >= REFRESH_EVERY {
+        if self.fetched.elapsed() < REFRESH_EVERY {
+            return;
+        }
+        if self.unauthorized {
+            if !self.in_flight {
+                self.fetched = Instant::now();
+                if self.queue.is_empty() {
+                    self.fetching = true;
+                    self.queue.push_back(Request::Fetch);
+                }
+                self.next_request(true);
+            }
+        } else if !self.fetching {
             self.fetch();
         }
     }
@@ -271,12 +303,14 @@ impl Client {
 
     fn send(&mut self, request: Request) {
         self.queue.push_back(request);
-        self.next_request();
+        self.next_request(false);
     }
 
-    /// Sends the next queued request, unless one is still on its way.
-    fn next_request(&mut self) {
-        if self.in_flight {
+    /// Sends the next queued request, unless one is still on its way or the
+    /// server is refusing. `retry` sends it anyway, as a retry after a
+    /// refusal, which in the browser asks the page for a fresh token.
+    fn next_request(&mut self, retry: bool) {
+        if self.in_flight || (self.unauthorized && !retry) {
             return;
         }
         let Some(request) = self.queue.pop_front() else {
@@ -294,13 +328,13 @@ impl Client {
         match request {
             Request::Fetch => {
                 let url = format!("{}/api/board", self.url);
-                call(url, None, token, timeout, move |reply| {
+                call(url, None, token, retry, timeout, move |reply| {
                     answer(Response::Fetched(board_from(reply)));
                 });
             }
             Request::Send(seq, change) => {
                 let url = format!("{}/api/changes", self.url);
-                call(url, Some(change), token, timeout, move |reply| {
+                call(url, Some(change), token, retry, timeout, move |reply| {
                     answer(Response::Sent(seq, answer_from(reply)));
                 });
             }
@@ -313,6 +347,14 @@ impl Client {
     fn take(&mut self, (token_gen, response): (u64, Response)) {
         self.in_flight = false;
         match response {
+            // The server didn't apply it: hold it, and send it again once
+            // signed in.
+            Response::Sent(seq, Err(ClientError::Unauthorized)) => {
+                if let Some(p) = self.pending.iter().find(|p| p.seq == seq) {
+                    self.queue.push_front(Request::Send(seq, p.change.clone()));
+                }
+                self.failed(ClientError::Unauthorized, token_gen);
+            }
             Response::Sent(seq, result) => {
                 self.pending.retain(|p| p.seq != seq);
                 match result {
@@ -347,18 +389,24 @@ impl Client {
                 }
             }
         }
-        self.next_request();
+        self.next_request(false);
     }
 
     fn answered(&mut self) {
         self.loaded = true;
         self.error = None;
         self.unauthorized = false;
+        self.unauthorized_since = None;
     }
 
     fn failed(&mut self, e: ClientError, token_gen: u64) {
-        self.unauthorized = e == ClientError::Unauthorized && token_gen == self.token_gen;
-        self.error = Some(e.to_string());
+        if e != ClientError::Unauthorized {
+            self.error = Some(e.to_string());
+        } else if token_gen == self.token_gen {
+            // A refusal of an earlier token says nothing of this one.
+            self.unauthorized = true;
+            self.unauthorized_since.get_or_insert_with(Instant::now);
+        }
     }
 
     /// The server's board with the changes still on their way on top.
@@ -391,6 +439,7 @@ fn call(
     url: String,
     change: Option<Change>,
     token: Option<String>,
+    _retry: bool,
     timeout: Duration,
     done: impl FnOnce(Result<Reply, String>) + Send + 'static,
 ) {
@@ -429,12 +478,14 @@ fn call(
 /// GETs `url`, or POSTs `change` to it as JSON, with the browser's
 /// `fetch()`, and hands the reply to `done` when it arrives. It's signed in
 /// with the page's token if the page has a way to get one (see
-/// `page_token`), and otherwise with the session cookie.
+/// `page_token`; a fresh one for a `retry`), and otherwise with the session
+/// cookie.
 #[cfg(target_arch = "wasm32")]
 fn call(
     url: String,
     change: Option<Change>,
     _token: Option<String>,
+    retry: bool,
     _timeout: Duration,
     done: impl FnOnce(Result<Reply, String>) + Send + 'static,
 ) {
@@ -445,7 +496,7 @@ fn call(
     // ehttp leaves cookies out unless told, unlike the browser's fetch().
     let mut request = request.with_credentials(ehttp::Credentials::SameOrigin);
     wasm_bindgen_futures::spawn_local(async move {
-        match page_token().await {
+        match page_token(retry).await {
             Err(e) => return done(Err(e)),
             Ok(PageToken::Cookie) => {}
             Ok(PageToken::Bearer(token)) => {
@@ -453,7 +504,7 @@ fn call(
                     .headers
                     .insert("Authorization", format!("Bearer {token}"));
             }
-            // On its way to sign in.
+            // Held like a refusal, and retried.
             Ok(PageToken::SignedOut) => {
                 return done(Ok(Reply {
                     status: 401,
@@ -462,6 +513,11 @@ fn call(
             }
         }
         let response = ehttp::fetch_async(request).await;
+        if let Ok(r) = &response
+            && r.status == 401
+        {
+            warn("its4tasks: the server refused the token; retrying with a fresh one");
+        }
         done(response.map(|r| Reply {
             status: r.status,
             body: r.bytes,
@@ -475,42 +531,78 @@ enum PageToken {
     /// With the session cookie: the page has no `its4tasksAuth`.
     Cookie,
     Bearer(String),
-    /// Nobody is: the browser has been sent to sign in.
+    /// Nobody is, for now.
     SignedOut,
 }
 
-/// A token from the page's `window.its4tasksAuth`, which the server adds
-/// for sign-in services that keep tokens fresh in the page, such as Clerk:
-/// `token()` gives a promise of a fresh token, or of null when signed out,
-/// and `signIn()` goes to sign in.
 #[cfg(target_arch = "wasm32")]
-async fn page_token() -> Result<PageToken, String> {
+fn warn(message: &str) {
+    web_sys::console::warn_1(&message.into());
+}
+
+/// The page's `window.its4tasksAuth`, which the server adds for sign-in
+/// services that keep tokens fresh in the page, such as Clerk: `token({
+/// fresh })` gives a promise of a token (a new one if `fresh`), or of null
+/// when signed out, and `signIn()` goes to sign in.
+#[cfg(target_arch = "wasm32")]
+fn page_auth() -> Option<eframe::wasm_bindgen::JsValue> {
+    let window = web_sys::window()?;
+    let auth = js_sys::Reflect::get(&window, &"its4tasksAuth".into()).ok()?;
+    (!auth.is_undefined() && !auth.is_null()).then_some(auth)
+}
+
+/// A token from the page's `its4tasksAuth`, if it has one. Never sends the
+/// browser away: signing in again is the user's call (`sign_in_again`).
+#[cfg(target_arch = "wasm32")]
+async fn page_token(fresh: bool) -> Result<PageToken, String> {
     use eframe::wasm_bindgen::{JsCast, JsValue};
-    use js_sys::{Function, Promise, Reflect};
+    use js_sys::{Function, Object, Promise, Reflect};
 
     let failed = |e: JsValue| format!("signing in: {e:?}");
-    let window = web_sys::window().ok_or("no window")?;
-    let auth = Reflect::get(&window, &"its4tasksAuth".into()).map_err(failed)?;
-    if auth.is_undefined() || auth.is_null() {
+    let Some(auth) = page_auth() else {
         return Ok(PageToken::Cookie);
-    }
-    let call = |name: &str| -> Result<JsValue, String> {
-        let method: Function = Reflect::get(&auth, &name.into())
-            .map_err(failed)?
-            .dyn_into()
-            .map_err(failed)?;
-        method.call0(&auth).map_err(failed)
     };
-    let promise: Promise = call("token")?.dyn_into().map_err(failed)?;
+    let token: Function = Reflect::get(&auth, &"token".into())
+        .map_err(failed)?
+        .dyn_into()
+        .map_err(failed)?;
+    let options = Object::new();
+    Reflect::set(&options, &"fresh".into(), &fresh.into()).map_err(failed)?;
+    let promise: Promise = token
+        .call1(&auth, &options)
+        .map_err(failed)?
+        .dyn_into()
+        .map_err(failed)?;
     let token = wasm_bindgen_futures::JsFuture::from(promise)
         .await
         .map_err(failed)?;
     match token.as_string() {
         Some(token) => Ok(PageToken::Bearer(token)),
         None => {
-            call("signIn")?;
+            warn("its4tasks: no session token from the page; retrying");
             Ok(PageToken::SignedOut)
         }
+    }
+}
+
+/// Sends the browser to sign in again: through the page's `its4tasksAuth`,
+/// or by reloading, for the server to send it there.
+#[cfg(target_arch = "wasm32")]
+pub fn sign_in_again() {
+    use eframe::wasm_bindgen::JsCast;
+    use js_sys::{Function, Reflect};
+
+    let sign_in = page_auth().and_then(|auth| {
+        let method: Function = Reflect::get(&auth, &"signIn".into())
+            .ok()?
+            .dyn_into()
+            .ok()?;
+        method.call0(&auth).ok()
+    });
+    if sign_in.is_none()
+        && let Some(window) = web_sys::window()
+    {
+        let _ = window.location().reload();
     }
 }
 

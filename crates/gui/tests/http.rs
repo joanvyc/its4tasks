@@ -75,6 +75,29 @@ fn changes_show_at_once_and_reach_the_server() {
 }
 
 #[test]
+fn changes_wait_for_a_working_token() {
+    let url = start();
+    let mut a = Client::new(&url, Some("expired".into()), WAIT, || {});
+    a.flush(WAIT);
+    assert!(a.unauthorized());
+    // Briefly refused, as while a token is renewed: not signed out yet.
+    assert!(!a.signed_out());
+    let id = add(&mut a, "Written while refused");
+    assert!(!a.flush(Duration::from_millis(300)), "held, not sent");
+    assert!(a.board().task(id).is_some(), "still shown");
+    assert!(client(&url).board().task(id).is_none());
+
+    a.set_token(Some(SECRET.into()));
+    assert!(a.flush(WAIT));
+    assert!(!a.unauthorized());
+    let server = client(&url);
+    assert_eq!(
+        server.board().tasks.iter().filter(|t| t.id == id).count(),
+        1
+    );
+}
+
+#[test]
 fn a_refused_change_is_undone() {
     let url = start();
     let mut a = client(&url);

@@ -1,10 +1,12 @@
 # Agent notes for its4tasks
 
-its4tasks is an egui/eframe desktop todo app: four focus cards plus a task list, with a daily/weekly log view. The code is in `src/`:
+its4tasks is an egui/eframe desktop todo app: four focus cards plus a task list, with a daily/weekly log view. It runs as two binaries: `its4tasks-server` keeps the board and serves it over HTTP, and the `its4tasks` GUI is a client of it. The code is in `src/`:
 - `model.rs`: data and rules
 - `log.rs`: log grouping
-- `api.rs`: the only way the UI reaches the model. It reads a `&Board` and sends serializable `Change`s to `Api::apply`, which also saves. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4), and changes address comments by id, never by position
-- `app.rs`: UI
+- `api.rs`: the only way to change the board. Clients read a `Board` and send serializable `Change`s, which `Api::apply` applies and saves. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4), and changes address comments by id, never by position
+- `server.rs` and `bin/its4tasks-server.rs`: `Api` over HTTP (`GET /board`, `POST /changes`). Listens on `$ITS4TASKS_ADDR`, by default `127.0.0.1:7878`
+- `client.rs`: the GUI's side. It keeps the last board the server sent and sends changes with blocking requests. Talks to `$ITS4TASKS_SERVER`, by default `http://127.0.0.1:7878`
+- `main.rs` and `app.rs`: the GUI
 - `storage/`: SQLite persistence through sea-orm (entities, migrations, and a diff so a save writes only what changed), plus a one-time import of the old `board.json`
 
 ## Checks
@@ -26,13 +28,17 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    ```
    The seed writes a `board.json`, which the app imports on launch. It covers about 12 days of history: open and resolved blockers, starred comments, a done task, and fresh and stale tasks. Extend it when a change needs other cases.
 
-2. **Run the app under XWayland so X11 tools can see it.** `import` and `tools/xt.py` only work with X11 windows.
+2. **Start the server, then the GUI under XWayland so X11 tools can see it.** `import` and `tools/xt.py` only work with X11 windows. Use a port other than the default 7878, so a real server or GUI the user has open never meets the test data.
    ```sh
    cargo build
-   env -u WAYLAND_DISPLAY XDG_DATA_HOME="$DATA" ./target/debug/its4tasks &
+   ITS4TASKS_ADDR=127.0.0.1:7979 XDG_DATA_HOME="$DATA" ./target/debug/its4tasks-server &
+   SERVER=$!
+   sleep 1
+   ITS4TASKS_SERVER=http://127.0.0.1:7979 env -u WAYLAND_DISPLAY ./target/debug/its4tasks &
    APP=$!
    sleep 2.5
    ```
+   `curl -s 127.0.0.1:7979/board` shows what the server holds. A change POSTed with curl, as another client would, shows up in the GUI within about 2 s.
 
 3. **Screenshot and look at the result:**
    ```sh
@@ -51,7 +57,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    ```
    The first pointer event after launch only tells egui where the pointer is. Move the pointer once before testing hover.
 
-5. **Rebuild before each look, and stop the app when done.** `cargo clippy` doesn't produce a new binary, so run `cargo build` before relaunching. When finished, run `kill $APP`. Don't use `pkill`: the user may have their real instance open.
+5. **Rebuild before each look, and stop the app when done.** `cargo clippy` doesn't produce a new binary, so run `cargo build` before relaunching. When finished, run `kill $APP $SERVER`. Don't use `pkill`: the user may have their real instance open.
 
 Check for:
 - overlapping or clipped widgets

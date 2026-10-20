@@ -9,7 +9,8 @@ use eframe::egui::{
     text::{CCursor, LayoutJob},
 };
 
-use crate::api::{Api, Change};
+use crate::api::Change;
+use crate::client::Client;
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
@@ -896,8 +897,9 @@ enum View {
 }
 
 pub struct TodoApp {
-    /// The board is only read through `api.board()` and changed through `api.apply`.
-    api: Api,
+    /// The board is only read through `api.board()` and changed through
+    /// `api.apply`, which go to the server.
+    api: Client,
     filter: String,
     new_task: Option<NewTaskDraft>,
     /// The task waiting for the user to confirm its deletion.
@@ -923,7 +925,7 @@ impl TodoApp {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(Theme::Light);
         Self {
-            api: Api::open(),
+            api: Client::connect(),
             filter: String::new(),
             new_task: None,
             confirm_delete: None,
@@ -1667,6 +1669,11 @@ impl TodoApp {
                 if theme != before {
                     ui.ctx().set_theme(theme);
                 }
+                if let Some(e) = self.api.error() {
+                    let text = RichText::new(format!("Can't reach the server: {e}"))
+                        .color(palette(ui.visuals()).blocker);
+                    ui.add(Label::new(text).truncate());
+                }
             });
         });
         ui.add_space(6.0);
@@ -1913,6 +1920,7 @@ impl TodoApp {
 
 impl eframe::App for TodoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.api.refresh();
         let mut actions = Vec::new();
         Panel::right("task_list")
             .resizable(true)
@@ -1931,6 +1939,7 @@ impl eframe::App for TodoApp {
         self.move_modal(&ui.ctx().clone());
         self.apply(actions);
         // Keep the freshness colors drifting while the app sits idle.
-        ui.ctx().request_repaint_after(Duration::from_secs(60));
+        // Also fetches other clients' changes, through `refresh`.
+        ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
 }

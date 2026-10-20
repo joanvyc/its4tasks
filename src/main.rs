@@ -1,8 +1,9 @@
-mod api;
+//! The its4tasks GUI. It shows the board kept by `its4tasks-server`, at
+//! `$ITS4TASKS_SERVER` (by default http://127.0.0.1:7878).
+
 mod app;
-mod log;
-mod model;
-mod storage;
+
+use its4tasks::{api, client, log, model};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

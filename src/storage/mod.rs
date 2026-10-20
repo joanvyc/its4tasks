@@ -20,7 +20,6 @@ use sea_orm::{
     DbErr, EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
-use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use crate::model::{Board, Note, SLOT_COUNT};
@@ -36,8 +35,6 @@ fn data_dir() -> Option<PathBuf> {
 }
 
 pub struct Store {
-    /// sea-orm is async; the app isn't, so every call blocks on this.
-    rt: Runtime,
     db: DatabaseConnection,
     /// What the database holds, to diff the next save against.
     saved: Board,
@@ -46,34 +43,28 @@ pub struct Store {
 impl Store {
     /// Opens (or creates) the database in the data directory, importing the
     /// old `board.json` the first time.
-    pub fn open() -> Result<Store, DbErr> {
+    pub async fn open() -> Result<Store, DbErr> {
         let dir = data_dir()
             .ok_or_else(|| DbErr::Custom("could not determine a data directory".into()))?;
         json::migrate_legacy(&dir.join(json::FILE_NAME));
-        Self::open_in(&dir)
+        Self::open_in(&dir).await
     }
 
-    fn open_in(dir: &Path) -> Result<Store, DbErr> {
+    /// Like `open`, with the database (and `board.json`) in `dir`.
+    pub async fn open_in(dir: &Path) -> Result<Store, DbErr> {
         fs::create_dir_all(dir).map_err(|e| DbErr::Custom(format!("{}: {e}", dir.display())))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| DbErr::Custom(e.to_string()))?;
         let mut options =
             ConnectOptions::new(format!("sqlite://{}?mode=rwc", dir.join(DB_FILE).display()));
         options.sqlx_logging(false);
-        let (db, saved) = rt.block_on(async {
-            let db = Database::connect(options).await?;
-            Migrator::up(&db, None).await?;
-            let saved = read(&db).await?;
-            Ok::<_, DbErr>((db, saved))
-        })?;
-        let mut store = Store { rt, db, saved };
+        let db = Database::connect(options).await?;
+        Migrator::up(&db, None).await?;
+        let saved = read(&db).await?;
+        let mut store = Store { db, saved };
         let json_path = dir.join(json::FILE_NAME);
         if store.saved == Board::default()
             && let Some(board) = json::read(&json_path)
         {
-            store.save(&board)?;
+            store.save(&board).await?;
             json::mark_imported(&json_path);
         }
         Ok(store)
@@ -86,12 +77,12 @@ impl Store {
         board
     }
 
-    pub fn save(&mut self, board: &Board) -> Result<(), DbErr> {
+    pub async fn save(&mut self, board: &Board) -> Result<(), DbErr> {
         let changes = diff(&self.saved, board);
         if changes.is_empty() {
             return Ok(());
         }
-        self.rt.block_on(write(&self.db, &changes))?;
+        write(&self.db, &changes).await?;
         self.saved = board.clone();
         Ok(())
     }
@@ -278,24 +269,29 @@ mod tests {
         b
     }
 
-    fn reopen(dir: &Path) -> Board {
-        Store::open_in(dir).unwrap().load()
+    async fn reopen(dir: &Path) -> Board {
+        Store::open_in(dir).await.unwrap().load()
     }
 
-    #[test]
-    fn round_trips_a_board() {
+    #[tokio::test]
+    async fn round_trips_a_board() {
         let dir = tempfile::tempdir().unwrap();
         let board = sample();
-        Store::open_in(dir.path()).unwrap().save(&board).unwrap();
-        assert_eq!(reopen(dir.path()), board);
+        Store::open_in(dir.path())
+            .await
+            .unwrap()
+            .save(&board)
+            .await
+            .unwrap();
+        assert_eq!(reopen(dir.path()).await, board);
     }
 
-    #[test]
-    fn saves_later_changes() {
+    #[tokio::test]
+    async fn saves_later_changes() {
         let dir = tempfile::tempdir().unwrap();
         let mut board = sample();
-        let mut store = Store::open_in(dir.path()).unwrap();
-        store.save(&board).unwrap();
+        let mut store = Store::open_in(dir.path()).await.unwrap();
+        store.save(&board).await.unwrap();
 
         let now = Utc::now();
         board.tasks[0].notes[1].text = "edited".into();
@@ -304,39 +300,35 @@ mod tests {
         let parent = board.tasks[2].id;
         board.add_task("New subtask".into(), "note", Some(parent), now);
         board.slots[1] = Some(parent);
-        store.save(&board).unwrap();
-        assert_eq!(reopen(dir.path()), board);
+        store.save(&board).await.unwrap();
+        assert_eq!(reopen(dir.path()).await, board);
 
         // Deleting a task takes its subtasks, their notes and slots with it.
         board.delete_task(board.tasks[0].id);
-        store.save(&board).unwrap();
-        assert_eq!(reopen(dir.path()), board);
+        store.save(&board).await.unwrap();
+        assert_eq!(reopen(dir.path()).await, board);
     }
 
-    #[test]
-    fn moved_comments_keep_their_id() {
+    #[tokio::test]
+    async fn moved_comments_keep_their_id() {
         let dir = tempfile::tempdir().unwrap();
         let mut board = sample();
-        let mut store = Store::open_in(dir.path()).unwrap();
-        store.save(&board).unwrap();
+        let mut store = Store::open_in(dir.path()).await.unwrap();
+        store.save(&board).await.unwrap();
         let (from, to) = (board.tasks[0].id, board.tasks[1].id);
         let id = board.tasks[0].notes[3].id;
         board.move_note(from, 3, to).unwrap();
-        store.save(&board).unwrap();
-        let loaded = reopen(dir.path());
+        store.save(&board).await.unwrap();
+        let loaded = reopen(dir.path()).await;
         assert_eq!(loaded, board);
         assert_eq!(loaded.find_note(id).map(|(t, _)| t), Some(to));
     }
 
-    #[test]
-    fn migrating_gives_old_rows_ids() {
+    #[tokio::test]
+    async fn migrating_gives_old_rows_ids() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join(DB_FILE).display());
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
+        {
             let db = Database::connect(url).await.unwrap();
             // The schema before comments and tasks had UUIDs.
             Migrator::up(&db, Some(1)).await.unwrap();
@@ -358,8 +350,8 @@ mod tests {
             .await
             .unwrap();
             db.close().await.unwrap();
-        });
-        let board = reopen(dir.path());
+        }
+        let board = reopen(dir.path()).await;
         let titles: Vec<&str> = board.tasks.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(titles, ["a", "b"]);
         let (a, b) = (&board.tasks[0], &board.tasks[1]);
@@ -381,31 +373,31 @@ mod tests {
         assert_eq!(subtask(&notes[0]), b.id);
         assert!(board.task(subtask(&notes[1])).is_none());
         // The ids are what's stored, not made up on each load.
-        assert_eq!(reopen(dir.path()), board);
+        assert_eq!(reopen(dir.path()).await, board);
     }
 
-    #[test]
-    fn imports_the_json_board_once() {
+    #[tokio::test]
+    async fn imports_the_json_board_once() {
         let dir = tempfile::tempdir().unwrap();
         let json = dir.path().join(json::FILE_NAME);
         let board = sample();
         fs::write(&json, serde_json::to_string(&board).unwrap()).unwrap();
 
-        assert_eq!(reopen(dir.path()), board);
+        assert_eq!(reopen(dir.path()).await, board);
         assert!(!json.exists());
         assert!(dir.path().join("board.json.imported").exists());
 
         // A new JSON file doesn't replace a board that's already there.
         fs::write(&json, serde_json::to_string(&Board::default()).unwrap()).unwrap();
-        assert_eq!(reopen(dir.path()), board);
+        assert_eq!(reopen(dir.path()).await, board);
         assert!(json.exists());
     }
 
-    #[test]
-    fn keeps_an_unreadable_json_board() {
+    #[tokio::test]
+    async fn keeps_an_unreadable_json_board() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(json::FILE_NAME), "{ not json").unwrap();
-        assert_eq!(reopen(dir.path()), Board::default());
+        assert_eq!(reopen(dir.path()).await, Board::default());
         assert!(dir.path().join("board.json.corrupt").exists());
     }
 }

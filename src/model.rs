@@ -477,7 +477,7 @@ impl Task {
 }
 
 /// Why a comment can't move to a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoveError {
     NotFound,
     SameTask,

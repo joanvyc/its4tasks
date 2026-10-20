@@ -5,9 +5,10 @@ open blockers, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, next steps (open,
 done, and one on a blocked task, where red wins), a done task closed
 with a message, tasks of different freshness, and subtasks: a parent blocked
-by its subtasks (focused, with one of them) and one that isn't. Run the app with
-XDG_DATA_HOME=DATA_HOME to load it: the app imports board.json into its
-SQLite database (board.sqlite) on launch, so seed a fresh DATA_HOME.
+by its subtasks (focused, with one of them) and one that isn't. Run
+its4tasks-server with XDG_DATA_HOME=DATA_HOME to load it: the server imports
+board.json into its SQLite database (board.sqlite) on launch, so seed a fresh
+DATA_HOME.
 """
 import datetime as dt
 import json

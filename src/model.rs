@@ -344,9 +344,10 @@ pub enum Command {
 }
 
 /// Names a command can be typed as.
-const COMMANDS: [(&str, Command); 6] = [
+const COMMANDS: [(&str, Command); 7] = [
     ("block", Command::Block),
     ("unblock", Command::Unblock),
+    ("release", Command::Unblock),
     ("close", Command::Close),
     ("star", Command::Star),
     ("sub-task", Command::Subtask),
@@ -1310,6 +1311,10 @@ mod tests {
             t.parse_input("/unblock got it").result,
             Ok(Submit::Post(Some(MessageKind::Unblock), "got it"))
         );
+        assert_eq!(
+            t.parse_input("/release got it").result,
+            Ok(Submit::Post(Some(MessageKind::Unblock), "got it"))
+        );
     }
 
     #[test]
@@ -1318,6 +1323,10 @@ mod tests {
         let p = t.parse_input("/unblock got it");
         assert_eq!(p.result, Err(CommandError::NothingToUnblock));
         assert_eq!(p.preview(), None);
+        assert_eq!(
+            t.parse_input("/release").result,
+            Err(CommandError::NothingToUnblock)
+        );
         t.post("x", MessageKind::Block, Utc::now());
         assert_eq!(
             t.parse_input("/block another").result,

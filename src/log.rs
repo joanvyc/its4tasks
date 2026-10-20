@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone, Utc};
 
-use crate::model::{Blocker, Board, Note, NoteAction, Task, headline};
+use crate::model::{Blocker, Board, NextStep, Note, NoteAction, Task, headline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period {
@@ -24,9 +24,18 @@ pub enum EntryKind {
     Created,
     Comment {
         blocking: bool,
+        next_step: bool,
     },
     /// An existing comment turned into a blocker.
     MarkedBlocking,
+    /// An existing comment turned into a next step.
+    MarkedNextStep,
+    /// A next step ticked off.
+    StepDone,
+    /// A next step turned into this subtask (its title as of now).
+    Promoted {
+        title: String,
+    },
     Unblocked {
         after: TimeDelta,
     },
@@ -133,7 +142,7 @@ pub struct LogPage {
     pub groups: Vec<TaskGroup>,
 }
 
-fn note_entries(note: &Note) -> Vec<Entry> {
+fn note_entries(board: &Board, note: &Note) -> Vec<Entry> {
     let entry = |at, kind| Entry {
         at,
         kind,
@@ -150,14 +159,36 @@ fn note_entries(note: &Note) -> Vec<Entry> {
         _ => {}
     }
     let posted_blocking = note.blocker.is_some() && note.blocked_since() == note.at;
+    let posted_step = note.next_step.is_some_and(|s| s.since() == note.at);
     let mut entries = vec![entry(
         note.at,
         EntryKind::Comment {
             blocking: posted_blocking,
+            next_step: posted_step,
         },
     )];
     if note.blocker.is_some() && !posted_blocking {
         entries.push(entry(note.blocked_since(), EntryKind::MarkedBlocking));
+    }
+    if let Some(step) = note.next_step
+        && !posted_step
+    {
+        entries.push(entry(step.since(), EntryKind::MarkedNextStep));
+    }
+    match note.next_step {
+        Some(NextStep::Done { at, .. }) => entries.push(entry(at, EntryKind::StepDone)),
+        Some(NextStep::Promoted { at, subtask, .. }) => {
+            let title = match board.task(subtask) {
+                Some(t) => t.title.clone(),
+                None => headline(&note.text).to_owned(),
+            };
+            // The title says it all; the text lives on in the subtask.
+            entries.push(Entry {
+                text: String::new(),
+                ..entry(at, EntryKind::Promoted { title })
+            });
+        }
+        _ => {}
     }
     if let (Some(Blocker::Resolved { at }), Some(after)) = (note.blocker, note.blocked_duration()) {
         entries.push(entry(at, EntryKind::Unblocked { after }));
@@ -196,7 +227,7 @@ pub fn build<Tz: TimeZone>(
             .map(|at| title_entry(at, EntryKind::Created))
             .into_iter()
             .collect();
-        entries.extend(task.notes.iter().flat_map(note_entries));
+        entries.extend(task.notes.iter().flat_map(|n| note_entries(board, n)));
         entries.extend(task.done_at.map(|at| title_entry(at, EntryKind::Done)));
         // An Unblock or Close message already says what its plain Unblocked or
         // Done entry would.
@@ -297,7 +328,10 @@ mod tests {
                 &EntryKind::Unblocked {
                     after: TimeDelta::hours(27)
                 },
-                &EntryKind::Comment { blocking: false },
+                &EntryKind::Comment {
+                    blocking: false,
+                    next_step: false
+                },
             ]
         );
         assert_eq!(pages[0].groups[0].entries[0].kind, EntryKind::Done);
@@ -308,10 +342,54 @@ mod tests {
     fn blockers_posted_vs_marked_later() {
         let pages = build(&sample(), Period::Day, false, &Utc);
         let posted = &pages[3].groups[0].entries[0];
-        assert_eq!(posted.kind, EntryKind::Comment { blocking: true });
+        assert_eq!(
+            posted.kind,
+            EntryKind::Comment {
+                blocking: true,
+                next_step: false
+            }
+        );
         let marked = &pages[1].groups[0].entries[0];
         assert_eq!(marked.kind, EntryKind::MarkedBlocking);
         assert_eq!(marked.text, "early note");
+    }
+
+    #[test]
+    fn next_steps_posted_marked_done_and_promoted() {
+        let mut b = Board::default();
+        let a = b.add_task("A".into(), "", None, at(12, 9));
+        let t = b.task_mut(a).unwrap();
+        t.post("call Bob", MessageKind::Next, at(12, 10));
+        t.toggle_step(0, at(12, 11));
+        t.post("Report\nwith numbers", MessageKind::Comment, at(12, 12));
+        t.mark_next_step(1, at(12, 13));
+        b.promote_step(a, 1, "Report".into(), "with numbers", at(12, 14));
+        let pages = build(&b, Period::Day, false, &Utc);
+        let group = &pages[0].groups[0];
+        let kinds: Vec<_> = group.entries.iter().map(|e| &e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EntryKind::Created,
+                &EntryKind::Comment {
+                    blocking: false,
+                    next_step: true
+                },
+                &EntryKind::StepDone,
+                &EntryKind::Comment {
+                    blocking: false,
+                    next_step: false
+                },
+                &EntryKind::MarkedNextStep,
+                &EntryKind::Promoted {
+                    title: "Report".into()
+                },
+            ]
+        );
+        // The subtask's history starts when the step was posted.
+        let sub = &group.subgroups[0];
+        assert_eq!(sub.entries[0].kind, EntryKind::Created);
+        assert_eq!(sub.entries[0].at, at(12, 12));
     }
 
     #[test]
@@ -321,7 +399,13 @@ mod tests {
         let kinds: Vec<_> = b.entries.iter().map(|e| &e.kind).collect();
         assert_eq!(
             kinds,
-            [&EntryKind::Created, &EntryKind::Comment { blocking: false }]
+            [
+                &EntryKind::Created,
+                &EntryKind::Comment {
+                    blocking: false,
+                    next_step: false
+                }
+            ]
         );
     }
 
@@ -368,7 +452,10 @@ mod tests {
             kinds,
             [
                 &EntryKind::Created,
-                &EntryKind::Comment { blocking: true },
+                &EntryKind::Comment {
+                    blocking: true,
+                    next_step: false
+                },
                 &EntryKind::Resolved {
                     quote: "need access".into(),
                     after: TimeDelta::hours(5)

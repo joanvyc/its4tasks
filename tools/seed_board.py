@@ -2,7 +2,8 @@
 
 Creates DATA_HOME/its4tasks/board.json with ~12 days of history relative to now:
 open blockers, resolved blockers (one with an Unblock message), multi-line
-comments (a title line plus details), starred comments, a done task closed
+comments (a title line plus details), starred comments, next steps (open,
+done, and one on a blocked task, where red wins), a done task closed
 with a message, tasks of different freshness, and subtasks: a parent blocked
 by its subtasks (focused, with one of them) and one that isn't. Run the app with
 XDG_DATA_HOME=DATA_HOME to load it.
@@ -19,8 +20,11 @@ def ago(**k):
     return (now - dt.timedelta(**k)).isoformat().replace("+00:00", "Z")
 
 
-def note(text, at, blocked_at=None, resolved=None, starred=False, action=None):
+def note(text, at, blocked_at=None, resolved=None, starred=False, action=None, step=None, step_done=None):
+    """`step` is when it became a next step; `step_done` when it was ticked off."""
     d = {"at": at, "text": text}
+    if step:
+        d["next_step"] = {"Done": {"since": step, "at": step_done}} if step_done else {"Open": {"since": step}}
     if action:
         d["action"] = action
     if blocked_at:
@@ -40,6 +44,7 @@ tasks = [
         note("The input case that they sent me doesn't work, I have asked for a new one and waiting for new one.",
              ago(days=3, hours=2), ago(days=3, hours=2), starred=True),
         note("Pinged them again about the input case", ago(days=1)),
+        note("Rerun with their constraints once the new case arrives", ago(hours=20), step=ago(hours=20)),
     ]),
     dict(title="Fix login bug", created_at=ago(days=6), updated_at=ago(minutes=20), notes=[
         note("Waiting on staging access", ago(days=2, hours=3), ago(days=2, hours=3), ago(minutes=20), starred=True),
@@ -51,6 +56,10 @@ tasks = [
         note("Finance signed off on the full amount", ago(days=5, hours=1), starred=True,
              action={"Unblocked": {"quote": BUDGET, "blocked_since": ago(days=6, hours=20)}}),
         note("Booked the venue", ago(days=5), starred=True),
+        note("Ask for dietary requirements", ago(days=4), step=ago(days=4), step_done=ago(days=1)),
+        note("Send the agenda\nDraft is in the shared folder; needs the room plan and the times for the talks.",
+             ago(days=1), step=ago(days=1)),
+        note("Book the bus", ago(hours=3), step=ago(hours=3)),
     ]),
     # Blocked since before "Plan offsite"'s blocker was resolved, so that pair can't move here.
     dict(title="Renew passport", created_at=ago(days=12), updated_at=ago(days=6), notes=[

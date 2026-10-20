@@ -15,6 +15,35 @@ pub enum Blocker {
     Resolved { at: DateTime<Utc> },
 }
 
+/// A comment saying what to do next, which is up to me rather than someone
+/// else (unlike a `Blocker`). `since` is when it became a step.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum NextStep {
+    Open {
+        since: DateTime<Utc>,
+    },
+    Done {
+        since: DateTime<Utc>,
+        at: DateTime<Utc>,
+    },
+    /// Grew into its own subtask.
+    Promoted {
+        since: DateTime<Utc>,
+        at: DateTime<Utc>,
+        subtask: u64,
+    },
+}
+
+impl NextStep {
+    pub fn since(self) -> DateTime<Utc> {
+        match self {
+            NextStep::Open { since }
+            | NextStep::Done { since, .. }
+            | NextStep::Promoted { since, .. } => since,
+        }
+    }
+}
+
 /// What a comment did besides commenting, posted from the comment box.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NoteAction {
@@ -33,6 +62,7 @@ pub enum NoteAction {
 pub enum MessageKind {
     Comment,
     Star,
+    Next,
     Block,
     Unblock,
     Close,
@@ -43,6 +73,7 @@ impl MessageKind {
         match self {
             MessageKind::Comment => "Comment",
             MessageKind::Star => "Star",
+            MessageKind::Next => "Next step",
             MessageKind::Block => "Block",
             MessageKind::Unblock => "Unblock",
             MessageKind::Close => "Close",
@@ -64,6 +95,9 @@ pub struct Note {
     pub starred: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<NoteAction>,
+    /// A comment is a blocker or a next step, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<NextStep>,
 }
 
 impl Note {
@@ -75,11 +109,21 @@ impl Note {
             blocked_at: None,
             starred: false,
             action: None,
+            next_step: None,
         }
     }
 
     pub fn is_open_blocker(&self) -> bool {
         self.blocker == Some(Blocker::Open)
+    }
+
+    pub fn is_open_step(&self) -> bool {
+        matches!(self.next_step, Some(NextStep::Open { .. }))
+    }
+
+    /// A plain comment, which can become a blocker or a next step.
+    fn is_plain(&self) -> bool {
+        self.blocker.is_none() && self.next_step.is_none() && self.action.is_none()
     }
 
     pub fn blocked_since(&self) -> DateTime<Utc> {
@@ -118,6 +162,8 @@ impl Note {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Active,
+    /// Has an open next step.
+    Ready,
     Blocked,
     Done,
 }
@@ -126,6 +172,7 @@ impl TaskState {
     pub fn label(self) -> &'static str {
         match self {
             TaskState::Active => "Active",
+            TaskState::Ready => "Next step",
             TaskState::Blocked => "Blocked",
             TaskState::Done => "Done",
         }
@@ -167,6 +214,7 @@ impl Task {
 
     /// Post a comment from the comment box. Blank text is ignored.
     /// - `Star` posts it starred.
+    /// - `Next` posts it as an open next step.
     /// - `Block` posts it as an open blocker (a plain comment if something is
     ///   already blocking; see `can_block`).
     /// - `Unblock` resolves the open blocker, with this as the message
@@ -181,6 +229,7 @@ impl Task {
         match kind {
             MessageKind::Comment => {}
             MessageKind::Star => note.starred = true,
+            MessageKind::Next => note.next_step = Some(NextStep::Open { since: now }),
             MessageKind::Block if self.can_block() => note.block(now),
             MessageKind::Block => {}
             MessageKind::Unblock => {
@@ -217,7 +266,7 @@ impl Task {
 
     /// What the comment box offers for this task, the default first.
     pub fn message_kinds(&self) -> Vec<MessageKind> {
-        let mut kinds = vec![MessageKind::Comment, MessageKind::Star];
+        let mut kinds = vec![MessageKind::Comment, MessageKind::Star, MessageKind::Next];
         kinds.push(if self.can_block() {
             MessageKind::Block
         } else {
@@ -235,12 +284,15 @@ impl Task {
         self.open_blocker().is_none()
     }
 
-    /// Turn a comment into the blocker. Does nothing while another one blocks.
+    /// Turn a comment into the blocker. Does nothing while another one
+    /// blocks, or on a next step.
     pub fn set_blocking(&mut self, idx: usize, now: DateTime<Utc>) {
         if !self.can_block() {
             return;
         }
-        if let Some(note) = self.notes.get_mut(idx) {
+        if let Some(note) = self.notes.get_mut(idx)
+            && note.next_step.is_none()
+        {
             note.block(now);
             self.touch(now);
         }
@@ -261,6 +313,43 @@ impl Task {
             note.blocker = None;
             note.blocked_at = None;
         }
+    }
+
+    /// Turn a plain comment into an open next step.
+    pub fn mark_next_step(&mut self, idx: usize, now: DateTime<Utc>) {
+        if let Some(note) = self.notes.get_mut(idx)
+            && note.is_plain()
+        {
+            note.next_step = Some(NextStep::Open { since: now });
+            self.touch(now);
+        }
+    }
+
+    /// Tick an open next step off, or reopen a done one.
+    pub fn toggle_step(&mut self, idx: usize, now: DateTime<Utc>) {
+        let Some(note) = self.notes.get_mut(idx) else {
+            return;
+        };
+        note.next_step = match note.next_step {
+            Some(NextStep::Open { since }) => Some(NextStep::Done { since, at: now }),
+            Some(NextStep::Done { since, .. }) => Some(NextStep::Open { since }),
+            _ => return,
+        };
+        self.touch(now);
+    }
+
+    /// Undo a next step mark (e.g. a mis-click); doesn't count as an update.
+    /// A promoted step stays, since its subtask came from it.
+    pub fn unmark_next_step(&mut self, idx: usize) {
+        if let Some(note) = self.notes.get_mut(idx)
+            && !matches!(note.next_step, Some(NextStep::Promoted { .. }))
+        {
+            note.next_step = None;
+        }
+    }
+
+    pub fn open_steps(&self) -> impl Iterator<Item = &Note> {
+        self.notes.iter().filter(|n| n.is_open_step())
     }
 
     /// Doesn't count as an update.
@@ -285,6 +374,8 @@ impl Task {
             TaskState::Done
         } else if self.open_blocker().is_some() {
             TaskState::Blocked
+        } else if self.open_steps().next().is_some() {
+            TaskState::Ready
         } else {
             TaskState::Active
         }
@@ -376,6 +467,7 @@ pub enum MoveError {
     SameTask,
     TargetClosed,
     CloseNote,
+    Promoted,
     AlreadyBlocked,
     BlockedBeforeResolved,
 }
@@ -387,6 +479,7 @@ impl fmt::Display for MoveError {
             MoveError::SameTask => "The comment is already on this task",
             MoveError::TargetClosed => "The task is closed",
             MoveError::CloseNote => "A closing comment can't be moved: it closed its task",
+            MoveError::Promoted => "A promoted step can't be moved: its subtask is on this task",
             MoveError::AlreadyBlocked => "Already blocked: it has an open blocker",
             MoveError::BlockedBeforeResolved => {
                 "Its open blocker started before this blocker was resolved"
@@ -402,11 +495,13 @@ pub enum Command {
     Unblock,
     Close,
     Star,
+    Next,
     Subtask,
 }
 
 /// Names a command can be typed as.
-const COMMANDS: [(&str, Command); 7] = [
+const COMMANDS: [(&str, Command); 8] = [
+    ("next", Command::Next),
     ("block", Command::Block),
     ("unblock", Command::Unblock),
     ("release", Command::Unblock),
@@ -424,6 +519,7 @@ impl Command {
             Command::Unblock => Some(MessageKind::Unblock),
             Command::Close => Some(MessageKind::Close),
             Command::Star => Some(MessageKind::Star),
+            Command::Next => Some(MessageKind::Next),
             Command::Subtask => None,
         }
     }
@@ -443,7 +539,7 @@ impl fmt::Display for CommandError {
         match self {
             CommandError::Unknown(name) => write!(
                 f,
-                "Unknown command {name}. Try /block, /unblock, /close, /star or /sub-task"
+                "Unknown command {name}. Try /next, /block, /unblock, /close, /star or /sub-task"
             ),
             CommandError::NothingToUnblock => write!(f, "Nothing to unblock: no open blocker"),
             CommandError::AlreadyBlocked => {
@@ -572,6 +668,41 @@ impl Board {
         id
     }
 
+    /// Turn an open next step into a subtask with this title and first
+    /// comment. The subtask keeps the step's history: created when the step
+    /// was posted, last updated when it became a step, its first comment as
+    /// old (and as starred) as the step. The step stays behind as a marker
+    /// pointing at it. `None` if the comment isn't an open step any more.
+    pub fn promote_step(
+        &mut self,
+        task_id: u64,
+        idx: usize,
+        title: String,
+        first_note: &str,
+        now: DateTime<Utc>,
+    ) -> Option<u64> {
+        let note = self.task(task_id)?.notes.get(idx)?;
+        let Some(NextStep::Open { since }) = note.next_step else {
+            return None;
+        };
+        let (posted, starred) = (note.at, note.starred);
+        let id = self.add_task(title, first_note, Some(task_id), posted);
+        if let Some(subtask) = self.task_mut(id) {
+            subtask.updated_at = since;
+            if let Some(first) = subtask.notes.first_mut() {
+                first.starred = starred;
+            }
+        }
+        let task = self.task_mut(task_id)?;
+        task.notes[idx].next_step = Some(NextStep::Promoted {
+            since,
+            at: now,
+            subtask: id,
+        });
+        task.touch(now);
+        Some(id)
+    }
+
     /// Delete the task and all its subtasks.
     pub fn delete_task(&mut self, id: u64) {
         let mut gone = self.descendants(id);
@@ -660,7 +791,9 @@ impl Board {
     /// blocked too.
     pub fn state(&self, id: u64) -> TaskState {
         match self.task(id).map(Task::state) {
-            Some(TaskState::Active) if self.blocked_by_subtasks(id) => TaskState::Blocked,
+            Some(TaskState::Active | TaskState::Ready) if self.blocked_by_subtasks(id) => {
+                TaskState::Blocked
+            }
             Some(state) => state,
             None => TaskState::Active,
         }
@@ -750,6 +883,9 @@ impl Board {
         let target = self.task(to).ok_or(MoveError::NotFound)?;
         if note.action == Some(NoteAction::Closed) {
             return Err(MoveError::CloseNote);
+        }
+        if matches!(note.next_step, Some(NextStep::Promoted { .. })) {
+            return Err(MoveError::Promoted);
         }
         if from == to {
             return Err(MoveError::SameTask);
@@ -1053,6 +1189,185 @@ mod tests {
     }
 
     #[test]
+    fn next_steps_are_ticked_off_directly() {
+        let mut b = board_with(1);
+        let t0 = Utc::now();
+        let h = TimeDelta::hours;
+        let t = b.task_mut(0).unwrap();
+        t.post("call Bob", MessageKind::Next, t0);
+        t.post("write it up", MessageKind::Next, t0 + h(1));
+        assert_eq!(t.state(), TaskState::Ready);
+        assert_eq!(t.notes[0].next_step, Some(NextStep::Open { since: t0 }));
+        // Not auto-starred, unlike blockers.
+        assert!(!t.notes[0].starred);
+        assert_eq!(t.open_steps().count(), 2);
+
+        t.toggle_step(0, t0 + h(2));
+        assert_eq!(
+            t.notes[0].next_step,
+            Some(NextStep::Done {
+                since: t0,
+                at: t0 + h(2)
+            })
+        );
+        assert_eq!(t.updated_at, t0 + h(2));
+        assert_eq!(t.state(), TaskState::Ready);
+        t.toggle_step(1, t0 + h(3));
+        assert_eq!(t.state(), TaskState::Active);
+        // Reopening keeps when it became a step.
+        t.toggle_step(0, t0 + h(4));
+        assert_eq!(t.notes[0].next_step, Some(NextStep::Open { since: t0 }));
+
+        // Doesn't count as an update.
+        t.unmark_next_step(0);
+        assert_eq!(t.notes[0].next_step, None);
+        assert_eq!(t.updated_at, t0 + h(4));
+        t.toggle_step(0, t0 + h(5)); // not a step: stays untouched
+        assert_eq!(t.notes[0].next_step, None);
+        t.mark_next_step(0, t0 + h(5));
+        assert_eq!(
+            t.notes[0].next_step,
+            Some(NextStep::Open { since: t0 + h(5) })
+        );
+    }
+
+    #[test]
+    fn blocked_wins_over_ready_and_done_over_both() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.post("call Bob", MessageKind::Next, now);
+        t.post("waiting on Alice", MessageKind::Block, now);
+        assert_eq!(t.state(), TaskState::Blocked);
+        t.resolve(1, now);
+        assert_eq!(t.state(), TaskState::Ready);
+        t.set_done(true, now);
+        assert_eq!(t.state(), TaskState::Done);
+
+        // Subtasks blocking the parent outweigh its own steps.
+        let mut b = tree();
+        b.task_mut(0).unwrap().post("plan", MessageKind::Next, now);
+        assert_eq!(b.state(0), TaskState::Ready);
+        for id in [1, 2] {
+            b.task_mut(id)
+                .unwrap()
+                .post("wait", MessageKind::Block, now);
+        }
+        assert_eq!(b.state(0), TaskState::Blocked);
+        // A subtask's step doesn't make the parent ready.
+        let mut b = tree();
+        b.task_mut(1).unwrap().post("plan", MessageKind::Next, now);
+        assert_eq!(b.state(0), TaskState::Active);
+    }
+
+    #[test]
+    fn a_comment_is_a_blocker_or_a_step_not_both() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.post("waiting", MessageKind::Block, now);
+        t.post("call Bob", MessageKind::Next, now);
+        t.mark_next_step(0, now);
+        assert_eq!(t.notes[0].next_step, None);
+        t.resolve(0, now);
+        t.mark_next_step(0, now);
+        assert_eq!(t.notes[0].next_step, None);
+        t.set_blocking(1, now);
+        assert_eq!(t.notes[1].blocker, None);
+        // An Unblock message isn't a plain comment either.
+        t.set_blocking(0, now);
+        t.post("got it", MessageKind::Unblock, now);
+        t.mark_next_step(2, now);
+        assert_eq!(t.notes[2].next_step, None);
+    }
+
+    #[test]
+    fn steps_round_trip_and_old_notes_load_without() {
+        let mut b = board_with(1);
+        let now = Utc::now();
+        let t = b.task_mut(0).unwrap();
+        t.post("open", MessageKind::Next, now);
+        t.post("done", MessageKind::Next, now);
+        t.toggle_step(1, now);
+        t.post("grows", MessageKind::Next, now);
+        b.promote_step(0, 2, "grows".into(), "", now);
+        let json = serde_json::to_string(&b).unwrap();
+        let back: Board = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
+
+        let json = r#"{"id":0,"title":"t","notes":[{"at":"2026-10-01T10:00:00Z","text":"x"}]}"#;
+        let t: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(t.notes[0].next_step, None);
+    }
+
+    #[test]
+    fn promoting_a_step_makes_a_subtask_with_its_history() {
+        let mut b = board_with(1);
+        let t0 = Utc::now();
+        let h = TimeDelta::hours;
+        let t = b.task_mut(0).unwrap();
+        t.post(
+            "Write the report\nWith the Q3 numbers",
+            MessageKind::Comment,
+            t0,
+        );
+        t.mark_next_step(0, t0 + h(1));
+        t.toggle_star(0);
+        t.post("call Bob", MessageKind::Next, t0 + h(2));
+
+        let id = b
+            .promote_step(
+                0,
+                0,
+                "Write the report".into(),
+                "With the Q3 numbers",
+                t0 + h(3),
+            )
+            .unwrap();
+        let sub = b.task(id).unwrap();
+        assert_eq!(sub.parent, Some(0));
+        assert_eq!(sub.title, "Write the report");
+        assert_eq!(sub.created_at, Some(t0));
+        assert_eq!(sub.updated_at, t0 + h(1));
+        assert_eq!(sub.notes.len(), 1);
+        assert_eq!(sub.notes[0].text, "With the Q3 numbers");
+        assert_eq!(sub.notes[0].at, t0);
+        assert!(sub.notes[0].starred);
+        assert_eq!(sub.state(), TaskState::Active);
+
+        let t = b.task(0).unwrap();
+        assert_eq!(
+            t.notes[0].next_step,
+            Some(NextStep::Promoted {
+                since: t0 + h(1),
+                at: t0 + h(3),
+                subtask: id
+            })
+        );
+        assert_eq!(t.updated_at, t0 + h(3));
+        // Still ready: "call Bob" is open.
+        assert_eq!(b.state(0), TaskState::Ready);
+        // Only open steps get promoted, and only once.
+        assert_eq!(b.promote_step(0, 0, "again".into(), "", t0), None);
+        b.task_mut(0).unwrap().toggle_step(1, t0 + h(4));
+        assert_eq!(b.promote_step(0, 1, "x".into(), "", t0), None);
+        assert_eq!(b.state(0), TaskState::Active);
+        // The marker can't be unmarked, ticked or moved.
+        let t = b.task_mut(0).unwrap();
+        t.unmark_next_step(0);
+        t.toggle_step(0, t0);
+        assert!(matches!(
+            t.notes[0].next_step,
+            Some(NextStep::Promoted { .. })
+        ));
+        assert_eq!(b.can_move_note(0, 0, id), Err(MoveError::Promoted));
+        // A one-line step leaves the subtask without comments.
+        b.task_mut(0).unwrap().post("ping", MessageKind::Next, t0);
+        let id = b.promote_step(0, 2, "ping".into(), "", t0).unwrap();
+        assert!(b.task(id).unwrap().notes.is_empty());
+    }
+
+    #[test]
     fn blockers_round_trip_and_old_notes_load() {
         let mut b = board_with(1);
         let t = b.task_mut(0).unwrap();
@@ -1108,6 +1423,7 @@ mod tests {
             [
                 MessageKind::Comment,
                 MessageKind::Star,
+                MessageKind::Next,
                 MessageKind::Block,
                 MessageKind::Close
             ]
@@ -1121,6 +1437,7 @@ mod tests {
             [
                 MessageKind::Comment,
                 MessageKind::Star,
+                MessageKind::Next,
                 MessageKind::Unblock,
                 MessageKind::Close
             ]
@@ -1201,7 +1518,12 @@ mod tests {
         assert_eq!(t.notes[0].action, Some(NoteAction::Closed));
         assert_eq!(
             t.message_kinds(),
-            [MessageKind::Comment, MessageKind::Star, MessageKind::Block]
+            [
+                MessageKind::Comment,
+                MessageKind::Star,
+                MessageKind::Next,
+                MessageKind::Block
+            ]
         );
 
         let json = serde_json::to_string(&b).unwrap();
@@ -1628,8 +1950,13 @@ mod tests {
         assert_eq!(p.token_len, Some(7));
         assert_eq!(
             p.result.unwrap_err().to_string(),
-            "Unknown command /blockx. Try /block, /unblock, /close, /star or /sub-task"
+            "Unknown command /blockx. Try /next, /block, /unblock, /close, /star or /sub-task"
         );
         assert!(t.parse_input("/").partial);
+        assert!(t.parse_input("/nex").partial);
+        assert_eq!(
+            t.parse_input("/next call Bob").result,
+            Ok(Submit::Post(Some(MessageKind::Next), "call Bob"))
+        );
     }
 }

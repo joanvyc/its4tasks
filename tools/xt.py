@@ -74,7 +74,7 @@ def key(name, shift=False):
     time.sleep(0.03)
 
 
-SPECIAL = {" ": "space", ",": "comma", ".": "period", "'": "apostrophe", "-": "minus"}
+SPECIAL = {" ": "space", ",": "comma", ".": "period", "'": "apostrophe", "-": "minus", "/": "slash"}
 
 cmd, args = sys.argv[1], sys.argv[2:]
 if cmd == "id":

@@ -11,8 +11,8 @@ use eframe::egui::{
 
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
-    Blocker, Board, Command, CommandError, MessageKind, MoveError, Note, NoteAction, SLOT_COUNT,
-    Submit, Task, TaskState, headline, short_duration, split_title, staleness,
+    Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
+    SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
 };
 use crate::storage;
 
@@ -41,6 +41,7 @@ struct Palette {
     blocker: Color32,
     star: Color32,
     resolved: Color32,
+    next: Color32,
     /// A valid `/command` in the comment box.
     command: Color32,
 }
@@ -51,6 +52,7 @@ const DARK: Palette = Palette {
     blocker: Color32::from_rgb(215, 85, 75),
     star: Color32::from_rgb(235, 195, 40),
     resolved: Color32::from_rgb(110, 180, 110),
+    next: Color32::from_rgb(110, 165, 245),
     command: Color32::from_rgb(110, 165, 245),
 };
 
@@ -60,6 +62,7 @@ const LIGHT: Palette = Palette {
     blocker: Color32::from_rgb(200, 55, 45),
     star: Color32::from_rgb(215, 160, 0),
     resolved: Color32::from_rgb(40, 135, 60),
+    next: Color32::from_rgb(30, 100, 210),
     command: Color32::from_rgb(30, 100, 210),
 };
 
@@ -118,6 +121,15 @@ fn blocked_glow_color(visuals: &Visuals) -> Color32 {
         Color32::from_rgb(210, 60, 60).gamma_multiply(0.6)
     } else {
         Color32::from_rgb(230, 80, 80).gamma_multiply(0.45)
+    }
+}
+
+/// Blue glow along the inside edge of a card or comment with a next step.
+fn next_glow_color(visuals: &Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(70, 130, 240).gamma_multiply(0.6)
+    } else {
+        Color32::from_rgb(60, 120, 230).gamma_multiply(0.45)
     }
 }
 
@@ -196,6 +208,71 @@ fn comment_menu_items(
     can_block: bool,
     actions: &mut Vec<Action>,
 ) {
+    match note.next_step {
+        Some(NextStep::Open { .. }) => {
+            if ui
+                .button("✔ Done")
+                .on_hover_text("Tick this step off")
+                .clicked()
+            {
+                actions.push(Action::ToggleStep(task_id, idx));
+            }
+            if ui
+                .button("Promote to subtask…")
+                .on_hover_text("Turn this step into a subtask of its own")
+                .clicked()
+            {
+                actions.push(Action::StartPromote(task_id, idx));
+            }
+            if ui.button("Not a next step").clicked() {
+                actions.push(Action::UnmarkStep(task_id, idx));
+            }
+        }
+        Some(NextStep::Done { .. }) => {
+            if ui.button("Reopen step").clicked() {
+                actions.push(Action::ToggleStep(task_id, idx));
+            }
+            if ui.button("Not a next step").clicked() {
+                actions.push(Action::UnmarkStep(task_id, idx));
+            }
+        }
+        Some(NextStep::Promoted { .. }) => {}
+        None => blocker_menu_items(ui, note, task_id, idx, can_block, actions),
+    }
+    if ui.button("Edit").clicked() {
+        actions.push(Action::StartEdit(task_id, idx));
+    }
+    let star = if note.starred { "Unstar" } else { "Star" };
+    if ui.button(star).clicked() {
+        actions.push(Action::ToggleStar(task_id, idx));
+    }
+    let unmovable = match (&note.action, note.next_step) {
+        (Some(NoteAction::Closed), _) => Some(MoveError::CloseNote),
+        (_, Some(NextStep::Promoted { .. })) => Some(MoveError::Promoted),
+        _ => None,
+    };
+    if ui
+        .add_enabled(unmovable.is_none(), Button::new("Move to task…"))
+        .on_hover_text("Move it to another task, e.g. if it was posted on the wrong one")
+        .on_disabled_hover_text(unmovable.map(|e| e.to_string()).unwrap_or_default())
+        .clicked()
+    {
+        actions.push(Action::StartMove(task_id, idx));
+    }
+    if ui.button("Delete").clicked() {
+        actions.push(Action::DeleteNote(task_id, idx));
+    }
+}
+
+/// The blocker entries of a comment's menu, for comments that aren't next steps.
+fn blocker_menu_items(
+    ui: &mut egui::Ui,
+    note: &Note,
+    task_id: u64,
+    idx: usize,
+    can_block: bool,
+    actions: &mut Vec<Action>,
+) {
     match note.blocker {
         Some(Blocker::Open) => {
             if ui
@@ -232,26 +309,15 @@ fn comment_menu_items(
             {
                 actions.push(Action::MarkBlocking(task_id, idx));
             }
+            if note.action.is_none()
+                && ui
+                    .button("→ Mark as next step")
+                    .on_hover_text("The next thing to do here, and it's up to you")
+                    .clicked()
+            {
+                actions.push(Action::MarkStep(task_id, idx));
+            }
         }
-    }
-    if ui.button("Edit").clicked() {
-        actions.push(Action::StartEdit(task_id, idx));
-    }
-    let star = if note.starred { "Unstar" } else { "Star" };
-    if ui.button(star).clicked() {
-        actions.push(Action::ToggleStar(task_id, idx));
-    }
-    let movable = note.action != Some(NoteAction::Closed);
-    if ui
-        .add_enabled(movable, Button::new("Move to task…"))
-        .on_hover_text("Move it to another task, e.g. if it was posted on the wrong one")
-        .on_disabled_hover_text(MoveError::CloseNote.to_string())
-        .clicked()
-    {
-        actions.push(Action::StartMove(task_id, idx));
-    }
-    if ui.button("Delete").clicked() {
-        actions.push(Action::DeleteNote(task_id, idx));
     }
 }
 
@@ -313,6 +379,12 @@ fn blocked_text(board: &Board, task: &Task, now: DateTime<Utc>) -> Option<String
     ))
 }
 
+/// A task's open next steps, for hover texts.
+fn next_steps_text(task: &Task) -> String {
+    let steps: Vec<&str> = task.open_steps().map(|n| headline(&n.text)).collect();
+    format!("Next: {}", steps.join("\nand "))
+}
+
 /// An on/off switch whose track turns `on_color` when on.
 fn toggle_switch(
     ui: &mut egui::Ui,
@@ -363,6 +435,7 @@ fn state_text_color(state: TaskState, visuals: &Visuals) -> Color32 {
     match state {
         TaskState::Blocked if visuals.dark_mode => Color32::from_rgb(255, 150, 140),
         TaskState::Blocked => Color32::from_rgb(170, 40, 40),
+        TaskState::Ready => palette(visuals).next,
         TaskState::Active | TaskState::Done => visuals.weak_text_color(),
     }
 }
@@ -371,6 +444,7 @@ fn kind_color(kind: MessageKind, visuals: &Visuals) -> Color32 {
     match kind {
         MessageKind::Comment => visuals.weak_text_color(),
         MessageKind::Star => palette(visuals).star,
+        MessageKind::Next => palette(visuals).next,
         MessageKind::Block => palette(visuals).blocker,
         MessageKind::Unblock | MessageKind::Close => palette(visuals).resolved,
     }
@@ -380,6 +454,9 @@ fn kind_hint(kind: MessageKind) -> &'static str {
     match kind {
         MessageKind::Comment => "Post a plain comment",
         MessageKind::Star => "Post a starred comment: it shows in the starred log",
+        MessageKind::Next => {
+            "Post the next step: it's up to you, so the task shows blue until ticked off"
+        }
         MessageKind::Block => "Post as blocking: the task stays blocked until resolved",
         MessageKind::Unblock => "Resolve the blocker, with this as the message",
         MessageKind::Close => "Mark the task done, with this as the message",
@@ -434,6 +511,8 @@ fn moved_note_job(note: &Note, ui: &egui::Ui) -> LayoutJob {
         job.append("★ ", 0.0, format(colors.star));
     }
     let marker = match (note.blocker, &note.action) {
+        _ if note.is_open_step() => Some(("→ Next step: ", colors.next)),
+        _ if note.next_step.is_some() => Some(("✔ Done step: ", colors.resolved)),
         (Some(Blocker::Open), _) => Some(("⛔ Blocking: ", colors.blocker)),
         (Some(Blocker::Resolved { .. }), _) => Some(("Resolved blocker: ", colors.blocker)),
         (_, Some(NoteAction::Unblocked { .. })) => {
@@ -474,6 +553,7 @@ fn updated_text(task: &Task, now: DateTime<Utc>) -> String {
 /// One entry of a card's comment log: timestamp/blocker line, then the text,
 /// or a text box while `edit` is being written. `hovered` reveals the star
 /// and the "⋯" menu, whose "mark as blocking" is enabled only when `can_block`.
+/// `promoted_to` is the title of the subtask a promoted step became.
 #[allow(clippy::too_many_arguments)]
 fn comment(
     ui: &mut egui::Ui,
@@ -482,13 +562,53 @@ fn comment(
     task_id: u64,
     hovered: bool,
     can_block: bool,
+    promoted_to: Option<&str>,
     edit: Option<&mut NoteEdit>,
     now: DateTime<Utc>,
     actions: &mut Vec<Action>,
 ) {
     let colors = palette(ui.visuals());
     ui.horizontal(|ui| {
+        if let Some(step @ (NextStep::Open { .. } | NextStep::Done { .. })) = note.next_step {
+            let mut done = matches!(step, NextStep::Done { .. });
+            let hint = if done {
+                "Reopen this step"
+            } else {
+                "Tick this step off"
+            };
+            // No spacing after the box: its label is empty.
+            ui.spacing_mut().icon_spacing = 0.0;
+            if ui.checkbox(&mut done, "").on_hover_text(hint).changed() {
+                actions.push(Action::ToggleStep(task_id, idx));
+            }
+        }
         ui.label(RichText::new(local_time(note.at)).small().weak());
+        match note.next_step {
+            Some(NextStep::Open { since }) => {
+                ui.label(
+                    RichText::new("· → Next step")
+                        .small()
+                        .strong()
+                        .color(colors.next),
+                )
+                .on_hover_text(format!("Next step since {}", local_time(since)));
+            }
+            Some(NextStep::Done { at, .. }) => {
+                ui.label(
+                    RichText::new(format!("· ✔ Done ({})", local_time(at)))
+                        .small()
+                        .weak(),
+                );
+            }
+            Some(NextStep::Promoted { at, .. }) => {
+                ui.label(
+                    RichText::new(format!("· → Promoted ({})", local_time(at)))
+                        .small()
+                        .weak(),
+                );
+            }
+            None => {}
+        }
         match (note.blocker, note.blocked_for(now), note.blocked_duration()) {
             (Some(Blocker::Open), Some(blocked_for), _) => {
                 ui.label(
@@ -548,11 +668,42 @@ fn comment(
         edit_box(ui, edit, actions);
         return;
     }
+    if let Some(NextStep::Promoted { subtask, .. }) = note.next_step {
+        let title = promoted_to.unwrap_or(headline(&note.text));
+        let mut job = LayoutJob::default();
+        let font = TextStyle::Body.resolve(ui.style());
+        let marker = TextFormat::simple(font.clone(), colors.next);
+        job.append("→ Promoted to subtask: ", 0.0, marker);
+        let mut link = TextFormat::simple(font, ui.visuals().text_color());
+        link.underline = Stroke::new(1.0, ui.visuals().weak_text_color());
+        job.append(title, 0.0, link);
+        let label = Label::new(job).wrap().sense(Sense::click());
+        if promoted_to.is_some() {
+            let response = ui.add(label).on_hover_text("Focus the subtask");
+            if response.clicked() {
+                actions.push(Action::Focus(subtask));
+            }
+        } else {
+            ui.add(label).on_hover_text("The subtask was deleted");
+        }
+        return;
+    }
     let job = match &note.action {
         Some(action) => action_job(action, note, ui),
         None => {
             let mut job = LayoutJob::default();
-            append_comment(&mut job, &note.text, ui.visuals().text_color(), ui);
+            let done = matches!(note.next_step, Some(NextStep::Done { .. }));
+            let color = if done {
+                ui.visuals().weak_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+            append_comment(&mut job, &note.text, color, ui);
+            if done {
+                for section in &mut job.sections {
+                    section.format.strikethrough = Stroke::new(1.0, color);
+                }
+            }
             job
         }
     };
@@ -623,9 +774,17 @@ fn log_entry_job(entry: &log::Entry, ui: &egui::Ui) -> LayoutJob {
     }
     let (marker, color) = match &entry.kind {
         EntryKind::Created => (Some("Created".to_owned()), ui.visuals().weak_text_color()),
-        EntryKind::Comment { blocking: false } => (None, normal),
-        EntryKind::Comment { blocking: true } => (Some("Blocked: ".to_owned()), colors.blocker),
+        EntryKind::Comment { blocking: true, .. } => (Some("Blocked: ".to_owned()), colors.blocker),
+        EntryKind::Comment {
+            next_step: true, ..
+        } => (Some("Next step: ".to_owned()), colors.next),
+        EntryKind::Comment { .. } => (None, normal),
         EntryKind::MarkedBlocking => (Some("Marked blocking: ".to_owned()), colors.blocker),
+        EntryKind::MarkedNextStep => (Some("Marked next step: ".to_owned()), colors.next),
+        EntryKind::StepDone => (Some("✔ Did: ".to_owned()), colors.resolved),
+        EntryKind::Promoted { title } => {
+            (Some(format!("→ Promoted to subtask: {title}")), colors.next)
+        }
         EntryKind::Unblocked { after } => (
             Some(format!("Unblocked after {}: ", short_duration(*after))),
             colors.resolved,
@@ -694,6 +853,8 @@ fn log_group(
 struct NewTaskDraft {
     /// Creating a subtask of this task.
     parent: Option<u64>,
+    /// Promoting this comment of `parent`, a next step, to the subtask.
+    from_step: Option<usize>,
     title: String,
     notes: String,
     add_to_focus: bool,
@@ -730,6 +891,11 @@ enum Action {
     MarkBlocking(u64, usize),
     Resolve(u64, usize),
     Unblock(u64, usize),
+    MarkStep(u64, usize),
+    ToggleStep(u64, usize),
+    UnmarkStep(u64, usize),
+    /// Open the new subtask dialog to turn this next step into a subtask.
+    StartPromote(u64, usize),
     ToggleStar(u64, usize),
     StartEdit(u64, usize),
     /// Open the dialog for moving a comment to another task.
@@ -829,6 +995,37 @@ impl TodoApp {
                 Action::Unblock(id, idx) => {
                     if let Some(task) = self.board.task_mut(id) {
                         task.unmark_blocking(idx);
+                    }
+                }
+                Action::MarkStep(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.mark_next_step(idx, now);
+                    }
+                }
+                Action::ToggleStep(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.toggle_step(idx, now);
+                    }
+                }
+                Action::UnmarkStep(id, idx) => {
+                    if let Some(task) = self.board.task_mut(id) {
+                        task.unmark_next_step(idx);
+                    }
+                }
+                Action::StartPromote(id, idx) => {
+                    let note = self.board.task(id).and_then(|t| t.notes.get(idx));
+                    if let Some(note) = note {
+                        let (title, body) = match split_title(&note.text) {
+                            (Some(title), body) => (title, body.trim()),
+                            (None, text) => (text, ""),
+                        };
+                        self.new_task = Some(NewTaskDraft {
+                            parent: Some(id),
+                            from_step: Some(idx),
+                            title: title.to_owned(),
+                            notes: body.to_owned(),
+                            ..Default::default()
+                        });
                     }
                 }
                 Action::ToggleStar(id, idx) => {
@@ -941,6 +1138,9 @@ impl TodoApp {
                     .board
                     .task(id)
                     .and_then(|t| blocked_text(&self.board, t, now));
+                let next_steps = (self.board.state(id) == TaskState::Ready)
+                    .then(|| self.board.task(id).map(next_steps_text))
+                    .flatten();
                 // Whether a task dragged over this row may become its subtask.
                 let can_adopt = |dragged: u64| self.board.can_set_parent(dragged, Some(id));
                 let hovered_payload =
@@ -969,7 +1169,7 @@ impl TodoApp {
                             ui.allocate_exact_size(Vec2::new(4.0, 16.0), Sense::hover());
                         ui.painter().rect_filled(bar, 2.0, color);
                         let mut hover = updated_text(task, now);
-                        if let Some(text) = &blocker {
+                        if let Some(text) = blocker.as_ref().or(next_steps.as_ref()) {
                             hover = format!("{text}\n{hover}");
                         }
                         bar_response.on_hover_text(hover);
@@ -1057,8 +1257,14 @@ impl TodoApp {
                     })
                 });
                 let rect = shown.response.rect;
-                if blocker.is_some() {
-                    let color = blocked_glow_color(ui.visuals());
+                let glow_color = if blocker.is_some() {
+                    Some(blocked_glow_color(ui.visuals()))
+                } else if next_steps.is_some() {
+                    Some(next_glow_color(ui.visuals()))
+                } else {
+                    None
+                };
+                if let Some(color) = glow_color {
                     let shape = inner_glow(rect, ROW_RADIUS, ROW_GLOW_WIDTH, color);
                     ui.painter().set(glow, shape);
                 }
@@ -1115,6 +1321,19 @@ impl TodoApp {
             .and_then(|p| self.board.task(p))
             .map(|p| p.title.clone());
         let has_task = task.is_some();
+        let ready = state == Some(TaskState::Ready);
+        // Titles of the subtasks this task's steps were promoted to, by subtask id.
+        let promoted: Vec<(u64, String)> = task
+            .iter()
+            .flat_map(|t| &t.notes)
+            .filter_map(|n| match n.next_step {
+                Some(NextStep::Promoted { subtask, .. }) => {
+                    let title = self.board.task(subtask)?.title.clone();
+                    Some((subtask, title))
+                }
+                _ => None,
+            })
+            .collect();
         // The background (and glow) is painted into this slot once the card's rect
         // is known, so it stays behind the card's contents.
         let background = ui.painter().add(Shape::Noop);
@@ -1275,6 +1494,7 @@ impl TodoApp {
                     let hint = match *kind {
                         MessageKind::Comment => "Add a comment… (Enter to post, / for commands)",
                         MessageKind::Star => "Something worth remembering… (Enter to post)",
+                        MessageKind::Next => "What's the next step?… (Enter to post)",
                         MessageKind::Block => "Describe what you're waiting for… (Enter to post)",
                         MessageKind::Unblock => "What unblocked it?… (Enter to post)",
                         MessageKind::Close => "Closing note… (Enter to post)",
@@ -1377,6 +1597,13 @@ impl TodoApp {
                                     .as_mut()
                                     .filter(|e| e.task_id == id && e.idx == idx);
                                 let can_block = task.can_block();
+                                let promoted_to = match note.next_step {
+                                    Some(NextStep::Promoted { subtask, .. }) => promoted
+                                        .iter()
+                                        .find(|(s, _)| *s == subtask)
+                                        .map(|(_, title)| title.as_str()),
+                                    _ => None,
+                                };
                                 let frame = match note.blocker {
                                     // Highlighted with a glow painted below.
                                     Some(Blocker::Open) => Frame::new(),
@@ -1399,18 +1626,33 @@ impl TodoApp {
                                         let shown = frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
                                             comment(
-                                                ui, note, idx, id, hovered, can_block, edit, now,
+                                                ui,
+                                                note,
+                                                idx,
+                                                id,
+                                                hovered,
+                                                can_block,
+                                                promoted_to,
+                                                edit,
+                                                now,
                                                 actions,
                                             );
                                         });
-                                        if note.is_open_blocker() {
+                                        let glow_color = if note.is_open_blocker() {
+                                            Some(blocked_glow_color(&visuals))
+                                        } else if note.is_open_step() {
+                                            Some(next_glow_color(&visuals))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(color) = glow_color {
                                             ui.painter().set(
                                                 glow,
                                                 inner_glow(
                                                     shown.response.rect,
                                                     COMMENT_RADIUS,
                                                     COMMENT_GLOW_WIDTH,
-                                                    blocked_glow_color(&visuals),
+                                                    color,
                                                 ),
                                             );
                                         }
@@ -1432,13 +1674,20 @@ impl TodoApp {
                 CARD_RADIUS,
                 visuals.extreme_bg_color,
             )];
-            if blocked {
+            let glow_color = if blocked {
+                Some(blocked_glow_color(&visuals))
+            } else if ready {
+                Some(next_glow_color(&visuals))
+            } else {
+                None
+            };
+            if let Some(color) = glow_color {
                 let inside = rect.shrink(stroke.width);
                 shapes.push(inner_glow(
                     inside,
                     CARD_RADIUS - stroke.width,
                     CARD_GLOW_WIDTH,
-                    blocked_glow_color(&visuals),
+                    color,
                 ));
             }
             ui.painter().set(background, Shape::Vec(shapes));
@@ -1642,13 +1891,18 @@ impl TodoApp {
             .parent
             .and_then(|id| self.board.task(id))
             .map(|t| t.title.clone());
+        let promoting = draft.from_step.is_some();
         let mut submit = false;
         let mut cancel = false;
         let modal = Modal::new(Id::unique("new_task_modal")).show(ctx, |ui| {
             ui.set_width(420.0);
             match &parent_title {
                 Some(title) => {
-                    ui.heading("New subtask");
+                    ui.heading(if promoting {
+                        "Promote to subtask"
+                    } else {
+                        "New subtask"
+                    });
                     ui.add(
                         Label::new(RichText::new(format!("Subtask of: {title}")).weak()).truncate(),
                     );
@@ -1686,7 +1940,8 @@ impl TodoApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let can_create = !draft.title.trim().is_empty();
-                if ui.add_enabled(can_create, Button::new("Create")).clicked() {
+                let create = if promoting { "Promote" } else { "Create" };
+                if ui.add_enabled(can_create, Button::new(create)).clicked() {
                     submit = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -1697,13 +1952,20 @@ impl TodoApp {
 
         if submit && !draft.title.trim().is_empty() {
             let draft = self.new_task.take().unwrap_or_default();
-            let id = self.board.add_task(
-                draft.title.trim().to_owned(),
-                &draft.notes,
-                draft.parent,
-                Utc::now(),
-            );
-            if draft.add_to_focus {
+            let title = draft.title.trim().to_owned();
+            let id = match (draft.parent, draft.from_step) {
+                (Some(parent), Some(idx)) => {
+                    self.board
+                        .promote_step(parent, idx, title, &draft.notes, Utc::now())
+                }
+                _ => Some(
+                    self.board
+                        .add_task(title, &draft.notes, draft.parent, Utc::now()),
+                ),
+            };
+            if draft.add_to_focus
+                && let Some(id) = id
+            {
                 self.board.focus(id);
             }
             self.dirty = true;

@@ -80,7 +80,8 @@ fn log_refusal(why: &str) {
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        eprintln!("its4tasks-server: refused a token: {why}");
+        // Debug-quoted: parts of the token come into it, newlines and all.
+        eprintln!("its4tasks-server: refused a token: {why:?}");
     }
 }
 
@@ -93,6 +94,9 @@ pub struct JwtConfig {
     pub jwks_url: String,
     /// The `aud` tokens must have, if any.
     pub audience: Option<String>,
+    /// The `azp` (Clerk's authorized party: the site the token was made
+    /// for) tokens must have one of, if any are given.
+    pub authorized_parties: Vec<String>,
     /// How the browser signs in.
     pub web: WebSignIn,
     /// The cookie the browser's token is in.
@@ -169,11 +173,34 @@ impl JwtConfig {
                     .into());
             }
         };
+        let audience = var("ITS4TASKS_AUTH_AUDIENCE");
+        let authorized_parties: Vec<String> = var("ITS4TASKS_AUTH_AUTHORIZED_PARTIES")
+            .map(|v| {
+                v.split(',')
+                    .map(|p| p.trim().trim_end_matches('/').to_owned())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Without either, any token the issuer made for any of its apps
+        // signs in here too. A Clerk instance is this app's own, so Clerk
+        // tokens are fine without; other issuers often serve many apps.
+        if audience.is_none() && authorized_parties.is_empty() {
+            let what = match web {
+                WebSignIn::Clerk(_) => "a Clerk token made for any of the instance's sites",
+                WebSignIn::Redirect(_) => "a token the issuer made for any app",
+            };
+            eprintln!(
+                "its4tasks-server: warning: neither ITS4TASKS_AUTH_AUDIENCE nor \
+                 ITS4TASKS_AUTH_AUTHORIZED_PARTIES is set, so {what} signs in"
+            );
+        }
         Ok(Some(JwtConfig {
             jwks_url: var("ITS4TASKS_AUTH_JWKS_URL")
                 .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json")),
             issuer,
-            audience: var("ITS4TASKS_AUTH_AUDIENCE"),
+            audience,
+            authorized_parties,
             web,
             cookie: var("ITS4TASKS_AUTH_COOKIE").unwrap_or_else(|| "__session".to_owned()),
             oauth,
@@ -346,6 +373,7 @@ struct Claims {
     exp: NumericDate,
     nbf: Option<NumericDate>,
     aud: Option<Audience>,
+    azp: Option<String>,
 }
 
 /// Seconds since the epoch, which may be given with a fraction.
@@ -392,6 +420,14 @@ impl Claims {
             if !ok {
                 return Err("for another audience".into());
             }
+        }
+        if !config.authorized_parties.is_empty()
+            && !self
+                .azp
+                .as_ref()
+                .is_some_and(|azp| config.authorized_parties.contains(azp))
+        {
+            return Err("for another site".into());
         }
         Ok(())
     }
@@ -455,6 +491,7 @@ mod tests {
             issuer: ISSUER.into(),
             jwks_url: String::new(),
             audience: audience.map(str::to_owned),
+            authorized_parties: Vec::new(),
             web: WebSignIn::Redirect(String::new()),
             cookie: "__session".into(),
             oauth: None,
@@ -601,6 +638,24 @@ mod tests {
         assert!(verify(&jwt, &token(&header, &claims)).await.is_err());
     }
 
+    #[tokio::test]
+    async fn checks_the_authorized_party_if_asked() {
+        let now = get_current_timestamp();
+        let (header, mut claims) = clerk_like(now);
+        let mut jwt = jwt(None);
+        jwt.config.authorized_parties = vec!["https://its4tasks.example.test".into()];
+        assert!(verify(&jwt, &token(&header, &claims)).await.is_ok());
+        claims["azp"] = json!("https://evil.test");
+        assert!(
+            verify(&jwt, &token(&header, &claims))
+                .await
+                .unwrap_err()
+                .contains("another site")
+        );
+        claims.as_object_mut().unwrap().remove("azp");
+        assert!(verify(&jwt, &token(&header, &claims)).await.is_err());
+    }
+
     #[test]
     fn finds_the_token() {
         let mut headers = HeaderMap::new();
@@ -617,6 +672,7 @@ mod tests {
             issuer: "https://auth.test".into(),
             jwks_url: String::new(),
             audience: None,
+            authorized_parties: Vec::new(),
             web: WebSignIn::Redirect("https://auth.test/sign-in?redirect_url={redirect}".into()),
             cookie: "__session".into(),
             oauth: None,

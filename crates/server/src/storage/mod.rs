@@ -148,6 +148,41 @@ impl Store {
         Ok(())
     }
 
+    /// One of these task and comment ids that's on a board other than
+    /// `owner`'s, if any.
+    pub async fn taken_elsewhere(
+        &self,
+        owner: Uuid,
+        tasks: &[Uuid],
+        notes: &[Uuid],
+    ) -> Result<Option<Uuid>, DbErr> {
+        // Few enough at a time for any database's limit on parameters.
+        const CHUNK: usize = 500;
+        let owner = owner.to_string();
+        let ids = |chunk: &[Uuid]| chunk.iter().map(Uuid::to_string).collect::<Vec<_>>();
+        for chunk in tasks.chunks(CHUNK) {
+            let row = task::Entity::find()
+                .filter(task::Column::Id.is_in(ids(chunk)))
+                .filter(task::Column::OwnerId.ne(&owner))
+                .one(&self.db)
+                .await?;
+            if let Some(row) = row {
+                return convert::parse_id(&row.id, "task").map(Some);
+            }
+        }
+        for chunk in notes.chunks(CHUNK) {
+            let row = note::Entity::find()
+                .filter(note::Column::Id.is_in(ids(chunk)))
+                .filter(note::Column::OwnerId.ne(&owner))
+                .one(&self.db)
+                .await?;
+            if let Some(row) = row {
+                return convert::parse_id(&row.id, "comment").map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     /// Whose board the task is on, if it exists.
     pub async fn owner_of_task(&self, id: Uuid) -> Result<Option<Uuid>, DbErr> {
         let row = task::Entity::find_by_id(id.to_string())
@@ -493,6 +528,15 @@ mod tests {
             assert_eq!(store.owner_of_task(task).await.unwrap(), Some(me));
             assert_eq!(store.owner_of_note(note).await.unwrap(), Some(me));
             assert_eq!(store.owner_of_task(Uuid::new_v4()).await.unwrap(), None);
+            let fresh = Uuid::new_v4();
+            let taken = |owner, tasks: Vec<Uuid>, notes: Vec<Uuid>| {
+                let store = &store;
+                async move { store.taken_elsewhere(owner, &tasks, &notes).await.unwrap() }
+            };
+            assert_eq!(taken(bob, vec![fresh, task], vec![]).await, Some(task));
+            assert_eq!(taken(bob, vec![fresh], vec![note]).await, Some(note));
+            assert_eq!(taken(me, vec![task], vec![note]).await, None, "her own");
+            assert_eq!(taken(bob, vec![fresh], vec![fresh]).await, None);
 
             // A board naming someone else's task can't change or delete it.
             let mut sneaky = his.clone();

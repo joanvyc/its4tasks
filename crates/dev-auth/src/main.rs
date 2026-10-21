@@ -506,6 +506,7 @@ mod tests {
             issuer: URL.into(),
             jwks_url: String::new(),
             audience: None,
+            authorized_parties: Vec::new(),
             web: WebSignIn::Redirect(String::new()),
             cookie: "__session".into(),
             oauth: None,

@@ -6,7 +6,7 @@ It runs as a server, `its4tasks-server`, which keeps every user's board and serv
 - `crates/core` (`its4tasks-core`): what both sides share. Must keep building for `wasm32-unknown-unknown`.
   - `model.rs`: data and rules.
   - `log.rs`: log grouping.
-  - `api.rs`: the only way to change a board. Clients read a `Board` and send serializable `Change`s, and `apply_change` holds the rules for them. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4). Changes address comments by id, never by position, and changes that create things carry client-picked ids. `Change::Import` adds a whole board's tasks (given fresh ids by `import::fresh_ids` first).
+  - `api.rs`: the only way to change a board. Clients read a `Board` and send serializable `Change`s, and `apply_change` holds the rules for them. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4). Changes address comments by id, never by position, and changes that create things carry client-picked ids. `apply_change` refuses titles, comments and boards over the `MAX_*` limits (`TooBig`, 413), and the server refuses new ids already on someone else's board (`Duplicate`). `Change::Import` adds a whole board's tasks (given fresh ids by `import::fresh_ids` first).
   - `import.rs`: `its4tasks.json` files. `export` writes one (the board, plus `format`/`version`/`exported_at` markers), and `parse` reads it, as well as the older `board.json` formats. `welcome.rs`: the board a new user starts with.
   - `examples/import_change.rs`: prints the `Import` change for an `its4tasks.json`, for seeding test users.
 - `crates/server` (`its4tasks-server`, library and binary):
@@ -14,7 +14,7 @@ It runs as a server, `its4tasks-server`, which keeps every user's board and serv
   - `clerk.rs`, `clerk.js`: with Clerk, the page loads Clerk's script and defines `window.its4tasksAuth`: `token({ fresh })` and `signIn()`. The startup page and the web GUI ask it for a token before each request. The server then serves the page without checking for a session, and the startup page sends people to sign in itself.
   - `api.rs`: `Api`, a board per user plus saving after each change. An unknown `(iss, sub)` becomes a new user, whose board is empty with `started: false` until they start one or import one. Touching another user's task or comment is `Forbidden`.
   - `storage/`: sea-orm over SQLite (feature `sqlite`, default) or Postgres (feature `postgres`): entities, migrations, and a per-user diff so a save writes only what changed. Every row carries its `owner_id`.
-  - `server.rs`: `GET /api/board`, `POST /api/changes` (401 without a valid token, 403 for others' things), `POST /api/start` (a new user's welcome board; 409 once started), `POST /api/import` (an `its4tasks.json`'s text; the server parses it with `core::import`), and `GET /api/auth` (how native apps sign in). It also serves the web GUI's files, with an ETag and `no-cache`, since their names don't change between builds.
+  - `server.rs`: anything but a `GET` to `/api` sent by another site's page is refused with 403 (`same_origin`: `Sec-Fetch-Site`, else `Origin`), as the cookie would sign it in. Every answer forbids framing. `GET /api/board`, `POST /api/changes` (401 without a valid token, 403 for others' things), `POST /api/start` (a new user's welcome board; 409 once started), `POST /api/import` (an `its4tasks.json`'s text; the server parses it with `core::import`), and `GET /api/auth` (how native apps sign in). It also serves the web GUI's files, with an ETag and `no-cache`, since their names don't change between builds.
   - `page/index.html`: the startup page at `/`. Before downloading the board app, it checks sign-in and whether the user has a board. Signed-out visitors go straight to sign-in, with nothing rendered. New users get a plain HTML landing page (start, or import an `its4tasks.json`). Everyone else gets the board app, which it loads by importing `/its4tasks.js`. In cookie mode the server sends strangers to the sign-in page before serving it. `page/favicon.svg` is the site's icon, at `/favicon.svg`.
   - `main.rs`: configuration from the environment; `README.md` lists it.
   - The web GUI is `crates/gui/dist`, embedded by rust-embed. Debug builds read it from disk, release builds bake it in (see `build.rs`).
@@ -38,8 +38,10 @@ Before finishing a change, run these. All must pass with no warnings.
 cargo fmt --all && cargo clippy --workspace --all-targets \
   && cargo clippy -p its4tasks --target wasm32-unknown-unknown \
   && cargo clippy -p its4tasks-server --no-default-features --features postgres --all-targets \
-  && cargo test --workspace
+  && cargo test --workspace \
+  && cargo audit
 ```
+`cargo audit` checks `Cargo.lock` against the RustSec advisories. It's known to list `rsa` (RUSTSEC-2023-0071, which affects private-key use, while the server only verifies) and some unmaintained crates under eframe. New ones need a look.
 Keep logic in `model.rs`/`log.rs`, where it can be unit-tested, rather than in `app.rs`. `app.rs` never mutates the model: a new kind of edit gets a `Change` variant in `api.rs`.
 
 The storage tests also run against Postgres when `TEST_DATABASE_URL` points at a server they may create databases on, with the `postgres` feature on (the default build has no Postgres driver). A throwaway cluster will do:

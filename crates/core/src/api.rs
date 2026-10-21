@@ -14,7 +14,16 @@ use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{Board, MessageKind, MoveError, Task};
+use crate::model::{Board, MessageKind, MoveError, Note, NoteAction, Task};
+
+/// The longest task title, in bytes.
+pub const MAX_TITLE: usize = 2 << 10;
+/// The longest comment, in bytes.
+pub const MAX_TEXT: usize = 64 << 10;
+/// The most tasks a board holds.
+pub const MAX_TASKS: usize = 20_000;
+/// The most comments a board holds, over all its tasks.
+pub const MAX_NOTES: usize = 200_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Change {
@@ -167,6 +176,9 @@ pub enum ApiError {
     Forbidden(Uuid),
     /// The board's rules don't allow it, e.g. a parent that makes a cycle.
     Refused,
+    /// A title or comment is too long, or the board would get too big (see
+    /// `MAX_TITLE` and the like).
+    TooBig,
 }
 
 impl fmt::Display for ApiError {
@@ -178,6 +190,7 @@ impl fmt::Display for ApiError {
             ApiError::Duplicate(id) => write!(f, "The id {id} is taken"),
             ApiError::Forbidden(id) => write!(f, "{id} is on someone else's board"),
             ApiError::Refused => f.write_str("Not allowed"),
+            ApiError::TooBig => f.write_str("That's too big for a board"),
         }
     }
 }
@@ -226,6 +239,7 @@ pub fn apply_change(
     change: Change,
     now: DateTime<Utc>,
 ) -> Result<Outcome, ApiError> {
+    fits(b, &change)?;
     match change {
         Change::AddTask {
             id,
@@ -347,6 +361,42 @@ pub fn apply_change(
     Ok(Outcome::Done)
 }
 
+/// Whether the board still fits the limits after `change`, as far as its
+/// size goes.
+fn fits(b: &Board, change: &Change) -> Result<(), ApiError> {
+    let long_title = |title: &str| title.len() > MAX_TITLE;
+    let long_text = |text: &str| text.len() > MAX_TEXT;
+    let long_note = |n: &Note| {
+        long_text(&n.text)
+            || matches!(&n.action, Some(NoteAction::Unblocked { quote, .. }) if long_text(quote))
+    };
+    let (too_long, new_tasks, new_notes) = match change {
+        Change::AddTask { title, notes, .. } | Change::PromoteStep { title, notes, .. } => {
+            (long_title(title) || long_text(notes), 1, 1)
+        }
+        Change::Rename { title, .. } => (long_title(title), 0, 0),
+        Change::Post { text, .. } => (long_text(text), 0, 1),
+        Change::EditNote { text, .. } => (long_text(text), 0, 0),
+        Change::Import { board } => (
+            board
+                .tasks
+                .iter()
+                .any(|t| long_title(&t.title) || t.notes.iter().any(long_note)),
+            board.tasks.len(),
+            board.tasks.iter().map(|t| t.notes.len()).sum(),
+        ),
+        _ => (false, 0, 0),
+    };
+    let notes = || b.tasks.iter().map(|t| t.notes.len()).sum::<usize>();
+    if too_long
+        || (new_tasks > 0 && b.tasks.len() + new_tasks > MAX_TASKS)
+        || (new_notes > 0 && notes() + new_notes > MAX_NOTES)
+    {
+        return Err(ApiError::TooBig);
+    }
+    Ok(())
+}
+
 fn import(b: &mut Board, imported: Board) -> Result<(), ApiError> {
     let mut tasks = HashSet::new();
     let mut notes = HashSet::new();
@@ -457,6 +507,52 @@ mod tests {
         assert_eq!(a, apply_change(&mut there, promote, now));
         assert!(matches!(a, Ok(Outcome::Created(_))));
         assert_eq!(here, there);
+    }
+
+    #[test]
+    fn boards_have_a_size_limit() {
+        let now = now();
+        let mut b = Board::default();
+        let long = |n: usize| "x".repeat(n);
+        let add = |title: String, notes: String| Change::add_task(title, notes, None, false);
+        assert_eq!(
+            apply_change(&mut b, add(long(MAX_TITLE + 1), String::new()), now),
+            Err(ApiError::TooBig)
+        );
+        assert_eq!(
+            apply_change(&mut b, add("a".into(), long(MAX_TEXT + 1)), now),
+            Err(ApiError::TooBig)
+        );
+        assert!(b.tasks.is_empty(), "nothing added");
+        let Ok(Outcome::Created(id)) =
+            apply_change(&mut b, add(long(MAX_TITLE), long(MAX_TEXT)), now)
+        else {
+            panic!("as long as allowed is fine")
+        };
+        let post = Change::post(id, long(MAX_TEXT + 1), MessageKind::Comment);
+        assert_eq!(apply_change(&mut b, post, now), Err(ApiError::TooBig));
+        let note = b.tasks[0].notes[0].id;
+        let edit = Change::EditNote {
+            note,
+            text: long(MAX_TEXT + 1),
+        };
+        assert_eq!(apply_change(&mut b, edit, now), Err(ApiError::TooBig));
+        let rename = Change::Rename {
+            task: id,
+            title: long(MAX_TITLE + 1),
+        };
+        assert_eq!(apply_change(&mut b, rename, now), Err(ApiError::TooBig));
+
+        // Too many tasks, all at once.
+        let mut big = Board::default();
+        for _ in 0..MAX_TASKS {
+            big.add_task("t".into(), "", None, now);
+        }
+        let import = Change::Import {
+            board: crate::import::fresh_ids(big),
+        };
+        assert_eq!(apply_change(&mut b, import, now), Err(ApiError::TooBig));
+        assert_eq!(b.tasks.len(), 1);
     }
 
     #[test]

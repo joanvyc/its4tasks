@@ -21,12 +21,14 @@
 //!   `crates/gui` and embedded in release builds. Their names don't change
 //!   between builds, so they're sent with an ETag and `no-cache`.
 //!
-//! Without a valid token the API answers 401.
+//! Without a valid token the API answers 401. Anything but a `GET` from a
+//! page on another site is refused with 403 (see `same_origin`).
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -78,11 +80,68 @@ pub fn router(api: Api, auth: Auth) -> Router {
             "/import",
             post(import_board).layer(DefaultBodyLimit::max(IMPORT_LIMIT)),
         )
-        .route("/auth", get(auth_info));
+        .route("/auth", get(auth_info))
+        .layer(middleware::from_fn_with_state(state.clone(), same_origin));
     Router::new()
         .nest("/api", api)
         .fallback(web)
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Refuses requests that change something when a page on another site sent
+/// them. The browser would sign those in with the session cookie, so a page
+/// elsewhere could otherwise import into someone's board (CSRF). Browsers
+/// say where a request comes from (`Sec-Fetch-Site`, or else `Origin`); the
+/// native app says nothing, and is let through.
+async fn same_origin(State(state): State<Shared>, request: Request, next: Next) -> Response {
+    if request.method() != Method::GET && !from_here(&state, request.headers()) {
+        return (StatusCode::FORBIDDEN, "Sent from another site.").into_response();
+    }
+    next.run(request).await
+}
+
+fn from_here(state: &AppState, headers: &HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match header("sec-fetch-site") {
+        Some("same-origin" | "none") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    let Some(origin) = header(header::ORIGIN.as_str()) else {
+        return true;
+    };
+    // `scheme://host[:port]`, without any path.
+    let authority = |url: &str| {
+        url.split_once("://").map(|(scheme, rest)| {
+            (
+                scheme.to_owned(),
+                rest.split('/').next().unwrap_or("").to_owned(),
+            )
+        })
+    };
+    match (&state.public_url, authority(origin)) {
+        (_, None) => false,
+        (Some(public), origin) => authority(public) == origin,
+        (None, Some((_, host))) => header(header::HOST.as_str()) == Some(host.as_str()),
+    }
+}
+
+/// Headers for every answer: the browser mustn't guess content types, and
+/// no other site may show these pages in a frame (clickjacking).
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response
 }
 
 pub async fn serve(listener: TcpListener, api: Api, auth: Auth) -> std::io::Result<()> {
@@ -150,16 +209,19 @@ async fn change(
     match result {
         Ok(outcome) => Json(Applied { outcome, board }).into_response(),
         Err(Failure::Api(error)) => {
-            let status = match error {
-                ApiError::UnknownTask(_) | ApiError::UnknownNote(_) => StatusCode::NOT_FOUND,
-                ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
-                ApiError::Move(_) | ApiError::Duplicate(_) | ApiError::Refused => {
-                    StatusCode::CONFLICT
-                }
-            };
-            (status, Json(Rejected { error, board })).into_response()
+            (status(error), Json(Rejected { error, board })).into_response()
         }
         Err(e) => internal(e),
+    }
+}
+
+/// The status a change refused for `error` is answered with.
+fn status(error: ApiError) -> StatusCode {
+    match error {
+        ApiError::UnknownTask(_) | ApiError::UnknownNote(_) => StatusCode::NOT_FOUND,
+        ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+        ApiError::Move(_) | ApiError::Duplicate(_) | ApiError::Refused => StatusCode::CONFLICT,
+        ApiError::TooBig => StatusCode::PAYLOAD_TOO_LARGE,
     }
 }
 
@@ -205,7 +267,7 @@ async fn add_board(api: &mut Api, user: &User, board: Board) -> Response {
     };
     match api.apply(user, change).await {
         Ok(_) => {}
-        Err(Failure::Api(e)) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
+        Err(Failure::Api(e)) => return (status(e), e.to_string()).into_response(),
         Err(e) => return internal(e),
     }
     match api.board(user).await {
@@ -353,6 +415,7 @@ mod tests {
             issuer: ISSUER.into(),
             jwks_url: String::new(),
             audience: None,
+            authorized_parties: Vec::new(),
             web: WebSignIn::Redirect("https://auth.test/sign-in?redirect={redirect}".into()),
             cookie: "__session".into(),
             oauth: Some(OAuth {
@@ -654,6 +717,73 @@ mod tests {
         let carol: BoardView = serde_json::from_str(&body).unwrap();
         assert_eq!(carol.board.tasks[0].title, "From the old app");
         assert_ne!(carol.board.tasks[0].id, first.board.tasks[0].id, "new ids");
+    }
+
+    #[tokio::test]
+    async fn other_sites_pages_cant_change_boards() {
+        let app = app();
+        let alice = token("alice");
+        let import = |headers: &[(&str, &str)]| {
+            let mut request = Request::post("/api/start")
+                .header(header::HOST, "app.test")
+                .header(header::COOKIE, format!("__session={alice}"));
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        for refused in [
+            &[("sec-fetch-site", "cross-site")][..],
+            &[("sec-fetch-site", "same-site")],
+            &[("origin", "https://evil.test")],
+            &[("origin", "null")],
+        ] {
+            let (status, _, _) = call(&app, import(refused)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{refused:?}");
+        }
+        assert!(!view(&app, &alice).await.started, "nothing started");
+        // The board's own page, and apps that don't say.
+        let (status, _, _) = call(&app, import(&[("origin", "http://app.test")])).await;
+        assert_eq!(status, StatusCode::OK);
+        for allowed in [&[("sec-fetch-site", "same-origin")][..], &[]] {
+            let (status, _, _) = call(&app, import(allowed)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "let through: {allowed:?}");
+        }
+        // Reading is fine from anywhere: the browser keeps the answer from
+        // other sites.
+        let request = Request::get("/api/board")
+            .header(header::AUTHORIZATION, format!("Bearer {alice}"))
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(&app, request).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pages_cant_be_framed() {
+        let app = app();
+        for path in ["/", "/api/auth", "/favicon.svg"] {
+            let (_, headers, _) = call(&app, Request::get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{path}");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'none'",
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_changes_are_refused() {
+        let app = app();
+        let alice = token("alice");
+        let long = "x".repeat(its4tasks_core::api::MAX_TITLE + 1);
+        let add = Change::add_task(long, String::new(), None, false);
+        let (status, body) = post(&app, &alice, &add).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let rejected: Rejected = serde_json::from_str(&body).unwrap();
+        assert_eq!(rejected.error, ApiError::TooBig);
     }
 
     #[tokio::test]

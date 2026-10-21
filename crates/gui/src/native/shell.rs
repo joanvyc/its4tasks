@@ -73,13 +73,15 @@ impl Shell {
             Some(Source::Local) => shell.open_local(),
             Some(Source::Server { url, refresh_token }) => {
                 shell.url = url.clone();
-                match refresh_token {
-                    Some(token) => shell.wait("Signing in…", move || {
+                match (refresh_token, normalize(&url)) {
+                    // Saved before plain http:// was refused: not sent there.
+                    (_, Err(e)) => shell.message = Some(e),
+                    (Some(token), Ok(_)) => shell.wait("Signing in…", move || {
                         let tokens = oauth::refresh(&url, &token)
                             .map_err(|e| format!("Sign in again ({e})."))?;
                         Ok(Opened::Remote { url, tokens })
                     }),
-                    None => shell.message = Some("Sign in again.".into()),
+                    (None, Ok(_)) => shell.message = Some("Sign in again.".into()),
                 }
             }
         }
@@ -109,7 +111,13 @@ impl Shell {
     }
 
     fn sign_in(&mut self) {
-        let url = normalize(&self.url);
+        let url = match normalize(&self.url) {
+            Ok(url) => url,
+            Err(e) => {
+                self.message = Some(e);
+                return;
+            }
+        };
         self.url = url.clone();
         self.wait("Sign in in your browser…", move || {
             let tokens = oauth::sign_in(&url)?;
@@ -302,14 +310,32 @@ impl Shell {
     }
 }
 
-/// `example.com/` → `https://example.com`.
-fn normalize(url: &str) -> String {
+/// `example.com/` → `https://example.com`. Plain `http://` only reaches
+/// this computer: elsewhere, anyone on the way could read the tokens sent.
+fn normalize(url: &str) -> Result<String, String> {
     let url = url.trim().trim_end_matches('/');
-    if url.contains("://") {
+    let url = if url.contains("://") {
         url.to_owned()
     } else {
         format!("https://{url}")
+    };
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(""),
+        };
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !loopback {
+            return Err("Use https:// for a server on another computer.".into());
+        }
+    } else if !url.starts_with("https://") {
+        return Err("The server's address starts with https://.".into());
     }
+    Ok(url)
 }
 
 impl App for Shell {
@@ -360,7 +386,21 @@ mod tests {
 
     #[test]
     fn server_addresses_are_tidied() {
-        assert_eq!(normalize(" example.com/ "), "https://example.com");
-        assert_eq!(normalize("http://127.0.0.1:7979"), "http://127.0.0.1:7979");
+        assert_eq!(normalize(" example.com/ ").unwrap(), "https://example.com");
+        for local in [
+            "http://127.0.0.1:7979",
+            "http://localhost:7979",
+            "http://[::1]:7979",
+        ] {
+            assert_eq!(normalize(local).unwrap(), local);
+        }
+        for refused in [
+            "http://example.com",
+            "http://127.0.0.1.example.com",
+            "http://192.168.1.2:7979",
+            "ftp://example.com",
+        ] {
+            assert!(normalize(refused).is_err(), "{refused}");
+        }
     }
 }

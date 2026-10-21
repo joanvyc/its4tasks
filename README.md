@@ -71,6 +71,7 @@ Everything is set through environment variables.
 | `ITS4TASKS_AUTH_SIGN_IN_URL` | Its sign-in page. `{redirect}` is replaced with the page to come back to, e.g. `https://accounts.example.com/sign-in?redirect_url={redirect}`. **Required** without Clerk. |
 | `ITS4TASKS_AUTH_JWKS_URL` | Its public keys. The default is `{issuer}/.well-known/jwks.json`. |
 | `ITS4TASKS_AUTH_AUDIENCE` | If set, tokens must have this `aud`. |
+| `ITS4TASKS_AUTH_AUTHORIZED_PARTIES` | If set, a comma-separated list of the sites (e.g. `https://its4tasks.example.com`) tokens must name in `azp`, as Clerk's do. Set this or the audience if the issuer serves other apps too: otherwise their users' tokens sign in here as well. The server warns at startup when neither is set. |
 | `ITS4TASKS_AUTH_COOKIE` | The cookie browsers carry the token in. The default is `__session`. |
 | `ITS4TASKS_OAUTH_AUTHORIZE_URL`, `ITS4TASKS_OAUTH_TOKEN_URL`, `ITS4TASKS_OAUTH_CLIENT_ID` | Optional, all three or none: lets the desktop app sign in, see below. |
 

@@ -128,6 +128,10 @@ impl Api {
         change: Change,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Failure> {
+        let (tasks, notes) = new_ids(&change);
+        if let Some(id) = self.taken_elsewhere(user, &tasks, &notes).await? {
+            return Err(ApiError::Duplicate(id).into());
+        }
         let board = self.load(user.id).await?;
         let outcome = match apply_change(board, change, now) {
             Ok(outcome) => outcome,
@@ -172,6 +176,30 @@ impl Api {
         })
     }
 
+    /// One of these new ids that's already on someone else's board. The
+    /// user's own board is `apply_change`'s to check.
+    async fn taken_elsewhere(
+        &self,
+        user: &User,
+        tasks: &[Uuid],
+        notes: &[Uuid],
+    ) -> Result<Option<Uuid>, DbErr> {
+        if tasks.is_empty() && notes.is_empty() {
+            return Ok(None);
+        }
+        if let Some(store) = &self.store {
+            return store.taken_elsewhere(user.id, tasks, notes).await;
+        }
+        let others = self.boards.iter().filter(|(owner, _)| **owner != user.id);
+        Ok(others
+            .flat_map(|(_, board)| {
+                let task = tasks.iter().find(|&&id| board.task(id).is_some());
+                task.or_else(|| notes.iter().find(|&&id| board.find_note(id).is_some()))
+            })
+            .next()
+            .copied())
+    }
+
     async fn owner_of(&self, id: Uuid, task: bool) -> Result<Option<Uuid>, DbErr> {
         if let Some(store) = &self.store {
             return if task {
@@ -188,6 +216,26 @@ impl Api {
             };
             found.then_some(*owner)
         }))
+    }
+}
+
+/// The task and comment ids a change would create.
+fn new_ids(change: &Change) -> (Vec<Uuid>, Vec<Uuid>) {
+    match change {
+        Change::AddTask { id, note_id, .. } | Change::PromoteStep { id, note_id, .. } => {
+            (vec![*id], vec![*note_id])
+        }
+        Change::Post { id, .. } => (Vec::new(), vec![*id]),
+        Change::Import { board } => (
+            board.tasks.iter().map(|t| t.id).collect(),
+            board
+                .tasks
+                .iter()
+                .flat_map(|t| &t.notes)
+                .map(|n| n.id)
+                .collect(),
+        ),
+        _ => (Vec::new(), Vec::new()),
     }
 }
 
@@ -310,6 +358,37 @@ mod tests {
             api_error(api.apply(&me, post).await),
             ApiError::Duplicate(id)
         );
+    }
+
+    #[tokio::test]
+    async fn ids_on_other_boards_are_taken() {
+        let mut api = Api::new();
+        let me = alice(&mut api).await;
+        let bob = api.sign_in("https://auth.test", "bob").await.unwrap();
+        let a = add(&mut api, &me, "alice's", false).await;
+        let post = Change::post(a, "mine".into(), MessageKind::Comment);
+        api.apply(&me, post).await.unwrap();
+        let note = api.board(&me).await.unwrap().1.task(a).unwrap().notes[0].id;
+        let mut theirs = Change::add_task("bob's".into(), String::new(), None, false);
+        if let Change::AddTask { id, .. } = &mut theirs {
+            *id = a;
+        }
+        assert_eq!(
+            api_error(api.apply(&bob, theirs).await),
+            ApiError::Duplicate(a)
+        );
+        let b = add(&mut api, &bob, "bob's", false).await;
+        let post = Change::Post {
+            task: b,
+            id: note,
+            text: "hi".into(),
+            kind: MessageKind::Comment,
+        };
+        assert_eq!(
+            api_error(api.apply(&bob, post).await),
+            ApiError::Duplicate(note)
+        );
+        assert_eq!(api.board(&bob).await.unwrap().1.tasks.len(), 1);
     }
 
     #[tokio::test]

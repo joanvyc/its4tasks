@@ -1,6 +1,6 @@
 # its4tasks
 
-A personal todo board: up to four tasks in focus as cards, the rest in a list, and a log of what happened each day or week. Each task keeps its comments as a running log, with next steps, blockers and stars.
+A personal todo board: up to four tasks in focus as cards, the rest in a list, and a log of what happened each day or week. Each task keeps its comments as a running log, with next steps, blockers and stars. Hence the name, read either way: it's for tasks, and it's four tasks.
 
 Boards are personal. Everyone who signs in gets their own board, and nothing is shared between users.
 

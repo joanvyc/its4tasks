@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- its4tasks: four focus cards, one of them in hand. -->
+  <rect x="3" y="3" width="27" height="27" rx="7" fill="#1e64d2"/>
+  <path d="M9.5 17l5 5 9.5-10" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="34" y="3" width="27" height="27" rx="7" fill="#8c96a5"/>
+  <rect x="3" y="34" width="27" height="27" rx="7" fill="#8c96a5"/>
+  <rect x="34" y="34" width="27" height="27" rx="7" fill="#8c96a5"/>
+</svg>

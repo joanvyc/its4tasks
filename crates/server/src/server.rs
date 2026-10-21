@@ -10,6 +10,7 @@
 //!   it isn't one.
 //! - `GET /api/auth`: how the native app signs in (OAuth), if it can.
 //!   Answered to anyone.
+//! - `/favicon.svg`: the site's icon (`page/favicon.svg`).
 //! - `/`: the startup page (`page/index.html`). It checks sign-in and the
 //!   board before loading anything big: signed-out visitors go to sign in,
 //!   new users get the landing page, and everyone else the board app. The
@@ -244,10 +245,23 @@ fn internal(e: Failure) -> Response {
 /// The startup page, served at `/`.
 const PAGE: &str = include_str!("page/index.html");
 
+/// The site's icon: four focus cards, one in hand.
+const FAVICON: &str = include_str!("page/favicon.svg");
+
 async fn web(State(state): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     if path.is_empty() || path == "index.html" {
         return page(&state, &uri, &headers).await;
+    }
+    if path == "favicon.svg" {
+        return (
+            [
+                (header::CONTENT_TYPE, "image/svg+xml"),
+                (header::CACHE_CONTROL, "max-age=86400"),
+            ],
+            FAVICON,
+        )
+            .into_response();
     }
     let Some(file) = Web::get(path) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -631,6 +645,20 @@ mod tests {
         let (status, body) = post_text(&app, "/api/import", Some(&bob), "not json").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("board.json"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_page_has_an_icon() {
+        let app = app();
+        let (status, headers, svg) = call(
+            &app,
+            Request::get("/favicon.svg").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "image/svg+xml");
+        assert!(svg.starts_with("<svg"));
+        assert!(PAGE.contains(r#"href="/favicon.svg""#));
     }
 
     #[tokio::test]

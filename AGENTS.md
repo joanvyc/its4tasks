@@ -7,15 +7,15 @@ It runs as a server, `its4tasks-server`, which keeps every user's board and serv
   - `model.rs`: data and rules.
   - `log.rs`: log grouping.
   - `api.rs`: the only way to change a board. Clients read a `Board` and send serializable `Change`s, and `apply_change` holds the rules for them. Tasks and comments have stable UUIDs (`Task::id` is a time-ordered v7, so sorting by it gives creation order; `Note::id` is a v4). Changes address comments by id, never by position, and changes that create things carry client-picked ids. `Change::Import` adds a whole board's tasks (given fresh ids by `import::fresh_ids` first).
-  - `import.rs`: reading `board.json` files, including the older formats. `welcome.rs`: the board a new user starts with.
-  - `examples/import_change.rs`: prints the `Import` change for a `board.json`, for seeding test users.
+  - `import.rs`: `its4tasks.json` files. `export` writes one (the board, plus `format`/`version`/`exported_at` markers), and `parse` reads it, as well as the older `board.json` formats. `welcome.rs`: the board a new user starts with.
+  - `examples/import_change.rs`: prints the `Import` change for an `its4tasks.json`, for seeding test users.
 - `crates/server` (`its4tasks-server`, library and binary):
   - `auth.rs`: who's asking. Users sign in at an outside authority (Clerk or similar) that signs JWTs; the server checks them against the authority's JWKS and knows a user by the token's `(iss, sub)`. The token comes as `Authorization: Bearer` (native, and the browser with Clerk) or in the `__session` cookie (browser). `Auth::Local` is the native app's local mode instead: one random bearer secret, standing for the local user. Tokens are read by `Jwt::verify` itself (header, claims, times with 60 s leeway, issuer, audience), and jsonwebtoken only checks the signature (`crypto::verify`). `jsonwebtoken::decode` refuses any token whose header has a non-string extra field, and Clerk's renewed tokens have numeric ones. Refused tokens are logged with the reason, at most every 10 s.
   - `clerk.rs`, `clerk.js`: with Clerk, the page loads Clerk's script and defines `window.its4tasksAuth`: `token({ fresh })` and `signIn()`. The startup page and the web GUI ask it for a token before each request. The server then serves the page without checking for a session, and the startup page sends people to sign in itself.
   - `api.rs`: `Api`, a board per user plus saving after each change. An unknown `(iss, sub)` becomes a new user, whose board is empty with `started: false` until they start one or import one. Touching another user's task or comment is `Forbidden`.
   - `storage/`: sea-orm over SQLite (feature `sqlite`, default) or Postgres (feature `postgres`): entities, migrations, and a per-user diff so a save writes only what changed. Every row carries its `owner_id`.
-  - `server.rs`: `GET /api/board`, `POST /api/changes` (401 without a valid token, 403 for others' things), `POST /api/start` (a new user's welcome board; 409 once started), `POST /api/import` (a `board.json`'s text; the server parses it with `core::import`), and `GET /api/auth` (how native apps sign in). It also serves the web GUI's files, with an ETag and `no-cache`, since their names don't change between builds.
-  - `page/index.html`: the startup page at `/`. Before downloading the board app, it checks sign-in and whether the user has a board. Signed-out visitors go straight to sign-in, with nothing rendered. New users get a plain HTML landing page (start, or import a `board.json`). Everyone else gets the board app, which it loads by importing `/its4tasks.js`. In cookie mode the server sends strangers to the sign-in page before serving it. `page/favicon.svg` is the site's icon, at `/favicon.svg`.
+  - `server.rs`: `GET /api/board`, `POST /api/changes` (401 without a valid token, 403 for others' things), `POST /api/start` (a new user's welcome board; 409 once started), `POST /api/import` (an `its4tasks.json`'s text; the server parses it with `core::import`), and `GET /api/auth` (how native apps sign in). It also serves the web GUI's files, with an ETag and `no-cache`, since their names don't change between builds.
+  - `page/index.html`: the startup page at `/`. Before downloading the board app, it checks sign-in and whether the user has a board. Signed-out visitors go straight to sign-in, with nothing rendered. New users get a plain HTML landing page (start, or import an `its4tasks.json`). Everyone else gets the board app, which it loads by importing `/its4tasks.js`. In cookie mode the server sends strangers to the sign-in page before serving it. `page/favicon.svg` is the site's icon, at `/favicon.svg`.
   - `main.rs`: configuration from the environment; `README.md` lists it.
   - The web GUI is `crates/gui/dist`, embedded by rust-embed. Debug builds read it from disk, release builds bake it in (see `build.rs`).
 - `crates/gui` (`its4tasks`):
@@ -25,7 +25,7 @@ It runs as a server, `its4tasks-server`, which keeps every user's board and serv
     - A 401, or no token from the page, sets `unauthorized()`. Requests are held and retried every 2 s, with a fresh token in the browser. The native shell refreshes its token and calls `set_token`.
     - `signed_out()` is true after 10 s of refusals, and the view bar then says so (with "Sign in again" in the browser).
     - **The app never reloads the page or redirects on its own.** Doing so loses whatever the user was doing, and Clerk can briefly have no token while it renews one.
-  - `files.rs`: picking a `board.json` to import, natively or in the browser.
+  - `files.rs`: picking an `its4tasks.json` to import (`pick_board`), and saving an export (`save_export`). Natively through rfd's dialogs, in the browser through its file picker and a download link.
   - `unsent.rs`: in the browser, work not on the server yet is kept in `localStorage` (`its4tasks.unsent.<user id>`) about once a second, and right before "Sign in again". That means changes held while refused (`Client::held`, empty unless refused, so nothing is sent twice), comment drafts by task, a comment being edited, and the new-task form. The app puts it back after the next load for the same user (`BoardView::user`).
   - `native/`: the native app's shell. The first time, it asks where the board is (`shell.rs`): a local board, served in-process from `board.sqlite` in the data directory (`local.rs`), or a server, signed in through the browser with OAuth code + PKCE and a loopback redirect (`oauth.rs`). The choice and the refresh token are kept in `config.json` in the config directory (`config.rs`).
   - `main.rs`: the native window, or the browser canvas in `index.html`.
@@ -65,7 +65,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
 
 1. **Never touch the user's real data or settings.** The native app keeps its local board in `~/.local/share/its4tasks/board.sqlite` and its settings, including a refresh token, in `~/.config/its4tasks/config.json`. Always point both `XDG_DATA_HOME` and `XDG_CONFIG_HOME` at temporary directories, for the app and for the server. Use ports other than the default 7878, so a real server or GUI the user has open never meets the test data: 7979 for the server and 7980 for dev-auth below.
 
-2. **Start the fake authority and a server that trusts it**, then seed a test user's board. `tools/seed_board.py` writes a `board.json` with about 12 days of history: open and resolved blockers, starred comments, a done task, and fresh and stale tasks. Extend it when a change needs other cases.
+2. **Start the fake authority and a server that trusts it**, then seed a test user's board. `tools/seed_board.py` writes an `its4tasks.json`, in the old numbered format, with about 12 days of history: open and resolved blockers, starred comments, a done task, and fresh and stale tasks. Extend it when a change needs other cases.
    ```sh
    cargo build
    T=$(mktemp -d)
@@ -84,7 +84,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
    TOKEN=$(curl -s -D - -o /dev/null -d name=alice -d redirect=http://127.0.0.1:7979/ \
      http://127.0.0.1:7980/sign-in | sed -n 's/^set-cookie: __session=\([^;]*\).*/\1/ip')
    python3 tools/seed_board.py "$T/seed"
-   cargo run -q -p its4tasks-core --example import_change -- "$T/seed/its4tasks/board.json" \
+   cargo run -q -p its4tasks-core --example import_change -- "$T/seed/its4tasks.json" \
      | curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary @- \
        127.0.0.1:7979/api/changes > /dev/null
    ```

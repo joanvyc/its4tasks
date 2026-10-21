@@ -11,7 +11,7 @@ use eframe::egui::{
 
 use crate::api::{self, Change};
 use crate::client::Client;
-use crate::files::{self, Picked};
+use crate::files::{self, Picked, Saved};
 use crate::import;
 use crate::log::{self, EntryKind, LogPage, Period};
 use crate::model::{
@@ -916,10 +916,12 @@ pub struct TodoApp {
     /// menu offers it.
     switchable: bool,
     request: Option<Request>,
-    /// A `board.json` being picked for importing.
+    /// An `its4tasks.json` being picked for importing.
     picking: Option<Receiver<Picked>>,
-    /// Why the last import failed.
-    import_error: Option<String>,
+    /// An export being saved.
+    saving: Option<Receiver<Saved>>,
+    /// Why the last import or export failed.
+    file_problem: Option<String>,
     filter: String,
     new_task: Option<NewTaskDraft>,
     /// The task waiting for the user to confirm its deletion.
@@ -968,7 +970,8 @@ impl TodoApp {
             switchable,
             request: None,
             picking: None,
-            import_error: None,
+            saving: None,
+            file_problem: None,
             filter: String::new(),
             new_task: None,
             confirm_delete: None,
@@ -1059,7 +1062,7 @@ impl TodoApp {
         self.request.take()
     }
 
-    /// Asks for a `board.json` to add to the board.
+    /// Asks for an `its4tasks.json` to add to the board.
     fn pick_import(&mut self, ctx: &egui::Context) {
         if self.picking.is_none() {
             let ctx = ctx.clone();
@@ -1067,7 +1070,30 @@ impl TodoApp {
         }
     }
 
-    /// Imports the `board.json` picked, once it is.
+    /// Saves the board as shown to an `its4tasks.json`.
+    fn export(&mut self, ctx: &egui::Context) {
+        if self.saving.is_none() {
+            let json = import::export(self.api.board(), Utc::now());
+            let ctx = ctx.clone();
+            self.saving = Some(files::save_export(json, move || ctx.request_repaint()));
+        }
+    }
+
+    /// Notes how saving an export went, once it has.
+    fn poll_export(&mut self) {
+        let Some(saving) = &self.saving else {
+            return;
+        };
+        let Ok(saved) = saving.try_recv() else {
+            return;
+        };
+        self.saving = None;
+        if let Some(Err(e)) = saved {
+            self.file_problem = Some(format!("Couldn't export: {e}"));
+        }
+    }
+
+    /// Imports the `its4tasks.json` picked, once it is.
     fn poll_import(&mut self) {
         let Some(picking) = &self.picking else {
             return;
@@ -1076,7 +1102,7 @@ impl TodoApp {
             return;
         };
         self.picking = None;
-        self.import_error = match picked {
+        self.file_problem = match picked {
             None => None,
             Some(Err(e)) => Some(format!("Couldn't import: {e}")),
             Some(Ok(board)) => self
@@ -1140,9 +1166,11 @@ impl TodoApp {
                 let import = ui
                     .add_enabled(
                         self.picking.is_none(),
-                        Button::new("Import a board.json…").min_size(size),
+                        Button::new("Import an its4tasks.json…").min_size(size),
                     )
-                    .on_hover_text("Add the tasks of a board.json saved by an older its4tasks");
+                    .on_hover_text(
+                        "Add the tasks of an its4tasks.json, or a board.json from an older its4tasks",
+                    );
                 if import.clicked() {
                     self.pick_import(ui.ctx());
                 }
@@ -1155,7 +1183,7 @@ impl TodoApp {
                         self.request = Some(Request::SwitchBoard);
                     }
                 }
-                if let Some(problem) = self.import_error.as_deref().or(self.api.error()) {
+                if let Some(problem) = self.file_problem.as_deref().or(self.api.error()) {
                     ui.add_space(16.0);
                     ui.colored_label(palette(ui.visuals()).blocker, problem);
                 }
@@ -1858,10 +1886,20 @@ impl TodoApp {
         let button = Button::new(RichText::new(" ⋯ ").strong());
         egui::containers::menu::MenuButton::from_button(button)
             .ui(ui, |ui| {
-                let import =
-                    ui.add_enabled(self.picking.is_none(), Button::new("Import board.json…"));
+                let import = ui.add_enabled(
+                    self.picking.is_none(),
+                    Button::new("Import its4tasks.json…"),
+                );
                 if import.clicked() {
                     self.pick_import(ui.ctx());
+                }
+                let export =
+                    ui.add_enabled(self.saving.is_none(), Button::new("Export its4tasks.json…"));
+                if export
+                    .on_hover_text("Save your whole board to a file")
+                    .clicked()
+                {
+                    self.export(ui.ctx());
                 }
                 if self.switchable && ui.button("Switch board…").clicked() {
                     self.request = Some(Request::SwitchBoard);
@@ -1916,7 +1954,7 @@ impl TodoApp {
                 } else if self.api.unauthorized() {
                     None
                 } else {
-                    match (self.api.error(), &self.import_error, self.api.notice()) {
+                    match (self.api.error(), &self.file_problem, self.api.notice()) {
                         (Some(e), _, _) => Some(format!("Can't reach the server: {e}")),
                         (None, Some(e), _) => Some(e.clone()),
                         (None, None, notice) => notice.map(str::to_owned),
@@ -2167,6 +2205,7 @@ impl eframe::App for TodoApp {
         self.api.poll();
         self.api.refresh();
         self.poll_import();
+        self.poll_export();
         if !self.api.loaded() {
             self.loading(ui);
             return;

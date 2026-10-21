@@ -6,7 +6,8 @@
 //!   409 (the board's rules refuse it, or a new id is taken).
 //! - `POST /api/start`: a new user's board, with the welcome tasks; 409 if
 //!   they have one.
-//! - `POST /api/import` with a `board.json`'s text: adds its tasks; 400 if
+//! - `POST /api/import` with an `its4tasks.json`'s text (or an older
+//!   version's `board.json`): adds its tasks; 400 if
 //!   it isn't one.
 //! - `GET /api/auth`: how the native app signs in (OAuth), if it can.
 //!   Answered to anyone.
@@ -52,7 +53,7 @@ struct AppState {
 
 type Shared = Arc<AppState>;
 
-/// The largest `board.json` `/api/import` takes, in bytes.
+/// The largest file `/api/import` takes, in bytes.
 const IMPORT_LIMIT: usize = 16 << 20;
 
 /// The web GUI (see build.rs). Debug builds read it from disk on each
@@ -176,7 +177,7 @@ async fn start(State(state): State<Shared>, headers: HeaderMap) -> Response {
     }
 }
 
-/// Adds the tasks of the `board.json` sent.
+/// Adds the tasks of the `its4tasks.json` sent.
 async fn import_board(State(state): State<Shared>, headers: HeaderMap, text: String) -> Response {
     let user = match user(&state, &headers).await {
         Ok(user) => user,
@@ -187,7 +188,7 @@ async fn import_board(State(state): State<Shared>, headers: HeaderMap, text: Str
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("That isn't an its4tasks board.json: {e}"),
+                format!("That isn't an its4tasks.json: {e}"),
             )
                 .into_response();
         }
@@ -644,7 +645,15 @@ mod tests {
         assert_ne!(twice.board.tasks[0].id, twice.board.tasks[1].id);
         let (status, body) = post_text(&app, "/api/import", Some(&bob), "not json").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("board.json"), "{body}");
+        assert!(body.contains("its4tasks.json"), "{body}");
+
+        // What the app exports reads back in.
+        let file = import::export(&first.board, now());
+        let (status, body) = post_text(&app, "/api/import", Some(&token("carol")), &file).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let carol: BoardView = serde_json::from_str(&body).unwrap();
+        assert_eq!(carol.board.tasks[0].title, "From the old app");
+        assert_ne!(carol.board.tasks[0].id, first.board.tasks[0].id, "new ids");
     }
 
     #[tokio::test]

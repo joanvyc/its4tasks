@@ -80,7 +80,7 @@ Put the server behind a reverse proxy that serves HTTPS, and keep `ITS4TASKS_ADD
 
 its4tasks has no passwords of its own. Sign-in is the job of the outside service, which must provide:
 
-- **Signed JWTs** (RS256, ES256 or EdDSA). The keys are published as a JWKS, and the token has `iss`, `sub` and `exp`. A user is their `sub` at that `iss`. The first time the server sees one, it creates the user, who then chooses to start a new board or import a `board.json`.
+- **Signed JWTs** (RS256, ES256 or EdDSA). The keys are published as a JWKS, and the token has `iss`, `sub` and `exp`. A user is their `sub` at that `iss`. The first time the server sees one, it creates the user, who then chooses to start a new board or import an `its4tasks.json`.
 - **A sign-in page** that sends people back to `{redirect}`, with the token in the `ITS4TASKS_AUTH_COOKIE` cookie on the server's own domain. API requests also accept the token as `Authorization: Bearer <token>`.
 - **OAuth 2 for the desktop app** (optional). The app needs the authorization code flow, for a public client (no secret), with PKCE (S256) and refresh tokens. It must be allowed to redirect to `http://127.0.0.1:<any port>/callback`, because the app listens on a random local port while you sign in in your browser.
 
@@ -142,9 +142,11 @@ ITS4TASKS_CLERK_FRONTEND_API=http://127.0.0.1:7980
 
 Starting dev-auth with `ITS4TASKS_DEV_AUTH_TTL=15` makes its tokens expire quickly, to watch the page renew them.
 
-## Bringing a board along
+## Exporting and importing
 
-**Import board.json…** in the **⋯** menu adds every task in a `board.json` file to your board. That works for files from older versions of the app too. New users are offered the same on the first page they see: start a new board, or import one.
+**Export its4tasks.json…** in the **⋯** menu above the task list saves your whole board to a file: every task, comment and focus card. In the browser it downloads as `its4tasks.json`.
+
+**Import its4tasks.json…** in the same menu adds every task in such a file to your board, with new ids, so a board can be moved between servers or into a local one. `board.json` files from older versions of the app work too. New users are offered the same on the first page they see: start a new board, or import one.
 
 ## Working on it
 

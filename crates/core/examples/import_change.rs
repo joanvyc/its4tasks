@@ -1,9 +1,9 @@
-//! Prints the `Change` that imports a `board.json` (read from the file
+//! Prints the `Change` that imports an `its4tasks.json` (read from the file
 //! named, or stdin), for POSTing to `/api/changes`, say to seed a test
 //! user's board:
 //!
 //! ```sh
-//! cargo run -q -p its4tasks-core --example import_change -- board.json
+//! cargo run -q -p its4tasks-core --example import_change -- its4tasks.json
 //! ```
 
 use std::io::Read;

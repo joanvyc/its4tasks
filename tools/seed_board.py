@@ -1,6 +1,6 @@
-"""Write a sample its4tasks board for visual testing: seed_board.py DATA_HOME
+"""Write a sample its4tasks board for visual testing: seed_board.py DIR
 
-Creates DATA_HOME/its4tasks/board.json with ~12 days of history relative to now:
+Creates DIR/its4tasks.json with ~12 days of history relative to now:
 open blockers, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, next steps (open,
 done, and one on a blocked task, where red wins), a done task closed
@@ -8,7 +8,9 @@ with a message, tasks of different freshness, and subtasks: a parent blocked
 by its subtasks (focused, with one of them) and one that isn't. Nothing
 loads it on its own: import it into a test user's board as AGENTS.md shows
 (examples/import_change.rs in its4tasks-core turns it into an Import change),
-or with "Import board.json…" in the app.
+or with "Import its4tasks.json…" in the app. It's written in the old format,
+numbered tasks and comments without ids, so importing older files stays
+exercised.
 """
 import datetime as dt
 import json
@@ -96,7 +98,7 @@ for i, t in enumerate(tasks):
     t["id"] = i
     t.setdefault("done", False)
 
-path = pathlib.Path(sys.argv[1]) / "its4tasks" / "board.json"
+path = pathlib.Path(sys.argv[1]) / "its4tasks.json"
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps({"tasks": tasks, "slots": [0, 6, 2, 7], "next_id": len(tasks)}, indent=1))
 print(path)

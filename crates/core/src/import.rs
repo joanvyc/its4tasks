@@ -1,16 +1,39 @@
-//! Boards from `board.json` files: exported ones, and the files older
-//! versions of the app kept their board in.
+//! Boards in files: `its4tasks.json` files exported by the app (`export`),
+//! and the `board.json` files older versions kept their board in.
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{Board, NextStep};
 
-/// The board in a `board.json` file's text, with dangling references
-/// dropped. Accepts the older formats: numbered tasks, and notes as one
-/// string.
+/// An `its4tasks.json` file: the board, marked as one.
+#[derive(Serialize)]
+struct Export<'a> {
+    format: &'static str,
+    version: u32,
+    exported_at: DateTime<Utc>,
+    #[serde(flatten)]
+    board: &'a Board,
+}
+
+/// The board as an `its4tasks.json` file's text, which `parse` reads back.
+pub fn export(board: &Board, now: DateTime<Utc>) -> String {
+    let file = Export {
+        format: "its4tasks",
+        version: 1,
+        exported_at: now,
+        board,
+    };
+    serde_json::to_string_pretty(&file).expect("a board serializes")
+}
+
+/// The board in an `its4tasks.json` file's text, with dangling references
+/// dropped. Also reads older versions' `board.json` files: numbered tasks,
+/// and notes as one string.
 pub fn parse(text: &str) -> Result<Board, String> {
     let mut value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     number_ids_to_uuids(&mut value);
@@ -110,6 +133,27 @@ mod tests {
         let again = parse(&serde_json::to_string(&board).unwrap()).unwrap();
         assert_eq!(again, board);
         assert!(parse("{ not json").is_err());
+    }
+
+    #[test]
+    fn exports_read_back() {
+        let now = Utc::now();
+        let mut b = crate::welcome::board(now);
+        let a = b.add_task("Blocked".into(), "", None, now);
+        let sub = b.add_task("Sub".into(), "", Some(a), now);
+        b.task_mut(a)
+            .unwrap()
+            .post("waiting on Ann", MessageKind::Block, now);
+        b.task_mut(sub)
+            .unwrap()
+            .post("a step", MessageKind::Next, now);
+        b.focus(sub);
+
+        let text = export(&b, now);
+        let file: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(file["format"], "its4tasks");
+        assert_eq!(file["version"], 1);
+        assert_eq!(parse(&text).unwrap(), b);
     }
 
     #[test]

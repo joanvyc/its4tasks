@@ -106,7 +106,7 @@ pub enum Change {
         to: Uuid,
     },
     /// Adds another board's tasks: a new user's welcome board, or an
-    /// uploaded `board.json`. Its ids must be new (see `import::fresh_ids`).
+    /// uploaded `its4tasks.json`. Its ids must be new (see `import::fresh_ids`).
     /// Tasks it had in focus are focused where there's room.
     Import {
         board: Board,

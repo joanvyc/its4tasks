@@ -28,7 +28,7 @@ webbrowser.workspace = true
 ehttp.workspace = true
 js-sys.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["console", "Document", "HtmlCanvasElement", "Location", "Storage", "Window"] }
+web-sys = { workspace = true, features = ["Blob", "BlobPropertyBag", "console", "Document", "Element", "HtmlAnchorElement", "HtmlCanvasElement", "HtmlElement", "Location", "Storage", "Url", "Window"] }
 
 [dev-dependencies]
 its4tasks-server.workspace = true

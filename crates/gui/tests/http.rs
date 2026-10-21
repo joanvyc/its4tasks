@@ -75,6 +75,31 @@ fn changes_show_at_once_and_reach_the_server() {
 }
 
 #[test]
+fn the_board_is_not_fetched_again_at_once() {
+    let url = start();
+    let mut a = client(&url);
+    let mut b = client(&url);
+    let id = add(&mut b, "Made elsewhere");
+    assert!(b.flush(WAIT));
+    // Just loaded: no fetch for a while.
+    a.refresh();
+    a.flush(Duration::from_millis(300));
+    assert!(a.board().task(id).is_none());
+}
+
+#[test]
+fn a_change_brings_the_board() {
+    let url = start();
+    let mut a = client(&url);
+    let mut b = client(&url);
+    let elsewhere = add(&mut b, "Made elsewhere");
+    assert!(b.flush(WAIT));
+    add(&mut a, "Made here");
+    assert!(a.flush(WAIT));
+    assert!(a.board().task(elsewhere).is_some(), "without fetching");
+}
+
+#[test]
 fn changes_wait_for_a_working_token() {
     let url = start();
     let mut a = Client::new(&url, Some("expired".into()), WAIT, || {});

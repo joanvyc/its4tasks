@@ -88,7 +88,7 @@ Any change that affects what's on screen (layout, colors, new widgets) must be c
      | curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary @- \
        127.0.0.1:7979/api/changes > /dev/null
    ```
-   `curl -s -H "Authorization: Bearer $TOKEN" 127.0.0.1:7979/api/board` shows alice's board. A change POSTed with curl, as another client would, shows up in the GUI within about 2 s. To check behaviour on a slow network, start the server with `ITS4TASKS_DELAY_MS=800`, which holds back every answer that long. Edits should still show at once. dev-auth's tokens last an hour; `ITS4TASKS_DEV_AUTH_TTL=20` makes them expire quickly, to test renewal (the server allows 60 s of clock leeway on top).
+   `curl -s -H "Authorization: Bearer $TOKEN" 127.0.0.1:7979/api/board` shows alice's board. A change POSTed with curl, as another client would, shows up in the GUI within a minute (the board is fetched once a minute), or at once after any change made in the GUI, whose answer carries the board. To check behaviour on a slow network, start the server with `ITS4TASKS_DELAY_MS=800`, which holds back every answer that long. Edits should still show at once. dev-auth's tokens last an hour; `ITS4TASKS_DEV_AUTH_TTL=20` makes them expire quickly, to test renewal (the server allows 60 s of clock leeway on top).
 
 3. **Run the native GUI under XWayland so X11 tools can see it.** `import` and `tools/xt.py` only work with X11 windows. Signing in opens a browser, so point `BROWSER` at a stand-in that never opens the user's: a script that signs in with curl and follows the redirect back to the app works.
    ```sh

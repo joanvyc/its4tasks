@@ -26,9 +26,14 @@ use uuid::Uuid;
 /// says otherwise. In the browser the server is the page's own.
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:7878";
 
-/// How often `refresh` fetches the board, to show changes made elsewhere
-/// (say, the same board open in a browser).
-const REFRESH_EVERY: Duration = Duration::from_secs(2);
+/// How long after the server last sent the board `refresh` fetches it, to
+/// show changes made elsewhere. Rarely needed: one person uses one device at
+/// a time, and each change's answer brings the board anyway.
+const REFRESH_EVERY: Duration = Duration::from_secs(60);
+
+/// How often `refresh` retries while the server refuses, so held changes go
+/// out soon after a token is renewed.
+const RETRY_EVERY: Duration = Duration::from_secs(2);
 
 /// How long the server must keep refusing before the user counts as signed
 /// out. Shorter refusals happen while a token is renewed, and are retried.
@@ -277,7 +282,12 @@ impl Client {
     /// Fetches the board if it hasn't been fetched for a while. While the
     /// server refuses, retries instead, with a fresh token in the browser.
     pub fn refresh(&mut self) {
-        if self.fetched.elapsed() < REFRESH_EVERY {
+        let every = if self.unauthorized {
+            RETRY_EVERY
+        } else {
+            REFRESH_EVERY
+        };
+        if self.fetched.elapsed() < every {
             return;
         }
         if self.unauthorized {
@@ -380,11 +390,13 @@ impl Client {
                     Ok(Answer::Applied(applied)) => {
                         self.confirmed = applied.board;
                         self.answered();
+                        self.fetched = Instant::now();
                     }
                     Ok(Answer::Refused(rejected)) => {
                         self.notice = Some(format!("Change refused: {}", rejected.error));
                         self.confirmed = rejected.board;
                         self.answered();
+                        self.fetched = Instant::now();
                     }
                     Err(e) => {
                         // Whether the server saw these is unknown, and some

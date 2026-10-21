@@ -2199,7 +2199,7 @@ impl eframe::App for TodoApp {
         self.move_modal(&ui.ctx().clone());
         self.apply(actions);
         // Keep the freshness colors drifting while the app sits idle.
-        // Also fetches other clients' changes, through `refresh`.
+        // `refresh` fetches the board too, but only once a minute.
         ui.ctx().request_repaint_after(Duration::from_secs(2));
     }
 

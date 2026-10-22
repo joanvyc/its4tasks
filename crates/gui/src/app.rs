@@ -1610,13 +1610,12 @@ impl TodoApp {
                                 let dragged = ui.dnd_drag_source(drag_id, id, |ui| {
                                     ui.add(Label::new(text).truncate().selectable(false))
                                 });
-                                let mut response = dragged.response;
-                                if has_subtasks {
-                                    // Same id as the drag source, so egui merges the senses:
-                                    // a press without moving is a click, else a drag.
-                                    response = ui.interact(response.rect, drag_id, Sense::click());
-                                    toggle_fold |= response.clicked();
-                                }
+                                // Same id as the drag source, so egui merges the senses:
+                                // a press without moving is a click, else a drag. Leaves
+                                // need it too, for the right-click menu.
+                                let response =
+                                    ui.interact(dragged.response.rect, drag_id, Sense::click());
+                                toggle_fold |= has_subtasks && response.clicked();
                                 let hint = if has_subtasks {
                                     "Click to fold or unfold · drag onto a card to focus, or onto a task to make it a subtask"
                                 } else {

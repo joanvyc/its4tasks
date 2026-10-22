@@ -16,7 +16,8 @@ use crate::import;
 use crate::log::{self, EntryKind, Filter, LogPage, Period};
 use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
-    SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
+    SLOT_COUNT, Submit, Task, TaskState, headline, list_guides, short_duration, split_title,
+    staleness,
 };
 use crate::unsent::{self, NewTask, Unsent};
 use crate::welcome;
@@ -389,6 +390,36 @@ fn delete_prompt(task: &Task, subtasks: usize) -> String {
         "\"{}\"{what} will be deleted. This can't be undone.",
         task.title
     )
+}
+
+/// Tree guide lines for a task list row at `depth`, in the indent before its
+/// freshness bar (see `list_guides`). Each level's line runs under its parent's
+/// bar, from the gap above the row so it meets the row before.
+fn tree_guides(ui: &egui::Ui, depth: usize, guides: &[bool], has_shown_child: bool) {
+    let rect = ui.max_rect();
+    // The row's frame adds 2 px around this rect, then the gap to the next row.
+    let top = rect.top() - 2.0 - ui.spacing().item_spacing.y;
+    let bottom = rect.bottom() + 2.0;
+    let mid = rect.center().y;
+    let x = |level: usize| rect.left() + (level as f32 - 1.0) * SUBTASK_INDENT + 2.0;
+    let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let painter = ui.painter();
+    for (level, runs_on) in (1..=depth).zip(guides) {
+        if level < depth {
+            if *runs_on {
+                painter.vline(x(level), top..=bottom, stroke);
+            }
+        } else {
+            let end = if *runs_on { bottom } else { mid };
+            painter.vline(x(level), top..=end, stroke);
+            let bar = rect.left() + depth as f32 * SUBTASK_INDENT;
+            painter.hline(x(level)..=bar - 2.0, mid, stroke);
+        }
+    }
+    if has_shown_child {
+        // From below this row's bar (16 px tall, centered) down to its children.
+        painter.vline(x(depth + 1), mid + 8.0..=bottom, stroke);
+    }
 }
 
 /// Why a blocked task is blocked and for how long, for hover texts.
@@ -1409,7 +1440,14 @@ impl TodoApp {
                 ui.add_space(8.0);
                 ui.weak("No tasks yet. Press + to create one.");
             }
-            for &(id, depth) in &shown {
+            let guides = list_guides(&shown);
+            for (i, &(id, depth)) in shown.iter().enumerate() {
+                // Each root task's tree is its own group.
+                if depth == 0 && i > 0 {
+                    ui.add(egui::Separator::default().spacing(6.0));
+                }
+                let guides = &guides[i];
+                let has_shown_child = shown.get(i + 1).is_some_and(|&(_, d)| d == depth + 1);
                 let slot = self.api.board().slot_of(id);
                 let has_subtasks = self.api.board().children(id).next().is_some();
                 // Only shown while folds apply, i.e. without a filter.
@@ -1445,6 +1483,7 @@ impl TodoApp {
                     let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y + 4.0);
                     ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
                         let row_hovered = ui.rect_contains_pointer(ui.max_rect());
+                        tree_guides(ui, depth, guides, has_shown_child);
                         ui.add_space(depth as f32 * SUBTASK_INDENT);
                         let color = if task.done {
                             ui.visuals().weak_text_color()

@@ -1152,6 +1152,28 @@ pub fn shown_in_list(task: &Task, filter: &str, hide_closed: bool) -> bool {
     matches_filter(task, filter) && !(hide_closed && task.done)
 }
 
+/// The task list's tree guides: for each row of `Board::list_rows`, for each
+/// level from 1 to its depth, whether a later row at that level follows
+/// before any shallower one. At the row's own level that's ├ rather than └;
+/// above it, whether a │ passes by.
+pub fn list_guides(rows: &[(Uuid, usize)]) -> Vec<Vec<bool>> {
+    let deepest = rows.iter().map(|(_, d)| *d).max().unwrap_or(0);
+    // Whether a row at each level came later, with nothing shallower between.
+    let mut seen = vec![false; deepest + 1];
+    let mut guides: Vec<Vec<bool>> = rows
+        .iter()
+        .rev()
+        .map(|&(_, depth)| {
+            let row = seen[1..=depth].to_vec();
+            seen[depth] = true;
+            seen[depth + 1..].fill(false);
+            row
+        })
+        .collect();
+    guides.reverse();
+    guides
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,6 +1942,24 @@ mod tests {
         b.sanitize();
         let parents: Vec<_> = b.tasks.iter().map(|t| t.parent).collect();
         assert_eq!(parents, [None, Some(n(0)), None, Some(n(1))]);
+    }
+
+    #[test]
+    fn list_guides_run_on_to_later_siblings() {
+        let b = tree();
+        let rows = b.list_rows("", false);
+        let none: Vec<bool> = Vec::new();
+        assert_eq!(
+            list_guides(&rows),
+            [
+                none.clone(),
+                vec![true],
+                vec![true, false],
+                vec![false],
+                none
+            ]
+        );
+        assert!(list_guides(&[]).is_empty());
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::{collections::HashSet, iter, sync::Arc, sync::mpsc::Receiver, time::Dur
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Utc};
 use eframe::egui::{
-    self, Align, Atom, Button, CentralPanel, Color32, ComboBox, DragAndDrop, FontData,
+    self, Align, Atom, Button, CentralPanel, Color32, ComboBox, CursorIcon, DragAndDrop, FontData,
     FontDefinitions, FontFamily, FontId, Frame, Id, Key, Label, Layout, Margin, Modal, Modifiers,
     Panel, Popup, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer,
     TextEdit, TextFormat, TextStyle, Theme, UiBuilder, Vec2, Visuals,
@@ -39,6 +39,10 @@ const COMMENT_INPUT_MARGIN: Margin = Margin::symmetric(6, 4);
 const LOG_TIME_WIDTH: f32 = 64.0;
 /// How far each level of subtasks is indented in the task list.
 const SUBTASK_INDENT: f32 = 16.0;
+/// How long a card's edge flashes when navigating to it, in seconds.
+const FLASH_SECS: f64 = 0.8;
+/// The edge drawn around a flashing or highlighted card.
+const HIGHLIGHT_WIDTH: f32 = 3.0;
 
 /// Accent colours for each theme. The light ones are darker so they read on white.
 #[derive(Clone, Copy)]
@@ -151,6 +155,33 @@ fn comment_input_bg(visuals: &Visuals) -> Color32 {
 }
 
 /// The task's menu entries, shared by the "⋯" button and the list's right-click menu.
+/// Small weak text that works as a link: strong and underlined while hovered.
+/// `salt` keeps its id, and so its hover state, the same between frames.
+fn link_label(ui: &mut egui::Ui, salt: &str, text: &str) -> egui::Response {
+    ui.push_id(salt, |ui| {
+        // The label takes the next id; its hover is known from last frame, so
+        // the text is styled before it's laid out and nothing reflows.
+        let hovered = ui
+            .ctx()
+            .read_response(ui.next_auto_id())
+            .is_some_and(|r| r.hovered());
+        let mut text = RichText::new(text).small();
+        text = if hovered {
+            text.color(ui.visuals().strong_text_color()).underline()
+        } else {
+            text.weak()
+        };
+        ui.add(
+            Label::new(text)
+                .truncate()
+                .selectable(false)
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+    })
+    .inner
+}
+
 fn task_menu_items(ui: &mut egui::Ui, task_id: Uuid, is_subtask: bool, actions: &mut Vec<Action>) {
     if ui.button("Add subtask…").clicked() {
         actions.push(Action::AddSubtask(task_id, String::new()));
@@ -885,6 +916,13 @@ enum Action {
     StartEdit(Uuid),
     /// Open the dialog for moving a comment to another task.
     StartMove(Uuid),
+    /// Go to a task from the card in slot `from`: flash its card if it's in
+    /// focus (`at` is when, in egui time), or else put it in place of `from`.
+    Navigate {
+        from: usize,
+        task: Uuid,
+        at: f64,
+    },
     SaveEdit,
     CancelEdit,
 }
@@ -948,6 +986,14 @@ pub struct TodoApp {
     restored: bool,
     /// When unsent work was last kept.
     kept: Instant,
+    /// When each focus slot was last used, from `use_tick`, for picking the
+    /// least recently used one. 0 for not yet this session.
+    slot_used: [u64; SLOT_COUNT],
+    use_tick: u64,
+    /// The card flashing after navigating to it, and since when (egui time).
+    flash: Option<(usize, f64)>,
+    /// The card the open "Replace highlighted task" menu would replace.
+    replacing: Option<usize>,
 }
 
 /// Sets up fonts and theme. Once, before showing anything.
@@ -990,6 +1036,10 @@ impl TodoApp {
             hide_closed: false,
             restored: false,
             kept: Instant::now(),
+            slot_used: [0; SLOT_COUNT],
+            use_tick: 0,
+            flash: None,
+            replacing: None,
         }
     }
 
@@ -1198,7 +1248,26 @@ impl TodoApp {
     fn apply(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Change(change) => self.change(change),
+                Action::Change(change) => {
+                    let focused = match change {
+                        Change::Focus { task } | Change::FocusInto { task, .. } => Some(task),
+                        _ => None,
+                    };
+                    self.change(change);
+                    if let Some(slot) = focused.and_then(|t| self.api.board().slot_of(t)) {
+                        self.mark_used(slot);
+                    }
+                }
+                Action::Navigate { from, task, at } => match self.api.board().slot_of(task) {
+                    Some(slot) => {
+                        self.flash = Some((slot, at));
+                        self.mark_used(slot);
+                    }
+                    None => {
+                        self.change(Change::FocusInto { slot: from, task });
+                        self.mark_used(from);
+                    }
+                },
                 Action::Delete(id) => self.confirm_delete = Some(id),
                 Action::AddSubtask(id, title) => {
                     self.new_task = Some(NewTaskDraft {
@@ -1243,6 +1312,11 @@ impl TodoApp {
                 Action::CancelEdit => self.editing = None,
             }
         }
+    }
+
+    fn mark_used(&mut self, slot: usize) {
+        self.use_tick += 1;
+        self.slot_used[slot] = self.use_tick;
     }
 
     /// Sends a change to the API, logging why it failed if it did.
@@ -1324,6 +1398,8 @@ impl TodoApp {
         ui.separator();
 
         let has_free_slot = self.api.board().has_free_slot();
+        let lru = self.api.board().lru_slot(&self.slot_used);
+        let mut replacing = None;
         let now = Utc::now();
         let log_mode = self.view == View::Log;
         // A task clicked in or out of the log, and whether it's now in.
@@ -1442,12 +1518,32 @@ impl TodoApp {
                                 ui.painter().circle_filled(dot.center(), 5.0, color);
                                 response.on_hover_text("In focus");
                             } else {
-                                let btn = ui
-                                    .add_enabled(has_free_slot, Button::new("→").small())
-                                    .on_hover_text("Bring into focus")
-                                    .on_disabled_hover_text("All 4 focus slots are taken");
-                                if btn.clicked() {
-                                    actions.push(Change::Focus { task: id }.into());
+                                let btn = ui.add(Button::new("→").small());
+                                if has_free_slot {
+                                    let btn = btn.on_hover_text("Bring into focus");
+                                    if btn.clicked() {
+                                        actions.push(Change::Focus { task: id }.into());
+                                    }
+                                } else if let Some(lru) = lru {
+                                    // All slots taken: offer the least recently used
+                                    // card, highlighted while the menu is open.
+                                    let btn = btn.on_hover_text(
+                                        "Bring into focus, replacing the least recently used card",
+                                    );
+                                    let menu = Popup::menu(&btn).show(|ui| {
+                                        if ui.button("Replace highlighted task").clicked() {
+                                            actions.push(
+                                                Change::FocusInto {
+                                                    slot: lru,
+                                                    task: id,
+                                                }
+                                                .into(),
+                                            );
+                                        }
+                                    });
+                                    if menu.is_some() {
+                                        replacing = Some(lru);
+                                    }
                                 }
                             }
                             // Always laid out, so titles don't reflow on hover.
@@ -1517,6 +1613,7 @@ impl TodoApp {
         if let Some((id, shown)) = log_toggle {
             log::set_shown(self.api.board(), &mut self.log_hidden, id, shown);
         }
+        self.replacing = replacing;
     }
 
     fn cards(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1552,10 +1649,20 @@ impl TodoApp {
         let blocked = state == Some(TaskState::Blocked);
         let blocked_since = task_id.and_then(|id| self.api.board().blocked_since(id));
         let by_subtasks = task_id.is_some_and(|id| self.api.board().blocked_by_subtasks(id));
-        let parent_title = task
+        let parent = task
             .and_then(|t| t.parent)
             .and_then(|p| self.api.board().task(p))
-            .map(|p| p.title.clone());
+            .map(|p| (p.id, p.title.clone()));
+        // Direct subtasks: id, title, done, and whether in focus.
+        let subtasks: Vec<(Uuid, String, bool, bool)> = task_id
+            .into_iter()
+            .flat_map(|id| self.api.board().children(id))
+            .map(|t| {
+                let focused = self.api.board().slot_of(t.id).is_some();
+                (t.id, t.title.clone(), t.done, focused)
+            })
+            .collect();
+        let time = ui.input(|i| i.time);
         let has_task = task.is_some();
         let ready = state == Some(TaskState::Ready);
         // Titles of the subtasks this task's steps were promoted to, by subtask id.
@@ -1653,12 +1760,44 @@ impl TodoApp {
                         .weak(),
                 )
                 .on_hover_text(updated_text(task, now));
-                if let Some(title) = &parent_title {
+                // Before the parent, so the parent's title is what truncates.
+                if !subtasks.is_empty() {
                     ui.label(RichText::new("·").small().weak());
-                    ui.add(
-                        Label::new(RichText::new(format!("↳ {title}")).small().weak()).truncate(),
-                    )
-                    .on_hover_text(format!("Subtask of {title}"));
+                    let label = format!("Subtasks ({})", subtasks.len());
+                    let response = link_label(ui, "subtasks", &label);
+                    Popup::menu(&response).show(|ui| {
+                        ui.set_max_width(320.0);
+                        for (id, title, done, focused) in &subtasks {
+                            let mut text = RichText::new(title);
+                            if *done {
+                                text = text.strikethrough().weak();
+                            }
+                            let mut button = Button::new(text).truncate();
+                            if *focused {
+                                button =
+                                    button.shortcut_text(RichText::new("in focus").small().weak());
+                            }
+                            if ui.add(button).clicked() {
+                                actions.push(Action::Navigate {
+                                    from: slot,
+                                    task: *id,
+                                    at: time,
+                                });
+                            }
+                        }
+                    });
+                }
+                if let Some((id, title)) = &parent {
+                    ui.label(RichText::new("·").small().weak());
+                    let response = link_label(ui, "parent", &format!("↳ {title}"))
+                        .on_hover_text(format!("Subtask of {title} · click to go to it"));
+                    if response.clicked() {
+                        actions.push(Action::Navigate {
+                            from: slot,
+                            task: *id,
+                            at: time,
+                        });
+                    }
                 }
             });
             ui.separator();
@@ -1932,6 +2071,39 @@ impl TodoApp {
                 ));
             }
             ui.painter().set(background, Shape::Vec(shapes));
+            // Over the contents: the flash after navigating here, fading out,
+            // or the steady highlight of the card a replace would take.
+            let flash = self
+                .flash
+                .filter(|(s, _)| *s == slot)
+                .map(|(_, since)| time - since)
+                .filter(|age| *age < FLASH_SECS);
+            let alpha = match flash {
+                Some(age) => {
+                    ui.ctx().request_repaint();
+                    Some(1.0 - (age / FLASH_SECS) as f32)
+                }
+                None if self.replacing == Some(slot) => Some(1.0),
+                None => None,
+            };
+            if let Some(alpha) = alpha {
+                let color = visuals.selection.bg_fill.gamma_multiply(alpha);
+                ui.painter().rect_stroke(
+                    rect,
+                    CARD_RADIUS,
+                    Stroke::new(HIGHLIGHT_WIDTH, color),
+                    StrokeKind::Inside,
+                );
+            }
+            if zone.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+                self.mark_used(slot);
+            }
+        }
+        if self
+            .flash
+            .is_some_and(|(s, since)| s == slot && time - since >= FLASH_SECS)
+        {
+            self.flash = None;
         }
         if let Some(id) = dropped {
             actions.push(Change::FocusInto { slot, task: *id }.into());
@@ -2305,6 +2477,10 @@ impl eframe::App for TodoApp {
         self.delete_modal(&ui.ctx().clone());
         self.move_modal(&ui.ctx().clone());
         self.apply(actions);
+        if self.flash.is_some() {
+            // Starts the flash now; the card keeps repainting while it runs.
+            ui.ctx().request_repaint();
+        }
         // Keep the freshness colors drifting while the app sits idle.
         // `refresh` fetches the board too, but only once a minute.
         ui.ctx().request_repaint_after(Duration::from_secs(2));

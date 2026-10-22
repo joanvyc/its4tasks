@@ -1086,6 +1086,19 @@ impl Board {
         self.slots[slot] = Some(id);
     }
 
+    /// The filled slot used longest ago, given each slot's last use as a
+    /// rising tick (0 for never). Never-used slots come first, the one whose
+    /// task was updated longest ago first. `None` if every slot is empty.
+    pub fn lru_slot(&self, used: &[u64; SLOT_COUNT]) -> Option<usize> {
+        (0..SLOT_COUNT)
+            .filter_map(|i| {
+                let task = self.task(self.slots[i]?)?;
+                Some((i, (used[i], task.updated_at)))
+            })
+            .min_by_key(|(_, key)| *key)
+            .map(|(i, _)| i)
+    }
+
     pub fn unfocus(&mut self, slot: usize) {
         if let Some(s) = self.slots.get_mut(slot) {
             *s = None;
@@ -1196,6 +1209,24 @@ mod tests {
         assert_eq!(b.slots, [Some(n(1)), None, None, None]);
         b.focus_into(2, n(1));
         assert_eq!(b.slots, [None, None, Some(n(1)), None]);
+    }
+
+    #[test]
+    fn lru_slot_takes_the_oldest_use_then_the_oldest_update() {
+        let t0 = Utc::now();
+        let mut b = board_with(4);
+        assert_eq!(b.lru_slot(&[0; SLOT_COUNT]), None);
+        for (slot, id) in [(0, 0), (1, 1), (3, 2)] {
+            b.focus_into(slot, n(id));
+        }
+        b.task_mut(n(0)).unwrap().updated_at = t0;
+        b.task_mut(n(1)).unwrap().updated_at = t0 - TimeDelta::hours(1);
+        b.task_mut(n(2)).unwrap().updated_at = t0 + TimeDelta::hours(1);
+        // Never used: the task updated longest ago.
+        assert_eq!(b.lru_slot(&[0; SLOT_COUNT]), Some(1));
+        // Used slots come after unused ones, oldest use first; empty ones never.
+        assert_eq!(b.lru_slot(&[3, 2, 0, 0]), Some(3));
+        assert_eq!(b.lru_slot(&[3, 2, 0, 4]), Some(1));
     }
 
     #[test]

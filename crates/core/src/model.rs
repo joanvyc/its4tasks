@@ -855,14 +855,47 @@ impl Board {
         self.children(id).filter(|t| !t.done)
     }
 
-    /// At least one subtask is open, and every open one is blocked.
-    pub fn blocked_by_subtasks(&self, id: Uuid) -> bool {
+    /// Nothing under or at this task can advance: its open subtasks are all
+    /// stuck, or it has none and an open blocker of its own. A task's own
+    /// blocker doesn't stop work on its open subtasks.
+    fn stuck(&self, id: Uuid) -> bool {
         let mut open = self.open_children(id).peekable();
-        open.peek().is_some() && open.all(|t| self.state(t.id) == TaskState::Blocked)
+        if open.peek().is_some() {
+            open.all(|t| self.stuck(t.id))
+        } else {
+            self.task(id).is_some_and(|t| t.open_blocker().is_some())
+        }
     }
 
-    /// Like `Task::state`, but a task whose open subtasks are all blocked is
-    /// blocked too.
+    /// When a stuck task got stuck: when its last open subtask got stuck, or
+    /// without open subtasks its own oldest open blocker, or when its last
+    /// unstuck subtask was closed, if that came later.
+    fn stuck_since(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        let stuck = if self.open_children(id).next().is_some() {
+            self.open_children(id)
+                .filter_map(|t| self.stuck_since(t.id))
+                .max()
+        } else {
+            self.task(id)?
+                .notes
+                .iter()
+                .filter(|n| n.is_open_blocker())
+                .map(Note::blocked_since)
+                .min()
+        }?;
+        let closed = self.children(id).filter_map(|t| t.done_at);
+        closed.chain([stuck]).max()
+    }
+
+    /// At least one subtask is open, and nothing below can advance: every
+    /// open task at the bottom of the open subtasks is blocked.
+    pub fn blocked_by_subtasks(&self, id: Uuid) -> bool {
+        let mut open = self.open_children(id).peekable();
+        open.peek().is_some() && open.all(|t| self.stuck(t.id))
+    }
+
+    /// Like `Task::state`, but a task where nothing below can advance (see
+    /// `blocked_by_subtasks`) is blocked too.
     pub fn state(&self, id: Uuid) -> TaskState {
         match self.task(id).map(Task::state) {
             Some(TaskState::Active | TaskState::Ready) if self.blocked_by_subtasks(id) => {
@@ -874,8 +907,8 @@ impl Board {
     }
 
     /// When the task became blocked, from its own oldest open blocker or from
-    /// its subtasks (when the last open one got blocked, or the last unblocked
-    /// one was closed), whichever came first. `None` unless blocked.
+    /// its subtasks (when the last open one got stuck, or the last unstuck one
+    /// was closed), whichever came first. `None` unless blocked.
     pub fn blocked_since(&self, id: Uuid) -> Option<DateTime<Utc>> {
         let task = self.task(id)?;
         if task.done {
@@ -888,11 +921,7 @@ impl Board {
             .map(Note::blocked_since)
             .min();
         let subtasks = if self.blocked_by_subtasks(id) {
-            let open = self
-                .open_children(id)
-                .filter_map(|t| self.blocked_since(t.id));
-            let closed = self.children(id).filter_map(|t| t.done_at);
-            open.chain(closed).max()
+            self.stuck_since(id)
         } else {
             None
         };
@@ -1349,7 +1378,7 @@ mod tests {
             .unwrap()
             .post("plan", MessageKind::Next, now);
         assert_eq!(b.state(n(0)), TaskState::Ready);
-        for id in [1, 2] {
+        for id in [2, 3] {
             b.task_mut(n(id))
                 .unwrap()
                 .post("wait", MessageKind::Block, now);
@@ -1763,6 +1792,38 @@ mod tests {
             .post("x", MessageKind::Block, Utc::now());
         assert_eq!(b.state(n(0)), TaskState::Blocked);
         assert!(!b.blocked_by_subtasks(n(0)));
+    }
+
+    #[test]
+    fn own_blocker_on_a_subtask_with_free_subtasks_doesnt_block_the_parent() {
+        let t0 = Utc::now();
+        let h = TimeDelta::hours;
+        let mut b = tree();
+        b.task_mut(n(2)).unwrap().set_done(true, t0);
+        b.task_mut(n(1)).unwrap().post("a", MessageKind::Block, t0);
+        // 1 is blocked itself, but 3 under it can still advance.
+        assert_eq!(b.state(n(1)), TaskState::Blocked);
+        assert!(!b.blocked_by_subtasks(n(1)));
+        assert!(!b.blocked_by_subtasks(n(0)));
+        assert_eq!(b.state(n(0)), TaskState::Active);
+        assert_eq!(b.blocked_since(n(0)), None);
+        // Once 3 is blocked too, nothing below 0 can advance.
+        b.task_mut(n(3))
+            .unwrap()
+            .post("b", MessageKind::Block, t0 + h(2));
+        assert_eq!(b.state(n(0)), TaskState::Blocked);
+        assert_eq!(b.blocked_since(n(0)), Some(t0 + h(2)));
+        assert_eq!(b.blocked_since(n(1)), Some(t0));
+        // Unblocking 3 frees 0; closing it leaves 1 with only its own blocker,
+        // which blocks 0 from then on.
+        b.task_mut(n(3))
+            .unwrap()
+            .post("ok", MessageKind::Unblock, t0 + h(3));
+        assert_eq!(b.state(n(0)), TaskState::Active);
+        b.task_mut(n(3)).unwrap().set_done(true, t0 + h(4));
+        assert_eq!(b.state(n(0)), TaskState::Blocked);
+        assert_eq!(b.blocked_since(n(0)), Some(t0 + h(4)));
+        assert_eq!(b.blocked_since(n(1)), Some(t0));
     }
 
     #[test]

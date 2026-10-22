@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, iter};
+use std::{cmp::Reverse, collections::HashSet, fmt, iter};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -935,6 +935,8 @@ impl Board {
     /// The task list: tasks in tree order with their depth. A task shows if it
     /// passes `shown_in_list`, or if one of its subtasks shows. Below a folded
     /// task only subtasks on the board pass; folds don't apply while filtering.
+    /// Open root tasks come first, oldest first, then closed ones, the most
+    /// recently closed first.
     pub fn list_rows(&self, filter: &str, hide_closed: bool) -> Vec<(Uuid, usize)> {
         fn visit(
             board: &Board,
@@ -956,8 +958,11 @@ impl Board {
                 rows.insert(at, (task.id, depth));
             }
         }
+        let mut roots: Vec<&Task> = self.tasks.iter().filter(|t| t.parent.is_none()).collect();
+        // Stable, so ties keep creation order.
+        roots.sort_by_key(|t| (t.done, t.done.then_some(Reverse(t.done_at))));
         let mut rows = Vec::new();
-        for task in self.tasks.iter().filter(|t| t.parent.is_none()) {
+        for task in roots {
             visit(self, task, 0, filter, hide_closed, false, &mut rows);
         }
         rows
@@ -1975,11 +1980,43 @@ mod tests {
         );
         b.task_mut(n(0)).unwrap().set_done(true, Utc::now());
         b.task_mut(n(2)).unwrap().set_done(true, Utc::now());
-        // 0 is closed but stays to hold its open subtasks.
+        // 0 is closed but stays to hold its open subtasks, below open 4.
         assert_eq!(
             b.list_rows("", true),
-            [(n(0), 0), (n(1), 1), (n(3), 2), (n(4), 0)]
+            [(n(4), 0), (n(0), 0), (n(1), 1), (n(3), 2)]
         );
+    }
+
+    #[test]
+    fn closed_roots_sink_below_open_ones() {
+        let mut b = tree();
+        let t0 = Utc::now();
+        b.task_mut(n(0)).unwrap().set_done(true, t0);
+        assert_eq!(
+            b.list_rows("", false),
+            [(n(4), 0), (n(0), 0), (n(1), 1), (n(3), 2), (n(2), 1)]
+        );
+        for i in 5..8 {
+            let id = b.add_task(format!("task {i}"), "", None, t0);
+            b.task_mut(id).unwrap().id = n(i);
+        }
+        b.task_mut(n(6))
+            .unwrap()
+            .set_done(true, t0 + TimeDelta::hours(1));
+        b.task_mut(n(4))
+            .unwrap()
+            .set_done(true, t0 + TimeDelta::hours(2));
+        // Closed in an old file, with no close time.
+        let old = b.task_mut(n(7)).unwrap();
+        old.set_done(true, t0);
+        old.done_at = None;
+        let roots: Vec<Uuid> = b
+            .list_rows("", false)
+            .into_iter()
+            .filter(|&(_, depth)| depth == 0)
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(roots, [n(5), n(4), n(6), n(0), n(7)]);
     }
 
     #[test]

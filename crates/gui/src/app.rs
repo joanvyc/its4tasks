@@ -13,7 +13,7 @@ use crate::api::{self, Change};
 use crate::client::Client;
 use crate::files::{self, Picked, Saved};
 use crate::import;
-use crate::log::{self, EntryKind, LogPage, Period};
+use crate::log::{self, EntryKind, Filter, LogPage, Period};
 use crate::model::{
     Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
     SLOT_COUNT, Submit, Task, TaskState, headline, short_duration, split_title, staleness,
@@ -937,7 +937,7 @@ pub struct TodoApp {
     moving: Option<NoteMove>,
     view: View,
     log_period: Period,
-    log_starred_only: bool,
+    log_filter: Filter,
     /// Tasks left out of the log, picked in the task list while the log is
     /// shown. Hidden rather than shown ones, so new tasks are shown.
     log_hidden: HashSet<Uuid>,
@@ -985,7 +985,7 @@ impl TodoApp {
             moving: None,
             view: View::Board,
             log_period: Period::Day,
-            log_starred_only: false,
+            log_filter: Filter::All,
             log_hidden: HashSet::new(),
             hide_closed: false,
             restored: false,
@@ -1980,14 +1980,18 @@ impl TodoApp {
                         }
                     });
                 ui.separator();
-                let on = &mut self.log_starred_only;
-                toggle_switch(ui, on, palette(ui.visuals()).star, "Starred only");
-                let label = Label::new("Starred only")
-                    .selectable(false)
-                    .sense(Sense::click());
-                if ui.add(label).clicked() {
-                    *on = !*on;
-                }
+                ComboBox::from_id_salt("log_filter")
+                    .selected_text(self.log_filter.label())
+                    .show_ui(ui, |ui| {
+                        for filter in [Filter::All, Filter::Starred, Filter::Relevant] {
+                            ui.selectable_value(&mut self.log_filter, filter, filter.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Starred: starred comments\n\
+                         Relevant: open blockers and next steps, on the day they were set",
+                    );
             }
             // Text rather than egui's ☀/🌙 buttons: drawing those emoji makes
             // other symbols such as ✔ switch to the colour emoji font.
@@ -2030,7 +2034,7 @@ impl TodoApp {
         let pages = log::build(
             self.api.board(),
             self.log_period,
-            self.log_starred_only,
+            self.log_filter,
             &self.log_hidden,
             &Local,
         );
@@ -2045,10 +2049,12 @@ impl TodoApp {
                 ui.add_space(8.0);
                 ui.weak(if none_shown && !board.tasks.is_empty() {
                     "No tasks selected. Pick some in the list."
-                } else if self.log_starred_only {
-                    "No starred comments yet. Star a comment from its card."
                 } else {
-                    "Nothing logged yet."
+                    match self.log_filter {
+                        Filter::All => "Nothing logged yet.",
+                        Filter::Starred => "No starred comments yet. Star a comment from its card.",
+                        Filter::Relevant => "No open blockers or next steps.",
+                    }
                 });
             }
             for page in &pages {

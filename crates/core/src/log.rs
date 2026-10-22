@@ -22,6 +22,27 @@ impl Period {
     }
 }
 
+/// Which entries the log keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    All,
+    /// Starred comments' entries.
+    Starred,
+    /// Open blockers and next steps of tasks not done, each as of when it
+    /// became one.
+    Relevant,
+}
+
+impl Filter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Filter::All => "All",
+            Filter::Starred => "Starred",
+            Filter::Relevant => "Relevant",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     Created,
@@ -208,17 +229,23 @@ fn page_start<Tz: TimeZone>(at: DateTime<Utc>, period: Period, tz: &Tz) -> Naive
 }
 
 /// Pages newest first; tasks within a page ordered by their first entry,
-/// subtasks nested under their parent, entries in time order. `starred_only` keeps only starred comments' entries.
+/// subtasks nested under their parent, entries in time order, as many as `filter` keeps.
 /// Tasks in `hidden` have no entries, but still head their shown subtasks.
 pub fn build<Tz: TimeZone>(
     board: &Board,
     period: Period,
-    starred_only: bool,
+    filter: Filter,
     hidden: &HashSet<Uuid>,
     tz: &Tz,
 ) -> Vec<LogPage> {
     let mut pages: Vec<LogPage> = Vec::new();
     for task in board.tasks.iter().filter(|t| !hidden.contains(&t.id)) {
+        if filter == Filter::Relevant {
+            if !task.done {
+                add_to_pages(&mut pages, task, relevant_entries(board, task), period, tz);
+            }
+            continue;
+        }
         let title_entry = |at, kind| Entry {
             at,
             kind,
@@ -250,30 +277,10 @@ pub fn build<Tz: TimeZone>(
             EntryKind::Done => !closed.contains(&e.at),
             _ => true,
         });
-        if starred_only {
+        if filter == Filter::Starred {
             entries.retain(|e| e.starred);
         }
-        for entry in entries {
-            let start = page_start(entry.at, period, tz);
-            let page = match pages.iter().position(|p| p.start == start) {
-                Some(i) => &mut pages[i],
-                None => {
-                    pages.push(LogPage {
-                        start,
-                        groups: Vec::new(),
-                    });
-                    pages.last_mut().unwrap()
-                }
-            };
-            match page.groups.iter_mut().find(|g| g.task_id == task.id) {
-                Some(group) => group.entries.push(entry),
-                None => {
-                    let mut group = TaskGroup::new(task);
-                    group.entries.push(entry);
-                    page.groups.push(group);
-                }
-            }
-        }
+        add_to_pages(&mut pages, task, entries, period, tz);
     }
     for page in &mut pages {
         page.groups = nest(board, std::mem::take(&mut page.groups));
@@ -284,6 +291,53 @@ pub fn build<Tz: TimeZone>(
     }
     pages.sort_by_key(|p| std::cmp::Reverse(p.start));
     pages
+}
+
+/// The entries that made the task's open blockers and next steps what they are.
+fn relevant_entries(board: &Board, task: &Task) -> Vec<Entry> {
+    task.notes
+        .iter()
+        .filter(|n| n.is_open_blocker() || n.is_open_step())
+        .flat_map(|n| note_entries(board, n))
+        .filter(|e| match e.kind {
+            EntryKind::Comment {
+                blocking,
+                next_step,
+            } => blocking || next_step,
+            EntryKind::MarkedBlocking | EntryKind::MarkedNextStep => true,
+            _ => false,
+        })
+        .collect()
+}
+
+fn add_to_pages<Tz: TimeZone>(
+    pages: &mut Vec<LogPage>,
+    task: &Task,
+    entries: Vec<Entry>,
+    period: Period,
+    tz: &Tz,
+) {
+    for entry in entries {
+        let start = page_start(entry.at, period, tz);
+        let page = match pages.iter().position(|p| p.start == start) {
+            Some(i) => &mut pages[i],
+            None => {
+                pages.push(LogPage {
+                    start,
+                    groups: Vec::new(),
+                });
+                pages.last_mut().unwrap()
+            }
+        };
+        match page.groups.iter_mut().find(|g| g.task_id == task.id) {
+            Some(group) => group.entries.push(entry),
+            None => {
+                let mut group = TaskGroup::new(task);
+                group.entries.push(entry);
+                page.groups.push(group);
+            }
+        }
+    }
 }
 
 /// Show the task in the log, or hide it, and its subtasks with it.
@@ -330,7 +384,7 @@ mod tests {
 
     #[test]
     fn daily_pages_newest_first_with_tasks_in_order() {
-        let pages = build(&sample(), Period::Day, false, &none(), &Utc);
+        let pages = build(&sample(), Period::Day, Filter::All, &none(), &Utc);
         let starts: Vec<_> = pages.iter().map(|p| p.start).collect();
         assert_eq!(starts, [date(19), date(15), date(14), date(13), date(12)]);
 
@@ -356,7 +410,7 @@ mod tests {
 
     #[test]
     fn blockers_posted_vs_marked_later() {
-        let pages = build(&sample(), Period::Day, false, &none(), &Utc);
+        let pages = build(&sample(), Period::Day, Filter::All, &none(), &Utc);
         let posted = &pages[3].groups[0].entries[0];
         assert_eq!(
             posted.kind,
@@ -380,7 +434,7 @@ mod tests {
         t.post("Report\nwith numbers", MessageKind::Comment, at(12, 12));
         t.mark_next_step(1, at(12, 13));
         b.promote_step(a, 1, "Report".into(), "with numbers", at(12, 14));
-        let pages = build(&b, Period::Day, false, &none(), &Utc);
+        let pages = build(&b, Period::Day, Filter::All, &none(), &Utc);
         let group = &pages[0].groups[0];
         let kinds: Vec<_> = group.entries.iter().map(|e| &e.kind).collect();
         assert_eq!(
@@ -410,7 +464,7 @@ mod tests {
 
     #[test]
     fn created_comes_before_a_first_comment_at_the_same_time() {
-        let pages = build(&sample(), Period::Day, false, &none(), &Utc);
+        let pages = build(&sample(), Period::Day, Filter::All, &none(), &Utc);
         let b = pages[2].groups.iter().find(|g| g.title == "B").unwrap();
         let kinds: Vec<_> = b.entries.iter().map(|e| &e.kind).collect();
         assert_eq!(
@@ -427,7 +481,7 @@ mod tests {
 
     #[test]
     fn weekly_pages_split_on_monday() {
-        let pages = build(&sample(), Period::Week, false, &none(), &Utc);
+        let pages = build(&sample(), Period::Week, Filter::All, &none(), &Utc);
         let starts: Vec<_> = pages.iter().map(|p| p.start).collect();
         assert_eq!(starts, [date(19), date(12)]);
         let titles: Vec<_> = pages[1].groups.iter().map(|g| g.title.as_str()).collect();
@@ -436,7 +490,7 @@ mod tests {
 
     #[test]
     fn starred_only_keeps_starred_comments_and_their_unblocks() {
-        let pages = build(&sample(), Period::Day, true, &none(), &Utc);
+        let pages = build(&sample(), Period::Day, Filter::Starred, &none(), &Utc);
         let all: Vec<_> = pages
             .iter()
             .flat_map(|p| p.groups.iter().flat_map(|g| &g.entries))
@@ -462,7 +516,7 @@ mod tests {
         );
         t.post("got access", MessageKind::Unblock, at(12, 15));
         t.post("shipped", MessageKind::Close, at(12, 16));
-        let pages = build(&b, Period::Day, false, &none(), &Utc);
+        let pages = build(&b, Period::Day, Filter::All, &none(), &Utc);
         let kinds: Vec<_> = pages[0].groups[0].entries.iter().map(|e| &e.kind).collect();
         assert_eq!(
             kinds,
@@ -482,7 +536,7 @@ mod tests {
         assert_eq!(pages[0].groups[0].entries[2].text, "got access");
 
         // Starred: the blocker and its Unblock message.
-        let pages = build(&b, Period::Day, true, &none(), &Utc);
+        let pages = build(&b, Period::Day, Filter::Starred, &none(), &Utc);
         assert_eq!(pages[0].groups[0].entries.len(), 2);
     }
 
@@ -505,6 +559,48 @@ mod tests {
         groups.iter().map(|g| g.title.as_str()).collect()
     }
 
+    #[test]
+    fn relevant_keeps_only_whats_open_as_of_when_it_opened() {
+        let mut b = Board::default();
+        let p = b.add_task("P".into(), "", None, at(12, 9));
+        let t = b.task_mut(p).unwrap();
+        t.post("old blocker", MessageKind::Block, at(12, 10));
+        t.resolve(0, at(12, 11));
+        t.post("ticked", MessageKind::Next, at(12, 12));
+        t.toggle_step(1, at(12, 13));
+        let a = b.add_task("A".into(), "", Some(p), at(13, 9));
+        let t = b.task_mut(a).unwrap();
+        t.post("waiting", MessageKind::Block, at(13, 10));
+        t.post("later a step", MessageKind::Comment, at(13, 11));
+        t.mark_next_step(1, at(14, 9));
+        let d = b.add_task("D".into(), "", None, at(13, 9));
+        let t = b.task_mut(d).unwrap();
+        t.post("never mind", MessageKind::Next, at(13, 10));
+        t.set_done(true, at(13, 11));
+
+        let pages = build(&b, Period::Day, Filter::Relevant, &none(), &Utc);
+        let starts: Vec<_> = pages.iter().map(|p| p.start).collect();
+        assert_eq!(starts, [date(14), date(13)]);
+        for page in &pages {
+            // P has nothing open: only there to head A.
+            assert_eq!(titles(&page.groups), ["P"]);
+            assert!(page.groups[0].entries.is_empty());
+            assert_eq!(titles(&page.groups[0].subgroups), ["A"]);
+        }
+        let kinds = |i: usize| -> Vec<EntryKind> {
+            let a = &pages[i].groups[0].subgroups[0];
+            a.entries.iter().map(|e| e.kind.clone()).collect()
+        };
+        assert_eq!(kinds(0), [EntryKind::MarkedNextStep]);
+        assert_eq!(
+            kinds(1),
+            [EntryKind::Comment {
+                blocking: true,
+                next_step: false
+            }]
+        );
+    }
+
     fn none() -> HashSet<Uuid> {
         HashSet::new()
     }
@@ -519,11 +615,11 @@ mod tests {
         let mut hidden = none();
         set_shown(&b, &mut hidden, id(&b, "P"), false);
         assert_eq!(hidden.len(), 4);
-        assert!(build(&b, Period::Week, false, &hidden, &Utc).is_empty());
+        assert!(build(&b, Period::Week, Filter::All, &hidden, &Utc).is_empty());
 
         // S shown again, without G: under an empty P, as P is hidden.
         hidden.remove(&id(&b, "S"));
-        let pages = build(&b, Period::Week, false, &hidden, &Utc);
+        let pages = build(&b, Period::Week, Filter::All, &hidden, &Utc);
         let p = &pages[0].groups[0];
         assert_eq!(titles(&pages[0].groups), ["P"]);
         assert!(p.entries.is_empty());
@@ -531,7 +627,7 @@ mod tests {
         assert!(p.subgroups[0].subgroups.is_empty());
 
         set_shown(&b, &mut hidden, id(&b, "S"), true);
-        let pages = build(&b, Period::Week, false, &hidden, &Utc);
+        let pages = build(&b, Period::Week, Filter::All, &hidden, &Utc);
         assert_eq!(titles(&pages[0].groups[0].subgroups[0].subgroups), ["G"]);
         set_shown(&b, &mut hidden, id(&b, "P"), true);
         assert!(hidden.is_empty());
@@ -539,7 +635,7 @@ mod tests {
 
     #[test]
     fn subtasks_nest_under_their_parent() {
-        let pages = build(&family(), Period::Week, false, &none(), &Utc);
+        let pages = build(&family(), Period::Week, Filter::All, &none(), &Utc);
         let p = &pages[0].groups[0];
         assert_eq!(titles(&pages[0].groups), ["P"]);
         assert_eq!(p.entries.len(), 1);
@@ -549,7 +645,7 @@ mod tests {
 
     #[test]
     fn parents_without_entries_still_head_their_subtasks() {
-        let pages = build(&family(), Period::Day, false, &none(), &Utc);
+        let pages = build(&family(), Period::Day, Filter::All, &none(), &Utc);
         let day14 = &pages[0];
         assert_eq!(day14.start, date(14));
         let p = &day14.groups[0];
@@ -563,7 +659,7 @@ mod tests {
 
     #[test]
     fn starred_only_nests_the_same_way() {
-        let pages = build(&family(), Period::Week, true, &none(), &Utc);
+        let pages = build(&family(), Period::Week, Filter::Starred, &none(), &Utc);
         assert_eq!(pages.len(), 1);
         let p = &pages[0].groups[0];
         assert!(p.entries.is_empty());

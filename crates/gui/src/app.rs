@@ -196,6 +196,9 @@ fn task_menu_items(ui: &mut egui::Ui, task_id: Uuid, is_subtask: bool, actions: 
             .into(),
         );
     }
+    if ui.button("Show in log").clicked() {
+        actions.push(Action::ShowInLog(task_id));
+    }
     if ui.button("Delete…").clicked() {
         actions.push(Action::Delete(task_id));
     }
@@ -947,6 +950,8 @@ enum Action {
     StartEdit(Uuid),
     /// Open the dialog for moving a comment to another task.
     StartMove(Uuid),
+    /// Switch to the log, showing only this task and its subtasks.
+    ShowInLog(Uuid),
     /// Go to a task from the card in slot `from`: flash its card if it's in
     /// focus (`at` is when, in egui time), or else put it in place of `from`.
     Navigate {
@@ -1300,6 +1305,10 @@ impl TodoApp {
                     }
                 },
                 Action::Delete(id) => self.confirm_delete = Some(id),
+                Action::ShowInLog(id) => {
+                    self.log_hidden = log::only(self.api.board(), id);
+                    self.view = View::Log;
+                }
                 Action::AddSubtask(id, title) => {
                     self.new_task = Some(NewTaskDraft {
                         parent: Some(id),

@@ -351,6 +351,17 @@ pub fn set_shown(board: &Board, hidden: &mut HashSet<Uuid>, id: Uuid, shown: boo
     }
 }
 
+/// The `hidden` set that shows only the task and its subtasks.
+pub fn only(board: &Board, id: Uuid) -> HashSet<Uuid> {
+    let shown: HashSet<Uuid> = std::iter::once(id).chain(board.descendants(id)).collect();
+    board
+        .tasks
+        .iter()
+        .map(|t| t.id)
+        .filter(|t| !shown.contains(t))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +642,29 @@ mod tests {
         assert_eq!(titles(&pages[0].groups[0].subgroups[0].subgroups), ["G"]);
         set_shown(&b, &mut hidden, id(&b, "P"), true);
         assert!(hidden.is_empty());
+    }
+
+    #[test]
+    fn only_shows_the_task_and_its_subtasks() {
+        let mut b = family();
+        b.add_task("Q".into(), "", None, at(13, 9));
+        let hidden = only(&b, id(&b, "S"));
+        let shown: Vec<&str> = b
+            .tasks
+            .iter()
+            .filter(|t| !hidden.contains(&t.id))
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(shown, ["S", "G"]);
+        // P only heads S, with no entries of its own; Q and T are left out.
+        let pages = build(&b, Period::Week, Filter::All, &hidden, &Utc);
+        let p = &pages[0].groups[0];
+        assert_eq!(titles(&pages[0].groups), ["P"]);
+        assert!(p.entries.is_empty());
+        assert_eq!(titles(&p.subgroups), ["S"]);
+        assert_eq!(titles(&p.subgroups[0].subgroups), ["G"]);
+
+        assert_eq!(only(&b, id(&b, "P")), HashSet::from([id(&b, "Q")]));
     }
 
     #[test]

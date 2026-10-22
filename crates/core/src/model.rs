@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 pub const SLOT_COUNT: usize = 4;
 
-/// How long without updates before a task is shown fully red.
-const STALE_AFTER_SECS: f32 = 7.0 * 24.0 * 3600.0;
+/// How long without updates before a task is shown fully yellow.
+const STALE_AFTER_SECS: f32 = 3.0 * 24.0 * 3600.0;
 
 /// A comment that needs someone else to act before the task can move on.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

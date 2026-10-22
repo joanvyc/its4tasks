@@ -30,7 +30,7 @@ pub enum Filter {
     Starred,
     /// Open blockers and next steps of tasks not done, each as of when it
     /// became one.
-    Relevant,
+    Pending,
 }
 
 impl Filter {
@@ -38,7 +38,7 @@ impl Filter {
         match self {
             Filter::All => "All",
             Filter::Starred => "Starred",
-            Filter::Relevant => "Relevant",
+            Filter::Pending => "Pending",
         }
     }
 }
@@ -240,9 +240,9 @@ pub fn build<Tz: TimeZone>(
 ) -> Vec<LogPage> {
     let mut pages: Vec<LogPage> = Vec::new();
     for task in board.tasks.iter().filter(|t| !hidden.contains(&t.id)) {
-        if filter == Filter::Relevant {
+        if filter == Filter::Pending {
             if !task.done {
-                add_to_pages(&mut pages, task, relevant_entries(board, task), period, tz);
+                add_to_pages(&mut pages, task, pending_entries(board, task), period, tz);
             }
             continue;
         }
@@ -294,7 +294,7 @@ pub fn build<Tz: TimeZone>(
 }
 
 /// The entries that made the task's open blockers and next steps what they are.
-fn relevant_entries(board: &Board, task: &Task) -> Vec<Entry> {
+fn pending_entries(board: &Board, task: &Task) -> Vec<Entry> {
     task.notes
         .iter()
         .filter(|n| n.is_open_blocker() || n.is_open_step())
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn relevant_keeps_only_whats_open_as_of_when_it_opened() {
+    fn pending_keeps_only_whats_open_as_of_when_it_opened() {
         let mut b = Board::default();
         let p = b.add_task("P".into(), "", None, at(12, 9));
         let t = b.task_mut(p).unwrap();
@@ -578,7 +578,7 @@ mod tests {
         t.post("never mind", MessageKind::Next, at(13, 10));
         t.set_done(true, at(13, 11));
 
-        let pages = build(&b, Period::Day, Filter::Relevant, &none(), &Utc);
+        let pages = build(&b, Period::Day, Filter::Pending, &none(), &Utc);
         let starts: Vec<_> = pages.iter().map(|p| p.start).collect();
         assert_eq!(starts, [date(14), date(13)]);
         for page in &pages {

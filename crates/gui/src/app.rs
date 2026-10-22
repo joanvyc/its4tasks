@@ -2155,14 +2155,14 @@ impl TodoApp {
                 ComboBox::from_id_salt("log_filter")
                     .selected_text(self.log_filter.label())
                     .show_ui(ui, |ui| {
-                        for filter in [Filter::All, Filter::Starred, Filter::Relevant] {
+                        for filter in [Filter::All, Filter::Starred, Filter::Pending] {
                             ui.selectable_value(&mut self.log_filter, filter, filter.label());
                         }
                     })
                     .response
                     .on_hover_text(
                         "Starred: starred comments\n\
-                         Relevant: open blockers and next steps, on the day they were set",
+                         Pending: open blockers and next steps, on the day they were set",
                     );
             }
             // Text rather than egui's ☀/🌙 buttons: drawing those emoji makes
@@ -2225,7 +2225,7 @@ impl TodoApp {
                     match self.log_filter {
                         Filter::All => "Nothing logged yet.",
                         Filter::Starred => "No starred comments yet. Star a comment from its card.",
-                        Filter::Relevant => "No open blockers or next steps.",
+                        Filter::Pending => "No open blockers or next steps.",
                     }
                 });
             }

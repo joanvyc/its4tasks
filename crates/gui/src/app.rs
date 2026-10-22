@@ -1,4 +1,4 @@
-use std::{iter, sync::Arc, sync::mpsc::Receiver, time::Duration};
+use std::{collections::HashSet, iter, sync::Arc, sync::mpsc::Receiver, time::Duration};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Utc};
 use eframe::egui::{
@@ -938,6 +938,9 @@ pub struct TodoApp {
     view: View,
     log_period: Period,
     log_starred_only: bool,
+    /// Tasks left out of the log, picked in the task list while the log is
+    /// shown. Hidden rather than shown ones, so new tasks are shown.
+    log_hidden: HashSet<Uuid>,
     /// Leave done tasks out of the task list.
     hide_closed: bool,
     /// Whether work kept from before signing in again (`unsent`) has been
@@ -983,6 +986,7 @@ impl TodoApp {
             view: View::Board,
             log_period: Period::Day,
             log_starred_only: false,
+            log_hidden: HashSet::new(),
             hide_closed: false,
             restored: false,
             kept: Instant::now(),
@@ -1293,12 +1297,37 @@ impl TodoApp {
                 }
                 let color = palette(ui.visuals()).resolved;
                 toggle_switch(ui, on, color, "Hide closed").on_hover_text(hint);
+                if self.view == View::Log {
+                    ui.add_space(8.0);
+                    let hint = "Show every task in the log, or none";
+                    let board = self.api.board();
+                    let all = !board.tasks.iter().any(|t| self.log_hidden.contains(&t.id));
+                    let mut on = all;
+                    let label = Label::new(RichText::new("Show all").small())
+                        .selectable(false)
+                        .sense(Sense::click());
+                    if ui.add(label).on_hover_text(hint).clicked() {
+                        on = !on;
+                    }
+                    let color = ui.visuals().selection.bg_fill;
+                    toggle_switch(ui, &mut on, color, "Show all").on_hover_text(hint);
+                    if on != all {
+                        self.log_hidden = if on {
+                            HashSet::new()
+                        } else {
+                            board.tasks.iter().map(|t| t.id).collect()
+                        };
+                    }
+                }
             });
         });
         ui.separator();
 
         let has_free_slot = self.api.board().has_free_slot();
         let now = Utc::now();
+        let log_mode = self.view == View::Log;
+        // A task clicked in or out of the log, and whether it's now in.
+        let mut log_toggle: Option<(Uuid, bool)> = None;
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if self.api.board().tasks.is_empty() {
                 ui.add_space(8.0);
@@ -1379,7 +1408,32 @@ impl TodoApp {
                             ui.painter().add(fold_arrow(arrow.center(), task.folded, color));
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if slot.is_some() {
+                            if log_mode {
+                                let shown = !self.log_hidden.contains(&id);
+                                let (dot, response) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::click());
+                                let color = if response.hovered() {
+                                    ui.visuals().strong_text_color()
+                                } else if shown {
+                                    ui.visuals().selection.bg_fill
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
+                                if shown {
+                                    ui.painter().circle_filled(dot.center(), 5.0, color);
+                                } else {
+                                    let stroke = Stroke::new(1.5, color);
+                                    ui.painter().circle_stroke(dot.center(), 4.25, stroke);
+                                }
+                                let hint = if shown {
+                                    "Shown in the log · click to hide it and its subtasks"
+                                } else {
+                                    "Hidden from the log · click to show it and its subtasks"
+                                };
+                                if response.on_hover_text(hint).clicked() {
+                                    log_toggle = Some((id, !shown));
+                                }
+                            } else if slot.is_some() {
                                 // Painted rather than a "●" glyph, which sits on the text
                                 // baseline instead of the row's center.
                                 let (dot, response) =
@@ -1460,6 +1514,9 @@ impl TodoApp {
                 }
             }
         });
+        if let Some((id, shown)) = log_toggle {
+            log::set_shown(self.api.board(), &mut self.log_hidden, id, shown);
+        }
     }
 
     fn cards(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -1974,8 +2031,11 @@ impl TodoApp {
             self.api.board(),
             self.log_period,
             self.log_starred_only,
+            &self.log_hidden,
             &Local,
         );
+        let board = self.api.board();
+        let none_shown = board.tasks.iter().all(|t| self.log_hidden.contains(&t.id));
         let time_format = match self.log_period {
             Period::Day => "%H:%M",
             Period::Week => "%a %H:%M",
@@ -1983,7 +2043,9 @@ impl TodoApp {
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if pages.is_empty() {
                 ui.add_space(8.0);
-                ui.weak(if self.log_starred_only {
+                ui.weak(if none_shown && !board.tasks.is_empty() {
+                    "No tasks selected. Pick some in the list."
+                } else if self.log_starred_only {
                     "No starred comments yet. Star a comment from its card."
                 } else {
                     "Nothing logged yet."

@@ -10,6 +10,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+#[cfg(test)]
+use chrono::TimeDelta;
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -234,11 +236,55 @@ pub struct Rejected {
 /// Applies a change to a board as of `now`: the board's rules, shared by the
 /// server and the GUI's optimistic copy. The same change on equal boards at
 /// the same `now` gives equal boards.
+///
+/// A change that updates a subtask updates the tasks above it too.
 pub fn apply_change(
     b: &mut Board,
     change: Change,
     now: DateTime<Utc>,
 ) -> Result<Outcome, ApiError> {
+    let subject = subject(b, &change);
+    let updated = |b: &Board| subject.and_then(|id| b.task(id)).map(|t| t.updated_at);
+    let before = updated(b);
+    let outcome = apply(b, change, now)?;
+    if let (Some(id), Some(at)) = (subject, updated(b))
+        && Some(at) != before
+    {
+        b.touch_ancestors(id, at);
+    }
+    Ok(outcome)
+}
+
+/// The task whose update a change can be: the one it changes, or the one it
+/// creates.
+fn subject(b: &Board, change: &Change) -> Option<Uuid> {
+    match change {
+        Change::AddTask { id, .. } => Some(*id),
+        Change::Rename { task, .. }
+        | Change::SetDone { task, .. }
+        | Change::ToggleFold { task }
+        | Change::SetParent { task, .. }
+        | Change::Post { task, .. } => Some(*task),
+        Change::MoveNote { to, .. } => Some(*to),
+        Change::PromoteStep { note, .. }
+        | Change::EditNote { note, .. }
+        | Change::DeleteNote { note }
+        | Change::MarkBlocking { note }
+        | Change::Resolve { note }
+        | Change::Unblock { note }
+        | Change::MarkStep { note }
+        | Change::ToggleStep { note }
+        | Change::UnmarkStep { note }
+        | Change::ToggleStar { note } => b.find_note(*note).map(|(task, _)| task),
+        Change::DeleteTask { .. }
+        | Change::Focus { .. }
+        | Change::FocusInto { .. }
+        | Change::Unfocus { .. }
+        | Change::Import { .. } => None,
+    }
+}
+
+fn apply(b: &mut Board, change: Change, now: DateTime<Utc>) -> Result<Outcome, ApiError> {
     fits(b, &change)?;
     match change {
         Change::AddTask {
@@ -507,6 +553,56 @@ mod tests {
         assert_eq!(a, apply_change(&mut there, promote, now));
         assert!(matches!(a, Ok(Outcome::Created(_))));
         assert_eq!(here, there);
+    }
+
+    #[test]
+    fn updating_a_subtask_updates_the_tasks_above_it() {
+        let t0 = now();
+        let h = TimeDelta::hours;
+        let mut b = Board::default();
+        let top = b.add_task("top".into(), "", None, t0);
+        let mid = b.add_task("mid".into(), "", Some(top), t0);
+        let at = |b: &Board, id| b.task(id).unwrap().updated_at;
+        let apply = |b: &mut Board, change, now| apply_change(b, change, now).unwrap();
+
+        // A new subtask counts.
+        let Outcome::Created(low) = apply(
+            &mut b,
+            Change::add_task("low".into(), String::new(), Some(mid), false),
+            t0 + h(1),
+        ) else {
+            panic!("created")
+        };
+        assert_eq!((at(&b, top), at(&b, mid)), (t0 + h(1), t0 + h(1)));
+
+        let post = Change::post(low, "/next ship".into(), MessageKind::Next);
+        apply(&mut b, post, t0 + h(2));
+        assert_eq!((at(&b, top), at(&b, mid)), (t0 + h(2), t0 + h(2)));
+        let step = b.task(low).unwrap().notes[0].id;
+        apply(&mut b, Change::ToggleStep { note: step }, t0 + h(3));
+        assert_eq!(at(&b, top), t0 + h(3));
+        let rename = Change::Rename {
+            task: low,
+            title: "lower".into(),
+        };
+        apply(&mut b, rename, t0 + h(4));
+        assert_eq!(at(&b, top), t0 + h(4));
+
+        // What doesn't update the subtask doesn't update its parents.
+        apply(&mut b, Change::ToggleStar { note: step }, t0 + h(5));
+        apply(&mut b, Change::ToggleFold { task: low }, t0 + h(5));
+        assert_eq!((at(&b, top), at(&b, low)), (t0 + h(4), t0 + h(4)));
+
+        // A moved comment updates them only as of its own time.
+        let other = b.add_task("other".into(), "", None, t0);
+        b.task_mut(other).unwrap().post(
+            "old",
+            MessageKind::Comment,
+            t0 + h(4) + TimeDelta::minutes(30),
+        );
+        let note = b.task(other).unwrap().notes[0].id;
+        apply(&mut b, Change::MoveNote { note, to: low }, t0 + h(6));
+        assert_eq!(at(&b, top), t0 + h(4) + TimeDelta::minutes(30));
     }
 
     #[test]

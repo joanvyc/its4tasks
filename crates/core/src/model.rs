@@ -832,6 +832,24 @@ impl Board {
         true
     }
 
+    /// Count every task above `id` as updated at `at` too, as an update of a
+    /// subtask is one of its parents. Never moves a task back in time.
+    pub fn touch_ancestors(&mut self, id: Uuid, at: DateTime<Utc>) {
+        let mut seen = vec![id];
+        let mut current = self.task(id).and_then(|t| t.parent);
+        while let Some(p) = current {
+            if seen.contains(&p) {
+                return;
+            }
+            seen.push(p);
+            let Some(task) = self.task_mut(p) else {
+                return;
+            };
+            task.updated_at = task.updated_at.max(at);
+            current = task.parent;
+        }
+    }
+
     /// Subtasks that aren't done.
     fn open_children(&self, id: Uuid) -> impl Iterator<Item = &Task> {
         self.children(id).filter(|t| !t.done)
@@ -1386,6 +1404,25 @@ mod tests {
     }
 
     #[test]
+    fn touching_ancestors_reaches_every_parent_and_never_goes_back() {
+        let mut b = board_with(4);
+        let t0 = b.task(n(0)).unwrap().updated_at;
+        let h = TimeDelta::hours;
+        // 0 > 1 > 2, and 3 is 1's other subtask.
+        b.set_parent(n(1), Some(n(0)));
+        b.set_parent(n(2), Some(n(1)));
+        b.set_parent(n(3), Some(n(1)));
+        b.touch_ancestors(n(2), t0 + h(2));
+        let at = |b: &Board, i| b.task(n(i)).unwrap().updated_at;
+        assert_eq!(at(&b, 0), t0 + h(2));
+        assert_eq!(at(&b, 1), t0 + h(2));
+        assert!(at(&b, 2) < t0 + h(1), "the task itself is left alone");
+        assert!(at(&b, 3) < t0 + h(1), "and so are its siblings");
+        b.touch_ancestors(n(2), t0 + h(1));
+        assert_eq!(at(&b, 0), t0 + h(2));
+    }
+
+    #[test]
     fn promoting_a_step_makes_a_subtask_with_its_history() {
         let mut b = board_with(1);
         let t0 = Utc::now();
@@ -1645,8 +1682,8 @@ mod tests {
     fn staleness_ramps_and_clamps() {
         assert_eq!(staleness(TimeDelta::zero()), 0.0);
         assert_eq!(staleness(TimeDelta::days(-1)), 0.0);
-        assert!((staleness(TimeDelta::hours(84)) - 0.5).abs() < 1e-4);
-        assert_eq!(staleness(TimeDelta::days(7)), 1.0);
+        assert!((staleness(TimeDelta::hours(36)) - 0.5).abs() < 1e-4);
+        assert_eq!(staleness(TimeDelta::days(3)), 1.0);
         assert_eq!(staleness(TimeDelta::days(30)), 1.0);
     }
 

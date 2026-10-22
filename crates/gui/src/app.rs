@@ -2138,10 +2138,26 @@ impl TodoApp {
             .on_hover_text("More");
     }
 
-    fn view_bar(&mut self, ui: &mut egui::Ui) {
+    fn view_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.view, View::Board, "Board");
             ui.selectable_value(&mut self.view, View::Log, "Log");
+            if self.view == View::Board {
+                ui.separator();
+                let slots = self.api.board().slots;
+                let clear = ui
+                    .add_enabled(
+                        slots.iter().any(Option::is_some),
+                        Button::new("Clear board"),
+                    )
+                    .on_hover_text("Send every card back to the list")
+                    .on_disabled_hover_text("The board is already empty");
+                if clear.clicked() {
+                    for slot in (0..SLOT_COUNT).filter(|&s| slots[s].is_some()) {
+                        actions.push(Change::Unfocus { slot }.into());
+                    }
+                }
+            }
             if self.view == View::Log {
                 ui.separator();
                 ComboBox::from_id_salt("log_period")
@@ -2467,7 +2483,7 @@ impl eframe::App for TodoApp {
             .min_size(240.0)
             .show(ui, |ui| self.task_list(ui, &mut actions));
         CentralPanel::default().show(ui, |ui| {
-            self.view_bar(ui);
+            self.view_bar(ui, &mut actions);
             match self.view {
                 View::Board => self.cards(ui, &mut actions),
                 View::Log => self.log_view(ui),

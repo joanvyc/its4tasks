@@ -9,6 +9,9 @@
 //! - `POST /api/import` with an `its4tasks.json`'s text (or an older
 //!   version's `board.json`): adds its tasks; 400 if
 //!   it isn't one.
+//! - The board in those answers leaves out archived tasks (see
+//!   `Board::archived`), unless the request asks for them with
+//!   `?archived=true`.
 //! - `GET /api/auth`: how the native app signs in (OAuth), if it can.
 //!   Answered to anyone.
 //! - `/favicon.svg`: the site's icon (`page/favicon.svg`).
@@ -26,7 +29,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -36,6 +39,7 @@ use its4tasks_core::api::{ApiError, Applied, BoardView, Change, Rejected, now};
 use its4tasks_core::model::Board;
 use its4tasks_core::{import, welcome};
 use rust_embed::Embed;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -174,7 +178,29 @@ async fn user(state: &AppState, headers: &HeaderMap) -> Result<User, Box<Respons
         .map_err(|e| Box::new(internal(e.into())))
 }
 
-async fn board(State(state): State<Shared>, headers: HeaderMap) -> Response {
+/// Which tasks a request wants in the board it's answered with.
+#[derive(Deserialize)]
+struct Shown {
+    /// Archived ones too (see `Board::archived`).
+    #[serde(default)]
+    archived: bool,
+}
+
+impl Shown {
+    fn board(&self, board: &Board) -> Board {
+        if self.archived {
+            board.clone()
+        } else {
+            board.without_archived(now())
+        }
+    }
+}
+
+async fn board(
+    State(state): State<Shared>,
+    Query(shown): Query<Shown>,
+    headers: HeaderMap,
+) -> Response {
     let user = match user(&state, &headers).await {
         Ok(user) => user,
         Err(response) => return *response,
@@ -183,7 +209,7 @@ async fn board(State(state): State<Shared>, headers: HeaderMap) -> Response {
     match api.board(&user).await {
         Ok((started, board)) => Json(BoardView {
             started,
-            board: board.clone(),
+            board: shown.board(board),
             user: Some(user.id),
         })
         .into_response(),
@@ -193,6 +219,7 @@ async fn board(State(state): State<Shared>, headers: HeaderMap) -> Response {
 
 async fn change(
     State(state): State<Shared>,
+    Query(shown): Query<Shown>,
     headers: HeaderMap,
     Json(change): Json<Change>,
 ) -> Response {
@@ -203,7 +230,7 @@ async fn change(
     let mut api = state.api.lock().await;
     let result = api.apply(&user, change).await;
     let board = match api.board(&user).await {
-        Ok((_, board)) => board.clone(),
+        Ok((_, board)) => shown.board(board),
         Err(e) => return internal(e),
     };
     match result {
@@ -226,7 +253,11 @@ fn status(error: ApiError) -> StatusCode {
 }
 
 /// Starts a new user's board with the welcome tasks.
-async fn start(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn start(
+    State(state): State<Shared>,
+    Query(shown): Query<Shown>,
+    headers: HeaderMap,
+) -> Response {
     let user = match user(&state, &headers).await {
         Ok(user) => user,
         Err(response) => return *response,
@@ -234,13 +265,18 @@ async fn start(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let mut api = state.api.lock().await;
     match api.board(&user).await {
         Ok((true, _)) => (StatusCode::CONFLICT, "You already have a board.").into_response(),
-        Ok((false, _)) => add_board(&mut api, &user, welcome::board(now())).await,
+        Ok((false, _)) => add_board(&mut api, &user, welcome::board(now()), &shown).await,
         Err(e) => internal(e),
     }
 }
 
 /// Adds the tasks of the `its4tasks.json` sent.
-async fn import_board(State(state): State<Shared>, headers: HeaderMap, text: String) -> Response {
+async fn import_board(
+    State(state): State<Shared>,
+    Query(shown): Query<Shown>,
+    headers: HeaderMap,
+    text: String,
+) -> Response {
     let user = match user(&state, &headers).await {
         Ok(user) => user,
         Err(response) => return *response,
@@ -256,12 +292,12 @@ async fn import_board(State(state): State<Shared>, headers: HeaderMap, text: Str
         }
     };
     let mut api = state.api.lock().await;
-    add_board(&mut api, &user, board).await
+    add_board(&mut api, &user, board, &shown).await
 }
 
 /// Adds `board`'s tasks to the user's, with new ids, and answers with the
 /// user's `BoardView`.
-async fn add_board(api: &mut Api, user: &User, board: Board) -> Response {
+async fn add_board(api: &mut Api, user: &User, board: Board, shown: &Shown) -> Response {
     let change = Change::Import {
         board: import::fresh_ids(board),
     };
@@ -273,7 +309,7 @@ async fn add_board(api: &mut Api, user: &User, board: Board) -> Response {
     match api.board(user).await {
         Ok((started, board)) => Json(BoardView {
             started,
-            board: board.clone(),
+            board: shown.board(board),
             user: Some(user.id),
         })
         .into_response(),
@@ -478,7 +514,16 @@ mod tests {
     }
 
     async fn post(app: &Router, token: &str, change: &Change) -> (StatusCode, String) {
-        let request = Request::post("/api/changes")
+        post_to(app, "/api/changes", token, change).await
+    }
+
+    async fn post_to(
+        app: &Router,
+        path: &str,
+        token: &str,
+        change: &Change,
+    ) -> (StatusCode, String) {
+        let request = Request::post(path)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(change).unwrap()))
@@ -585,6 +630,55 @@ mod tests {
         };
         assert_eq!(post(&app, &bob, &gone).await.0, StatusCode::NOT_FOUND);
         assert_eq!(view(&app, &alice).await.board.tasks[0].title, "Alice's");
+    }
+
+    #[tokio::test]
+    async fn archived_tasks_are_sent_only_when_asked_for() {
+        let app = app();
+        let alice = token("alice");
+        let (t0, long_ago) = (now(), now() - chrono::TimeDelta::days(40));
+        let mut board = Board::default();
+        let root = board.add_task("old".into(), "", None, long_ago);
+        let sub = board.add_task("old sub".into(), "", Some(root), long_ago);
+        let deep = board.add_task("old deep".into(), "", Some(sub), long_ago);
+        let recent = board.add_task("recent".into(), "", None, long_ago);
+        let open = board.add_task("open".into(), "", None, t0);
+        for id in [root, sub, deep] {
+            board.task_mut(id).unwrap().set_done(true, long_ago);
+        }
+        board.task_mut(recent).unwrap().set_done(true, t0);
+        let import = Change::Import { board };
+        assert_eq!(post(&app, &alice, &import).await.0, StatusCode::OK);
+        let ids = |board: &Board| board.tasks.iter().map(|t| t.id).collect::<Vec<_>>();
+
+        assert_eq!(ids(&view(&app, &alice).await.board), [recent, open]);
+        let (status, body) = get(&app, "/api/board?archived=true", Some(&alice)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let all: BoardView = serde_json::from_str(&body).unwrap();
+        assert_eq!(ids(&all.board), [root, sub, deep, recent, open]);
+
+        // A change's answer too.
+        let rename = Change::Rename {
+            task: open,
+            title: "still open".into(),
+        };
+        let (_, body) = post(&app, &alice, &rename).await;
+        let applied: Applied = serde_json::from_str(&body).unwrap();
+        assert_eq!(ids(&applied.board), [recent, open]);
+        let (_, body) = post_to(&app, "/api/changes?archived=true", &alice, &rename).await;
+        let applied: Applied = serde_json::from_str(&body).unwrap();
+        assert_eq!(ids(&applied.board).len(), 5);
+
+        // Reopening its deepest task brings the whole tree back.
+        let reopen = Change::SetDone {
+            task: deep,
+            done: false,
+        };
+        assert_eq!(post(&app, &alice, &reopen).await.0, StatusCode::OK);
+        assert_eq!(
+            ids(&view(&app, &alice).await.board),
+            [root, sub, deep, recent, open]
+        );
     }
 
     #[tokio::test]

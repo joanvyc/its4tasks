@@ -207,6 +207,10 @@ pub fn now() -> DateTime<Utc> {
 }
 
 /// A user's board as `GET /api/board` answers it.
+///
+/// Here and in `Applied` and `Rejected`, the board leaves out archived
+/// tasks (see `Board::archived`) unless the request asks for them with
+/// `?archived=true`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardView {
     /// False for a new user, until they start a board or import one.

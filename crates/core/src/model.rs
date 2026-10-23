@@ -1,10 +1,18 @@
-use std::{cmp::Reverse, collections::HashSet, fmt, iter};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    fmt, iter,
+};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 pub const SLOT_COUNT: usize = 4;
+
+/// How long after its last task is closed a closed tree is archived (see
+/// `Board::archived`).
+pub const ARCHIVE_AFTER: TimeDelta = TimeDelta::days(30);
 
 /// How long without updates before a task is shown fully yellow.
 const STALE_AFTER_SECS: f32 = 3.0 * 24.0 * 3600.0;
@@ -1107,6 +1115,62 @@ impl Board {
     pub fn unfocus(&mut self, slot: usize) {
         if let Some(s) = self.slots.get_mut(slot) {
             *s = None;
+        }
+    }
+
+    /// The tasks archived as of `now`: every task of each tree (a root task
+    /// and its subtasks at any depth) that is closed throughout, with the
+    /// last of them closed more than `ARCHIVE_AFTER` ago and none in focus.
+    /// Reopening any task of a tree, or adding an open subtask to it, brings
+    /// the whole tree back. A task closed without `done_at` (old boards)
+    /// counts as closed when it was last updated.
+    pub fn archived(&self, now: DateTime<Utc>) -> HashSet<Uuid> {
+        let parents: HashMap<Uuid, Uuid> = self
+            .tasks
+            .iter()
+            .filter_map(|t| Some((t.id, t.parent?)))
+            .collect();
+        // At most as many steps up as there are tasks, in case of a cycle.
+        let root = |mut id: Uuid| {
+            for _ in 0..self.tasks.len() {
+                match parents.get(&id) {
+                    Some(&p) => id = p,
+                    None => break,
+                }
+            }
+            id
+        };
+        let roots: Vec<Uuid> = self.tasks.iter().map(|t| root(t.id)).collect();
+        // For each tree: whether it's closed and out of focus throughout,
+        // and when its last task was closed.
+        let mut trees: HashMap<Uuid, (bool, DateTime<Utc>)> = HashMap::new();
+        for (t, &r) in self.tasks.iter().zip(&roots) {
+            let closed = t.done_at.unwrap_or(t.updated_at);
+            let tree = trees.entry(r).or_insert((true, closed));
+            tree.0 &= t.done && self.slot_of(t.id).is_none();
+            tree.1 = tree.1.max(closed);
+        }
+        let before = now - ARCHIVE_AFTER;
+        self.tasks
+            .iter()
+            .zip(&roots)
+            .filter(|(_, r)| trees[*r].0 && trees[*r].1 < before)
+            .map(|(t, _)| t.id)
+            .collect()
+    }
+
+    /// The board without the tasks archived as of `now` (see `archived`).
+    /// Slots stay: a tree in focus isn't archived.
+    pub fn without_archived(&self, now: DateTime<Utc>) -> Board {
+        let archived = self.archived(now);
+        Board {
+            tasks: self
+                .tasks
+                .iter()
+                .filter(|t| !archived.contains(&t.id))
+                .cloned()
+                .collect(),
+            slots: self.slots,
         }
     }
 
@@ -2284,5 +2348,54 @@ mod tests {
             t.parse_input("/next call Bob").result,
             Ok(Submit::Post(Some(MessageKind::Next), "call Bob"))
         );
+    }
+
+    #[test]
+    fn closed_trees_are_archived_a_month_after_their_last_closure() {
+        let t0 = Utc::now();
+        let day = TimeDelta::days;
+        let mut b = Board::default();
+        let root = b.add_task("root".into(), "", None, t0);
+        let mid = b.add_task("mid".into(), "", Some(root), t0);
+        let low = b.add_task("low".into(), "", Some(mid), t0);
+        let side = b.add_task("side".into(), "", Some(root), t0);
+        let open = b.add_task("open".into(), "", None, t0);
+        let lone = b.add_task("lone".into(), "", None, t0);
+        let tree = HashSet::from([root, mid, low, side]);
+        for id in [root, mid, side, lone] {
+            b.task_mut(id).unwrap().set_done(true, t0);
+        }
+        // One open subtask keeps the whole tree out.
+        assert_eq!(b.archived(t0 + day(40)), HashSet::from([lone]));
+        b.task_mut(low).unwrap().set_done(true, t0 + day(5));
+        // A month after the last closure, not the first.
+        assert_eq!(b.archived(t0 + day(34)), HashSet::from([lone]));
+        let all = &tree | &HashSet::from([lone]);
+        assert_eq!(b.archived(t0 + day(36)), all);
+        assert!(!b.archived(t0 + day(36)).contains(&open));
+        let shown = b.without_archived(t0 + day(36));
+        assert_eq!(shown.tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [open]);
+
+        // Reopening any task of the tree, however deep, brings it all back.
+        b.task_mut(low).unwrap().set_done(false, t0 + day(40));
+        assert_eq!(b.archived(t0 + day(40)), HashSet::from([lone]));
+        b.task_mut(low).unwrap().set_done(true, t0 + day(41));
+        assert_eq!(b.archived(t0 + day(70)), HashSet::from([lone]));
+        assert_eq!(b.archived(t0 + day(72)), all);
+        // As does an open subtask added to it.
+        let new = b.add_task("new".into(), "", Some(low), t0 + day(72));
+        assert_eq!(b.archived(t0 + day(72)), HashSet::from([lone]));
+        b.delete_task(new);
+
+        // A tree in focus isn't archived.
+        b.focus(side);
+        assert_eq!(b.archived(t0 + day(72)), HashSet::from([lone]));
+        b.unfocus(0);
+
+        // Closed without a closing time: as of its last update.
+        let old = b.task_mut(lone).unwrap();
+        old.done_at = None;
+        old.updated_at = t0 + day(60);
+        assert_eq!(b.archived(t0 + day(72)), tree);
     }
 }

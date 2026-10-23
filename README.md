@@ -34,10 +34,11 @@ The first time it starts, the app asks where your board is. Choose **Use a local
 
 The app remembers the choice in `~/.config/its4tasks/config.json`. To change it later, use **Switch board…** in the **⋯** menu above the task list.
 
-To get the board out from a script, `its4tasks --get-board` prints it to standard output as an `its4tasks.json` (the same file **Export** saves) and opens no window:
+To get the board out from a script, `its4tasks --get-board` prints it to standard output as an `its4tasks.json` and opens no window. It leaves out archived tasks: trees of tasks closed throughout, with the last of them closed over a month ago. `its4tasks --get-board-archived` prints them too, like the file **Export** saves:
 
 ```sh
 its4tasks --get-board > board.json
+its4tasks --get-board-archived > everything.json
 ```
 
 It reads whichever board the app last opened, local or on a server. For a server, the app must have signed in once. If the server's sign-in service replaces refresh tokens each time they're used, running it while the app is open on that server makes the app ask you to sign in again.

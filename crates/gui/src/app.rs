@@ -374,6 +374,29 @@ fn fold_arrow(center: egui::Pos2, folded: bool, color: Color32) -> Shape {
     Shape::convex_polygon(points.map(|p| center + p).to_vec(), color, Stroke::NONE)
 }
 
+/// An archive box, the mark of an archived task: a lid over a box with a
+/// handle. Painted so it sits on the row's center line, unlike a glyph.
+fn archive_box(center: egui::Pos2, color: Color32) -> Vec<Shape> {
+    let stroke = Stroke::new(1.2, color);
+    let lid = Rect::from_center_size(center - Vec2::new(0.0, 3.0), Vec2::new(12.0, 3.5));
+    let body = Rect::from_min_max(
+        egui::pos2(center.x - 5.0, lid.bottom()),
+        egui::pos2(center.x + 5.0, center.y + 5.0),
+    );
+    let handle = center.y;
+    vec![
+        Shape::rect_stroke(lid, 1.0, stroke, StrokeKind::Inside),
+        Shape::rect_stroke(body, 1.0, stroke, StrokeKind::Inside),
+        Shape::line_segment(
+            [
+                egui::pos2(center.x - 2.0, handle),
+                egui::pos2(center.x + 2.0, handle),
+            ],
+            stroke,
+        ),
+    ]
+}
+
 /// What the delete confirmation says will go.
 fn delete_prompt(task: &Task, subtasks: usize) -> String {
     let plural = |n: usize, what: &str| match n {
@@ -994,6 +1017,9 @@ pub struct TodoApp {
     picking: Option<Receiver<Picked>>,
     /// An export being saved.
     saving: Option<Receiver<Saved>>,
+    /// An export waiting for the archived tasks, with whether they were
+    /// asked for before it.
+    exporting: Option<bool>,
     /// Why the last import or export failed.
     file_problem: Option<String>,
     filter: String,
@@ -1056,6 +1082,7 @@ impl TodoApp {
             request: None,
             picking: None,
             saving: None,
+            exporting: None,
             file_problem: None,
             filter: String::new(),
             new_task: None,
@@ -1160,17 +1187,37 @@ impl TodoApp {
         }
     }
 
-    /// Saves the board as shown to an `its4tasks.json`.
+    /// Saves the whole board to an `its4tasks.json`, archived tasks
+    /// included: once they're here, if they aren't yet (see `poll_export`).
     fn export(&mut self, ctx: &egui::Context) {
-        if self.saving.is_none() {
-            let json = import::export(self.api.board(), Utc::now());
-            let ctx = ctx.clone();
-            self.saving = Some(files::save_export(json, move || ctx.request_repaint()));
+        if self.saving.is_some() || self.exporting.is_some() {
+            return;
         }
+        if !self.api.has_archived() {
+            self.exporting = Some(self.api.archived());
+            self.api.set_archived(true);
+            return;
+        }
+        let json = import::export(self.api.board(), Utc::now());
+        let ctx = ctx.clone();
+        self.saving = Some(files::save_export(json, move || ctx.request_repaint()));
     }
 
-    /// Notes how saving an export went, once it has.
-    fn poll_export(&mut self) {
+    /// Saves an export once the archived tasks it waits for are here, and
+    /// notes how saving went, once it has.
+    fn poll_export(&mut self, ctx: &egui::Context) {
+        // Given up if the archived tasks are switched off meanwhile.
+        if let Some(asked) = self.exporting
+            && (self.api.has_archived() || !self.api.archived())
+        {
+            self.exporting = None;
+            if self.api.archived() {
+                self.export(ctx);
+            }
+            if !asked {
+                self.api.set_archived(false);
+            }
+        }
         let Some(saving) = &self.saving else {
             return;
         };
@@ -1411,6 +1458,20 @@ impl TodoApp {
                 }
                 let color = palette(ui.visuals()).resolved;
                 toggle_switch(ui, on, color, "Hide closed").on_hover_text(hint);
+                ui.add_space(8.0);
+                let hint = "Bring back tasks closed, with all their subtasks, over a month ago";
+                let mut on = self.api.archived();
+                let label = Label::new(RichText::new("Archived").small())
+                    .selectable(false)
+                    .sense(Sense::click());
+                if ui.add(label).on_hover_text(hint).clicked() {
+                    on = !on;
+                }
+                let color = ui.visuals().weak_text_color();
+                toggle_switch(ui, &mut on, color, "Archived").on_hover_text(hint);
+                if on != self.api.archived() {
+                    self.api.set_archived(on);
+                }
                 if self.view == View::Log {
                     ui.add_space(8.0);
                     let hint = "Show every task in the log, or none";
@@ -1441,6 +1502,7 @@ impl TodoApp {
         let lru = self.api.board().lru_slot(&self.slot_used);
         let mut replacing = None;
         let now = Utc::now();
+        let archived = self.api.board().archived(now);
         let log_mode = self.view == View::Log;
         // A task clicked in or out of the log, and whether it's now in.
         let mut log_toggle: Option<(Uuid, bool)> = None;
@@ -1600,6 +1662,15 @@ impl TodoApp {
                                 let plural = if n == 1 { "" } else { "s" };
                                 ui.label(RichText::new(n.to_string()).small().weak())
                                     .on_hover_text(format!("{n} subtask{plural} hidden"));
+                            }
+                            if archived.contains(&id) {
+                                let (icon, response) =
+                                    ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                                let color = ui.visuals().weak_text_color();
+                                ui.painter().extend(archive_box(icon.center(), color));
+                                response.on_hover_text(
+                                    "Archived: closed, with all its subtasks, over a month ago",
+                                );
                             }
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 let mut text = RichText::new(&task.title);
@@ -2169,8 +2240,10 @@ impl TodoApp {
                 if import.clicked() {
                     self.pick_import(ui.ctx());
                 }
-                let export =
-                    ui.add_enabled(self.saving.is_none(), Button::new("Export its4tasks.json…"));
+                let export = ui.add_enabled(
+                    self.saving.is_none() && self.exporting.is_none(),
+                    Button::new("Export its4tasks.json…"),
+                );
                 if export
                     .on_hover_text("Save your whole board to a file")
                     .clicked()
@@ -2508,7 +2581,7 @@ impl eframe::App for TodoApp {
         self.api.poll();
         self.api.refresh();
         self.poll_import();
-        self.poll_export();
+        self.poll_export(ui.ctx());
         if !self.api.loaded() {
             self.loading(ui);
             return;

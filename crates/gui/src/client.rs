@@ -8,6 +8,9 @@
 //! answer carries the server's board, which becomes the copy's base. Changes
 //! still on their way are replayed on top of it. A change the server
 //! refuses, or can't be told about, is dropped from the copy.
+//!
+//! The server leaves archived tasks out of its boards (see
+//! `Board::archived`) unless asked for them: `set_archived`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -80,6 +83,13 @@ enum Answer {
     Refused(Rejected),
 }
 
+/// How a request was sent, as its answer comes back.
+struct Asked {
+    token_gen: u64,
+    /// With archived tasks.
+    archived: bool,
+}
+
 /// A change applied to the copy but not yet answered by the server.
 struct Pending {
     seq: u64,
@@ -101,9 +111,13 @@ pub struct Client {
     /// back in order.
     queue: VecDeque<Request>,
     in_flight: bool,
-    /// Answers, each with the `token_gen` its request was sent with.
-    answer_to: Sender<(u64, Response)>,
-    answers: Receiver<(u64, Response)>,
+    /// Answers, each with how its request was sent.
+    answer_to: Sender<(Asked, Response)>,
+    answers: Receiver<(Asked, Response)>,
+    /// Whether to ask for archived tasks too.
+    archived: bool,
+    /// Whether `confirmed` has the archived tasks.
+    has_archived: bool,
     /// The last board the server sent.
     confirmed: Board,
     pending: VecDeque<Pending>,
@@ -166,6 +180,8 @@ impl Client {
             in_flight: false,
             answer_to,
             answers,
+            archived: false,
+            has_archived: false,
             confirmed: Board::default(),
             pending: VecDeque::new(),
             board: Board::default(),
@@ -238,6 +254,36 @@ impl Client {
         // The server hasn't seen this one yet.
         self.unauthorized = false;
         self.next_request(false);
+    }
+
+    /// Whether archived tasks are asked for.
+    pub fn archived(&self) -> bool {
+        self.archived
+    }
+
+    /// Whether the board shown has the archived tasks: once the server has
+    /// answered a request that asked for them.
+    pub fn has_archived(&self) -> bool {
+        self.has_archived
+    }
+
+    /// Asks for archived tasks from now on, fetching them now; or leaves
+    /// them out, at once.
+    pub fn set_archived(&mut self, on: bool) {
+        if on == self.archived {
+            return;
+        }
+        self.archived = on;
+        if on {
+            // Even if a fetch is on its way: it may not have asked.
+            self.fetching = true;
+            self.fetched = Instant::now();
+            self.send(Request::Fetch);
+        } else {
+            self.has_archived = false;
+            self.confirmed = self.confirmed.without_archived(api::now());
+            self.rebuild();
+        }
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -347,22 +393,26 @@ impl Client {
         };
         self.in_flight = true;
         let (answer_to, wake) = (self.answer_to.clone(), self.wake.clone());
-        let token_gen = self.token_gen;
+        let asked = Asked {
+            token_gen: self.token_gen,
+            archived: self.archived,
+        };
+        let query = if self.archived { "?archived=true" } else { "" };
         let answer = move |response| {
             // The client may be gone, say while the GUI closes.
-            let _ = answer_to.send((token_gen, response));
+            let _ = answer_to.send((asked, response));
             wake();
         };
         let (timeout, token) = (self.timeout, self.token.clone());
         match request {
             Request::Fetch => {
-                let url = format!("{}/api/board", self.url);
+                let url = format!("{}/api/board{query}", self.url);
                 call(url, None, token, retry, timeout, move |reply| {
                     answer(Response::Fetched(board_from(reply)));
                 });
             }
             Request::Send(seq, change) => {
-                let url = format!("{}/api/changes", self.url);
+                let url = format!("{}/api/changes{query}", self.url);
                 call(url, Some(change), token, retry, timeout, move |reply| {
                     answer(Response::Sent(seq, answer_from(reply)));
                 });
@@ -373,7 +423,8 @@ impl Client {
     /// Records one answer and sends the next request. Answers come in the
     /// order the requests were made, so an answer's board includes every
     /// change sent before it.
-    fn take(&mut self, (token_gen, response): (u64, Response)) {
+    fn take(&mut self, (asked, response): (Asked, Response)) {
+        let token_gen = asked.token_gen;
         self.in_flight = false;
         match response {
             // The server didn't apply it: hold it, and send it again once
@@ -388,13 +439,13 @@ impl Client {
                 self.pending.retain(|p| p.seq != seq);
                 match result {
                     Ok(Answer::Applied(applied)) => {
-                        self.confirmed = applied.board;
+                        self.confirm(applied.board, asked.archived);
                         self.answered();
                         self.fetched = Instant::now();
                     }
                     Ok(Answer::Refused(rejected)) => {
                         self.notice = Some(format!("Change refused: {}", rejected.error));
-                        self.confirmed = rejected.board;
+                        self.confirm(rejected.board, asked.archived);
                         self.answered();
                         self.fetched = Instant::now();
                     }
@@ -413,7 +464,7 @@ impl Client {
                 match result {
                     Ok(view) => {
                         self.user = view.user.or(self.user);
-                        self.confirmed = view.board;
+                        self.confirm(view.board, asked.archived);
                         self.started = view.started || !self.pending.is_empty();
                         self.answered();
                     }
@@ -422,6 +473,17 @@ impl Client {
             }
         }
         self.next_request(false);
+    }
+
+    /// Takes the server's board, sent with archived tasks or not. Archived
+    /// tasks asked for before `set_archived(false)` are left out.
+    fn confirm(&mut self, board: Board, archived: bool) {
+        self.has_archived = archived && self.archived;
+        self.confirmed = if archived && !self.archived {
+            board.without_archived(api::now())
+        } else {
+            board
+        };
     }
 
     fn answered(&mut self) {
@@ -452,12 +514,14 @@ impl Client {
     }
 }
 
-/// The board at `url`, signed in with `token`, waiting for it here: for
-/// `its4tasks --get-board`, which has no window to keep responsive.
+/// The board at `url`, signed in with `token`, with its archived tasks if
+/// `archived`, waiting for it here: for `its4tasks --get-board` and
+/// `--get-board-archived`, which have no window to keep responsive.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn fetch_board(url: &str, token: &str) -> Result<BoardView, ClientError> {
+pub fn fetch_board(url: &str, token: &str, archived: bool) -> Result<BoardView, ClientError> {
     let (tx, rx) = mpsc::channel();
-    let url = format!("{url}/api/board");
+    let query = if archived { "?archived=true" } else { "" };
+    let url = format!("{url}/api/board{query}");
     call(
         url,
         None,
@@ -684,4 +748,48 @@ fn answer_from(reply: Result<Reply, String>) -> Result<Answer, ClientError> {
         serde_json::from_slice(&reply.body).map(Answer::Refused)
     };
     answer.map_err(|e| ClientError::Http(format!("server answered {}: {e}", reply.status)))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::native::local;
+
+    #[test]
+    fn archived_tasks_come_only_when_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("b.sqlite").display()
+        );
+        let server = local::start_at(url).unwrap();
+        let mut client = Client::new(&server.url, Some(server.secret.clone()), TIMEOUT, || {});
+        let long_ago = api::now() - chrono::TimeDelta::days(40);
+        let mut board = Board::default();
+        let old = board.add_task("old".into(), "", None, long_ago);
+        board.task_mut(old).unwrap().set_done(true, long_ago);
+        let open = board.add_task("open".into(), "", None, long_ago);
+        client.apply(Change::Import { board }).unwrap();
+        assert!(client.flush(TIMEOUT));
+        let ids = |c: &Client| c.board().tasks.iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(&client), [open]);
+        assert!(!client.has_archived());
+
+        client.set_archived(true);
+        assert!(client.flush(TIMEOUT));
+        assert!(client.has_archived());
+        assert_eq!(ids(&client), [old, open]);
+        // Changes' answers keep them.
+        let rename = Change::Rename {
+            task: open,
+            title: "still open".into(),
+        };
+        client.apply(rename).unwrap();
+        assert!(client.flush(TIMEOUT));
+        assert_eq!(ids(&client), [old, open]);
+
+        client.set_archived(false);
+        assert!(!client.has_archived());
+        assert_eq!(ids(&client), [open]);
+    }
 }

@@ -5,7 +5,8 @@ open blockers, resolved blockers (one with an Unblock message), multi-line
 comments (a title line plus details), starred comments, next steps (open,
 done, and one on a blocked task, where red wins), a done task closed
 with a message, tasks of different freshness, and subtasks: a parent blocked
-by its subtasks (focused, with one of them) and one that isn't. Nothing
+by its subtasks (focused, with one of them) and one that isn't, and an
+archived tree (closed throughout, the last task 40 days ago). Nothing
 loads it on its own: import it into a test user's board as AGENTS.md shows
 (examples/import_change.rs in its4tasks-core turns it into an Import change),
 or with "Import its4tasks.json…" in the app. It's written in the old format,
@@ -93,6 +94,14 @@ tasks += [
          done_at=ago(hours=6), notes=[]),  # 10
     dict(title="Book flights", parent=2, created_at=ago(days=5), updated_at=ago(days=4),
          notes=[note("Compare train vs plane", ago(days=4))]),  # 11
+]
+# Archived: a tree closed throughout, its last task over a month ago. The
+# server leaves it out unless asked for archived tasks.
+tasks += [
+    dict(title="Move to the new office", created_at=ago(days=70), updated_at=ago(days=40), done=True,
+         done_at=ago(days=40), notes=[note("Moved in", ago(days=40), action="Closed")]),  # 12
+    dict(title="Pack the lab", parent=12, created_at=ago(days=70), updated_at=ago(days=45), done=True,
+         done_at=ago(days=45), notes=[note("Boxes labelled by shelf", ago(days=50))]),  # 13
 ]
 for i, t in enumerate(tasks):
     t["id"] = i

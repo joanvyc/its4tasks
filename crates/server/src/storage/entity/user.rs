@@ -14,6 +14,9 @@ pub struct Model {
     /// Chose to start a new board or import one. New users haven't.
     pub started: bool,
     pub created_at: DateTimeUtc,
+    /// `its4tasks_core::api::Settings` as JSON.
+    #[sea_orm(column_type = "Text")]
+    pub settings: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

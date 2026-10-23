@@ -21,7 +21,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use web_time::Instant;
 
-use crate::api::{self, ApiError, Applied, BoardView, Change, Outcome, Rejected, apply_change};
+use crate::api::{
+    self, ApiError, Applied, BoardView, Change, Outcome, Rejected, Settings, apply_change,
+};
 use crate::model::Board;
 use uuid::Uuid;
 
@@ -70,12 +72,15 @@ impl fmt::Display for ClientError {
 enum Request {
     Send(u64, Change),
     Fetch,
+    Settings(Settings),
 }
 
 enum Response {
     /// The server's answer to a change, or why there was none.
     Sent(u64, Result<Answer, ClientError>),
     Fetched(Result<BoardView, ClientError>),
+    /// Whether the server kept the settings.
+    Settled(Settings, Result<(), ClientError>),
 }
 
 enum Answer {
@@ -131,6 +136,11 @@ pub struct Client {
     loaded: bool,
     /// Whose board it is, once the server has said.
     user: Option<Uuid>,
+    /// The user's settings: the server's, or the ones on their way to it.
+    settings: Settings,
+    /// Settings sent but not answered yet. Till they are, boards fetched
+    /// may have older settings, which are ignored.
+    settings_unsent: usize,
     /// The server's last answer was that nobody's signed in. Requests wait
     /// in `queue` meanwhile, and are retried with a fresh token.
     unauthorized: bool,
@@ -188,6 +198,8 @@ impl Client {
             started: true,
             loaded: false,
             user: None,
+            settings: Settings::default(),
+            settings_unsent: 0,
             unauthorized: false,
             unauthorized_since: None,
             token_gen: 0,
@@ -254,6 +266,18 @@ impl Client {
         // The server hasn't seen this one yet.
         self.unauthorized = false;
         self.next_request(false);
+    }
+
+    /// The user's settings, as the server keeps them.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Changes the user's settings here at once, and on the server.
+    pub fn set_settings(&mut self, settings: Settings) {
+        self.settings = settings.clone();
+        self.settings_unsent += 1;
+        self.send(Request::Settings(settings));
     }
 
     /// Whether archived tasks are asked for.
@@ -359,13 +383,14 @@ impl Client {
         }
     }
 
-    /// Waits until every change and fetch sent so far is answered, or until
-    /// `timeout`. True if everything was answered. Not in the browser, which
-    /// can't wait.
+    /// Waits until every change, fetch and setting sent so far is answered,
+    /// or until `timeout`. True if everything was answered. Not in the
+    /// browser, which can't wait.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn flush(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while !self.pending.is_empty() || self.fetching {
+        let waiting = |c: &Client| !c.pending.is_empty() || c.fetching || c.settings_unsent > 0;
+        while waiting(self) {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.answers.recv_timeout(left) {
                 Ok(response) => self.take(response),
@@ -373,7 +398,7 @@ impl Client {
             }
         }
         self.rebuild();
-        self.pending.is_empty() && !self.fetching
+        !waiting(self)
     }
 
     fn send(&mut self, request: Request) {
@@ -413,8 +438,16 @@ impl Client {
             }
             Request::Send(seq, change) => {
                 let url = format!("{}/api/changes{query}", self.url);
-                call(url, Some(change), token, retry, timeout, move |reply| {
+                let body = serde_json::to_value(change).expect("a Change serializes");
+                call(url, Some(body), token, retry, timeout, move |reply| {
                     answer(Response::Sent(seq, answer_from(reply)));
+                });
+            }
+            Request::Settings(settings) => {
+                let url = format!("{}/api/settings", self.url);
+                let body = serde_json::to_value(&settings).expect("Settings serialize");
+                call(url, Some(body), token, retry, timeout, move |reply| {
+                    answer(Response::Settled(settings, kept_from(reply)));
                 });
             }
         }
@@ -464,10 +497,25 @@ impl Client {
                 match result {
                     Ok(view) => {
                         self.user = view.user.or(self.user);
+                        if self.settings_unsent == 0 {
+                            self.settings = view.settings;
+                        }
                         self.confirm(view.board, asked.archived);
                         self.started = view.started || !self.pending.is_empty();
                         self.answered();
                     }
+                    Err(e) => self.failed(e, token_gen),
+                }
+            }
+            // Not kept: send them again once signed in.
+            Response::Settled(settings, Err(ClientError::Unauthorized)) => {
+                self.queue.push_front(Request::Settings(settings));
+                self.failed(ClientError::Unauthorized, token_gen);
+            }
+            Response::Settled(_, result) => {
+                self.settings_unsent = self.settings_unsent.saturating_sub(1);
+                match result {
+                    Ok(()) => self.answered(),
                     Err(e) => self.failed(e, token_gen),
                 }
             }
@@ -548,12 +596,12 @@ impl Reply {
     }
 }
 
-/// GETs `url`, or POSTs `change` to it as JSON, with `token` as the bearer
-/// token, and hands the reply to `done` on another thread.
+/// GETs `url`, or POSTs `body` to it, with `token` as the bearer token, and
+/// hands the reply to `done` on another thread.
 #[cfg(not(target_arch = "wasm32"))]
 fn call(
     url: String,
-    change: Option<Change>,
+    body: Option<serde_json::Value>,
     token: Option<String>,
     _retry: bool,
     timeout: Duration,
@@ -566,7 +614,7 @@ fn call(
             .build()
             .into();
         let bearer = token.map(|t| format!("Bearer {t}"));
-        let response = match change {
+        let response = match body {
             None => {
                 let request = agent.get(&url);
                 match &bearer {
@@ -574,11 +622,11 @@ fn call(
                     None => request.call(),
                 }
             }
-            Some(change) => {
+            Some(body) => {
                 let request = agent.post(&url);
                 match &bearer {
-                    Some(b) => request.header("Authorization", b).send_json(&change),
-                    None => request.send_json(&change),
+                    Some(b) => request.header("Authorization", b).send_json(&body),
+                    None => request.send_json(&body),
                 }
             }
         };
@@ -591,23 +639,22 @@ fn call(
     });
 }
 
-/// GETs `url`, or POSTs `change` to it as JSON, with the browser's
-/// `fetch()`, and hands the reply to `done` when it arrives. It's signed in
-/// with the page's token if the page has a way to get one (see
-/// `page_token`; a fresh one for a `retry`), and otherwise with the session
-/// cookie.
+/// GETs `url`, or POSTs `body` to it, with the browser's `fetch()`, and
+/// hands the reply to `done` when it arrives. It's signed in with the
+/// page's token if the page has a way to get one (see `page_token`; a fresh
+/// one for a `retry`), and otherwise with the session cookie.
 #[cfg(target_arch = "wasm32")]
 fn call(
     url: String,
-    change: Option<Change>,
+    body: Option<serde_json::Value>,
     _token: Option<String>,
     retry: bool,
     _timeout: Duration,
     done: impl FnOnce(Result<Reply, String>) + Send + 'static,
 ) {
-    let request = match change {
+    let request = match body {
         None => ehttp::Request::get(url),
-        Some(change) => ehttp::Request::post_json(url, &change).expect("a Change serializes"),
+        Some(body) => ehttp::Request::post_json(url, &body).expect("JSON serializes"),
     };
     // ehttp leaves cookies out unless told, unlike the browser's fetch().
     let mut request = request.with_credentials(ehttp::Credentials::SameOrigin);
@@ -737,6 +784,16 @@ fn board_from(reply: Result<Reply, String>) -> Result<BoardView, ClientError> {
         .map_err(|e| ClientError::Http(format!("unreadable board: {e}")))
 }
 
+/// Whether the server kept what was sent, by its answer's status.
+fn kept_from(reply: Result<Reply, String>) -> Result<(), ClientError> {
+    let reply = reply.map_err(ClientError::Http)?;
+    match reply.status {
+        401 => Err(ClientError::Unauthorized),
+        _ if reply.ok() => Ok(()),
+        status => Err(ClientError::Http(format!("server answered {status}"))),
+    }
+}
+
 fn answer_from(reply: Result<Reply, String>) -> Result<Answer, ClientError> {
     let reply = reply.map_err(ClientError::Http)?;
     if reply.status == 401 {
@@ -791,5 +848,29 @@ mod tests {
         client.set_archived(false);
         assert!(!client.has_archived());
         assert_eq!(ids(&client), [open]);
+    }
+
+    #[test]
+    fn settings_are_kept_by_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("b.sqlite").display()
+        );
+        let server = local::start_at(url).unwrap();
+        let connect = || Client::new(&server.url, Some(server.secret.clone()), TIMEOUT, || {});
+        let mut client = connect();
+        assert!(client.flush(TIMEOUT));
+        assert_eq!(client.settings(), &Settings::default());
+        let hide = Settings {
+            hide_archive_notice: true,
+        };
+        client.set_settings(hide.clone());
+        // At once here, before the server answers.
+        assert_eq!(client.settings(), &hide);
+        assert!(client.flush(TIMEOUT));
+        let mut again = connect();
+        assert!(again.flush(TIMEOUT));
+        assert_eq!(again.settings(), &hide);
     }
 }

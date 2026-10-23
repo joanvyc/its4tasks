@@ -9,6 +9,8 @@
 //! - `POST /api/import` with an `its4tasks.json`'s text (or an older
 //!   version's `board.json`): adds its tasks; 400 if
 //!   it isn't one.
+//! - `POST /api/settings` with the user's `Settings`: keeps them, answering
+//!   204. `BoardView`s carry them.
 //! - The board in those answers leaves out archived tasks (see
 //!   `Board::archived`), unless the request asks for them with
 //!   `?archived=true`.
@@ -35,7 +37,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use its4tasks_core::api::{ApiError, Applied, BoardView, Change, Rejected, now};
+use its4tasks_core::api::{ApiError, Applied, BoardView, Change, Rejected, Settings, now};
 use its4tasks_core::model::Board;
 use its4tasks_core::{import, welcome};
 use rust_embed::Embed;
@@ -80,6 +82,7 @@ pub fn router(api: Api, auth: Auth) -> Router {
         .route("/board", get(board))
         .route("/changes", post(change))
         .route("/start", post(start))
+        .route("/settings", post(settings))
         .route(
             "/import",
             post(import_board).layer(DefaultBodyLimit::max(IMPORT_LIMIT)),
@@ -206,14 +209,33 @@ async fn board(
         Err(response) => return *response,
     };
     let mut api = state.api.lock().await;
+    let settings = api.settings(&user);
     match api.board(&user).await {
         Ok((started, board)) => Json(BoardView {
             started,
             board: shown.board(board),
             user: Some(user.id),
+            settings,
         })
         .into_response(),
         Err(e) => internal(e),
+    }
+}
+
+/// Keeps the user's settings.
+async fn settings(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(settings): Json<Settings>,
+) -> Response {
+    let user = match user(&state, &headers).await {
+        Ok(user) => user,
+        Err(response) => return *response,
+    };
+    let mut api = state.api.lock().await;
+    match api.set_settings(&user, settings).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal(e.into()),
     }
 }
 
@@ -306,11 +328,13 @@ async fn add_board(api: &mut Api, user: &User, board: Board, shown: &Shown) -> R
         Err(Failure::Api(e)) => return (status(e), e.to_string()).into_response(),
         Err(e) => return internal(e),
     }
+    let settings = api.settings(user);
     match api.board(user).await {
         Ok((started, board)) => Json(BoardView {
             started,
             board: shown.board(board),
             user: Some(user.id),
+            settings,
         })
         .into_response(),
         Err(e) => internal(e),
@@ -521,12 +545,12 @@ mod tests {
         app: &Router,
         path: &str,
         token: &str,
-        change: &Change,
+        body: &impl serde::Serialize,
     ) -> (StatusCode, String) {
         let request = Request::post(path)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(change).unwrap()))
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap();
         let (status, _, body) = call(app, request).await;
         (status, body)
@@ -679,6 +703,29 @@ mod tests {
             ids(&view(&app, &alice).await.board),
             [root, sub, deep, recent, open]
         );
+    }
+
+    #[tokio::test]
+    async fn users_keep_their_own_settings() {
+        let app = app();
+        let (alice, bob) = (token("alice"), token("bob"));
+        assert_eq!(view(&app, &alice).await.settings, Settings::default());
+        let hide = Settings {
+            hide_archive_notice: true,
+        };
+        let request = Request::post("/api/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&hide).unwrap()))
+            .unwrap();
+        assert_eq!(call(&app, request).await.0, StatusCode::UNAUTHORIZED);
+        let (status, body) = post_to(&app, "/api/settings", &alice, &hide).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(view(&app, &alice).await.settings, hide);
+        assert_eq!(view(&app, &bob).await.settings, Settings::default());
+        // A change doesn't lose them.
+        let add = Change::add_task("a".into(), String::new(), None, false);
+        assert_eq!(post(&app, &alice, &add).await.0, StatusCode::OK);
+        assert_eq!(view(&app, &alice).await.settings, hide);
     }
 
     #[tokio::test]

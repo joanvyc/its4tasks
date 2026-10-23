@@ -220,6 +220,17 @@ pub struct BoardView {
     /// browser goes back to the same user.
     #[serde(default)]
     pub user: Option<Uuid>,
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+/// The user's preferences, kept by the server with the user rather than
+/// the board (`POST /api/settings`), so they follow them to every device.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    /// Don't say, when a task is closed, that its tree will be archived.
+    #[serde(default)]
+    pub hide_archive_notice: bool,
 }
 
 /// What a change did, and the board after it.

@@ -15,9 +15,9 @@ use crate::files::{self, Picked, Saved};
 use crate::import;
 use crate::log::{self, EntryKind, Filter, LogPage, Period};
 use crate::model::{
-    Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note, NoteAction,
-    SLOT_COUNT, Submit, Task, TaskState, headline, list_guides, short_duration, split_title,
-    staleness,
+    ARCHIVE_AFTER, Blocker, Board, Command, CommandError, MessageKind, MoveError, NextStep, Note,
+    NoteAction, SLOT_COUNT, Submit, Task, TaskState, headline, list_guides, short_duration,
+    split_title, staleness,
 };
 use crate::unsent::{self, NewTask, Unsent};
 use crate::welcome;
@@ -1005,6 +1005,14 @@ pub enum Request {
     SwitchBoard,
 }
 
+/// The pop-up saying a tree that was just closed will be archived.
+struct ArchiveNotice {
+    /// The task whose close finished the tree.
+    task: Uuid,
+    /// "Don't show again" is ticked.
+    hide: bool,
+}
+
 pub struct TodoApp {
     /// The board is only read through `api.board()` and changed through
     /// `api.apply`, which go to the server.
@@ -1020,6 +1028,8 @@ pub struct TodoApp {
     /// An export waiting for the archived tasks, with whether they were
     /// asked for before it.
     exporting: Option<bool>,
+    /// Saying that a tree just closed will be archived.
+    archive_notice: Option<ArchiveNotice>,
     /// Why the last import or export failed.
     file_problem: Option<String>,
     filter: String,
@@ -1083,6 +1093,7 @@ impl TodoApp {
             picking: None,
             saving: None,
             exporting: None,
+            archive_notice: None,
             file_problem: None,
             filter: String::new(),
             new_task: None,
@@ -1406,10 +1417,30 @@ impl TodoApp {
         self.slot_used[slot] = self.use_tick;
     }
 
-    /// Sends a change to the API, logging why it failed if it did.
+    /// Sends a change to the API, logging why it failed if it did. A close
+    /// that leaves its whole tree closed says the tree will be archived
+    /// (unless the user said not to).
     fn change(&mut self, change: Change) {
-        if let Err(e) = self.api.apply(change) {
-            eprintln!("its4tasks: {e}");
+        let closing = match change {
+            Change::SetDone { task, done: true }
+            | Change::Post {
+                task,
+                kind: MessageKind::Close,
+                ..
+            } => Some(task),
+            _ => None,
+        };
+        let was_closed = closing.map(|task| self.api.board().tree_closed(task));
+        match self.api.apply(change) {
+            Ok(_) => {
+                if let (Some(task), Some(false)) = (closing, was_closed)
+                    && self.api.board().tree_closed(task)
+                    && !self.api.settings().hide_archive_notice
+                {
+                    self.archive_notice = Some(ArchiveNotice { task, hide: false });
+                }
+            }
+            Err(e) => eprintln!("its4tasks: {e}"),
         }
         // Stop editing a comment that is gone.
         let board = self.api.board();
@@ -2493,6 +2524,67 @@ impl TodoApp {
         }
     }
 
+    /// Says that the tree just closed will be archived, and when.
+    fn archive_notice_modal(&mut self, ctx: &egui::Context) {
+        let Some(notice) = &mut self.archive_notice else {
+            return;
+        };
+        let board = self.api.board();
+        let root = board.root(notice.task);
+        let (Some(title), true) = (
+            board.task(root).map(|t| t.title.clone()),
+            board.tree_closed(root),
+        ) else {
+            // Gone, or reopened meanwhile.
+            self.archive_notice = None;
+            return;
+        };
+        let tree: Vec<Uuid> = iter::once(root).chain(board.descendants(root)).collect();
+        let focused = tree.iter().any(|&id| board.slot_of(id).is_some());
+        let days = ARCHIVE_AFTER.num_days();
+        let mut close = false;
+        let modal = Modal::new(Id::unique("archive_notice_modal")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            let heading = format!("Archived in {days} days");
+            ui.label(RichText::new(heading).heading().strong());
+            ui.separator();
+            let mut text = if tree.len() == 1 {
+                format!(
+                    "“{title}” is closed. In {days} days it will be archived: left out \
+                     of the task list unless Archived is on. Reopening it stops that."
+                )
+            } else {
+                format!(
+                    "“{title}” and all its subtasks are closed. In {days} days they will \
+                     be archived: left out of the task list unless Archived is on. \
+                     Reopening any of them stops that."
+                )
+            };
+            if focused {
+                text.push_str(
+                    " Nothing in focus is archived, so it waits until it's out of focus.",
+                );
+            }
+            ui.label(text);
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut notice.hide, "Don't show again");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = ui.button("Close").clicked();
+                });
+            });
+        });
+        if close || modal.should_close() {
+            let hide = notice.hide;
+            self.archive_notice = None;
+            if hide {
+                let mut settings = self.api.settings().clone();
+                settings.hide_archive_notice = true;
+                self.api.set_settings(settings);
+            }
+        }
+    }
+
     fn new_task_modal(&mut self, ctx: &egui::Context) {
         let has_free_slot = self.api.board().has_free_slot();
         let Some(draft) = &mut self.new_task else {
@@ -2612,7 +2704,13 @@ impl eframe::App for TodoApp {
         self.new_task_modal(&ui.ctx().clone());
         self.delete_modal(&ui.ctx().clone());
         self.move_modal(&ui.ctx().clone());
+        self.archive_notice_modal(&ui.ctx().clone());
+        let had_notice = self.archive_notice.is_some();
         self.apply(actions);
+        if !had_notice && self.archive_notice.is_some() {
+            // Shows it now rather than on the next input.
+            ui.ctx().request_repaint();
+        }
         if self.flash.is_some() {
             // Starts the flash now; the card keeps repainting while it runs.
             ui.ctx().request_repaint();

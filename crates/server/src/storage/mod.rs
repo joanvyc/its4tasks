@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use diff::{Changes, diff};
 use entity::{note, slot, task, user};
+use its4tasks_core::api::Settings;
 use its4tasks_core::model::{Board, Note, SLOT_COUNT};
 use migration::Migrator;
 
@@ -36,6 +37,7 @@ pub struct User {
     pub sub: String,
     /// Chose to start a new board or import one. New users haven't.
     pub started: bool,
+    pub settings: Settings,
 }
 
 pub struct Store {
@@ -77,6 +79,7 @@ impl Store {
             sub: Set(sub.to_owned()),
             started: Set(false),
             created_at: Set(its4tasks_core::api::now()),
+            settings: Set("{}".to_owned()),
         };
         // Two first requests at once both get here; one insert wins.
         user::Entity::insert(row)
@@ -106,9 +109,23 @@ impl Store {
                     iss: row.iss,
                     sub: row.sub,
                     started: row.started,
+                    // Unreadable settings are the defaults, rather than a
+                    // user who can't sign in.
+                    settings: serde_json::from_str(&row.settings).unwrap_or_default(),
                 })
             })
             .transpose()
+    }
+
+    /// Keeps the user's settings.
+    pub async fn set_settings(&self, user: Uuid, settings: &Settings) -> Result<(), DbErr> {
+        let json = serde_json::to_string(settings).map_err(|e| DbErr::Custom(e.to_string()))?;
+        user::Entity::update_many()
+            .col_expr(user::Column::Settings, json.into())
+            .filter(user::Column::Id.eq(user.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 
     /// Records that the user chose to start a new board or import one.
@@ -453,6 +470,25 @@ mod tests {
             // The same subject at another authority is someone else.
             let (other, created) = store.user("https://other.test", "alice").await.unwrap();
             assert!(created && other.id != a.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_are_kept() {
+        for url in databases().await.urls {
+            let store = Store::connect(&url).await.unwrap();
+            let (a, _) = store.user("https://auth.test", "alice").await.unwrap();
+            let (b, _) = store.user("https://auth.test", "bob").await.unwrap();
+            assert_eq!(a.settings, Settings::default());
+            let hide = Settings {
+                hide_archive_notice: true,
+            };
+            store.set_settings(a.id, &hide).await.unwrap();
+            let store = Store::connect(&url).await.unwrap();
+            let (again, _) = store.user("https://auth.test", "alice").await.unwrap();
+            assert_eq!(again.settings, hide);
+            let (bob, _) = store.user("https://auth.test", "bob").await.unwrap();
+            assert_eq!((bob.id, bob.settings), (b.id, Settings::default()));
         }
     }
 

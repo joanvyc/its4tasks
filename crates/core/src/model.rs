@@ -1130,17 +1130,11 @@ impl Board {
             .iter()
             .filter_map(|t| Some((t.id, t.parent?)))
             .collect();
-        // At most as many steps up as there are tasks, in case of a cycle.
-        let root = |mut id: Uuid| {
-            for _ in 0..self.tasks.len() {
-                match parents.get(&id) {
-                    Some(&p) => id = p,
-                    None => break,
-                }
-            }
-            id
-        };
-        let roots: Vec<Uuid> = self.tasks.iter().map(|t| root(t.id)).collect();
+        let roots: Vec<Uuid> = self
+            .tasks
+            .iter()
+            .map(|t| self.root_in(&parents, t.id))
+            .collect();
         // For each tree: whether it's closed and out of focus throughout,
         // and when its last task was closed.
         let mut trees: HashMap<Uuid, (bool, DateTime<Utc>)> = HashMap::new();
@@ -1157,6 +1151,38 @@ impl Board {
             .filter(|(_, r)| trees[*r].0 && trees[*r].1 < before)
             .map(|(t, _)| t.id)
             .collect()
+    }
+
+    /// The root task of the tree `id` is in: `id` itself if it's a root.
+    pub fn root(&self, id: Uuid) -> Uuid {
+        let parents: HashMap<Uuid, Uuid> = self
+            .tasks
+            .iter()
+            .filter_map(|t| Some((t.id, t.parent?)))
+            .collect();
+        self.root_in(&parents, id)
+    }
+
+    /// `root`, given each task's parent. At most as many steps up as there
+    /// are tasks, in case of a cycle.
+    fn root_in(&self, parents: &HashMap<Uuid, Uuid>, mut id: Uuid) -> Uuid {
+        for _ in 0..self.tasks.len() {
+            match parents.get(&id) {
+                Some(&p) => id = p,
+                None => break,
+            }
+        }
+        id
+    }
+
+    /// Whether every task of the tree `id` is in (its root and all the
+    /// root's subtasks) is closed: what starts the countdown to archiving
+    /// it (see `archived`).
+    pub fn tree_closed(&self, id: Uuid) -> bool {
+        let root = self.root(id);
+        iter::once(root)
+            .chain(self.descendants(root))
+            .all(|id| self.task(id).is_some_and(|t| t.done))
     }
 
     /// The board without the tasks archived as of `now` (see `archived`).
@@ -2397,5 +2423,32 @@ mod tests {
         old.done_at = None;
         old.updated_at = t0 + day(60);
         assert_eq!(b.archived(t0 + day(72)), tree);
+    }
+
+    #[test]
+    fn a_tree_is_closed_once_all_its_tasks_are() {
+        let now = Utc::now();
+        let mut b = Board::default();
+        let root = b.add_task("root".into(), "", None, now);
+        let mid = b.add_task("mid".into(), "", Some(root), now);
+        let low = b.add_task("low".into(), "", Some(mid), now);
+        let side = b.add_task("side".into(), "", Some(root), now);
+        let lone = b.add_task("lone".into(), "", None, now);
+        assert_eq!(b.root(low), root);
+        assert_eq!(b.root(lone), lone);
+        for id in [root, mid, side] {
+            b.task_mut(id).unwrap().set_done(true, now);
+        }
+        // One open task, however deep, keeps it open for all of them.
+        for id in [root, mid, low, side] {
+            assert!(!b.tree_closed(id));
+        }
+        b.task_mut(low).unwrap().set_done(true, now);
+        for id in [root, mid, low, side] {
+            assert!(b.tree_closed(id));
+        }
+        assert!(!b.tree_closed(lone));
+        b.task_mut(lone).unwrap().set_done(true, now);
+        assert!(b.tree_closed(lone));
     }
 }

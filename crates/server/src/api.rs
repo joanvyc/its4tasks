@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use its4tasks_core::api::{ApiError, Change, Outcome, apply_change};
+use its4tasks_core::api::{ApiError, Change, Outcome, Settings, apply_change};
 use its4tasks_core::model::Board;
 use sea_orm::DbErr;
 use uuid::Uuid;
@@ -85,6 +85,7 @@ impl Api {
                 iss: iss.to_owned(),
                 sub: sub.to_owned(),
                 started: false,
+                settings: Settings::default(),
             },
         };
         self.users.insert(key, user.clone());
@@ -97,6 +98,22 @@ impl Api {
             .get(&(user.iss.clone(), user.sub.clone()))
             .cloned()
             .unwrap_or_else(|| user.clone())
+    }
+
+    /// The user's settings, as they are now.
+    pub fn settings(&self, user: &User) -> Settings {
+        self.current(user).settings
+    }
+
+    /// Keeps the user's settings.
+    pub async fn set_settings(&mut self, user: &User, settings: Settings) -> Result<(), DbErr> {
+        if let Some(store) = &self.store {
+            store.set_settings(user.id, &settings).await?;
+        }
+        let user = self.current(user);
+        let key = (user.iss.clone(), user.sub.clone());
+        self.users.insert(key, User { settings, ..user });
+        Ok(())
     }
 
     /// Whether the user has started a board, and the board.

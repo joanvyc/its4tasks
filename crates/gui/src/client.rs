@@ -452,6 +452,26 @@ impl Client {
     }
 }
 
+/// The board at `url`, signed in with `token`, waiting for it here: for
+/// `its4tasks --get-board`, which has no window to keep responsive.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_board(url: &str, token: &str) -> Result<BoardView, ClientError> {
+    let (tx, rx) = mpsc::channel();
+    let url = format!("{url}/api/board");
+    call(
+        url,
+        None,
+        Some(token.to_owned()),
+        false,
+        TIMEOUT,
+        move |reply| {
+            let _ = tx.send(board_from(reply));
+        },
+    );
+    rx.recv()
+        .unwrap_or_else(|_| Err(ClientError::Http("the request went nowhere".into())))
+}
+
 /// What the server sent back.
 struct Reply {
     status: u16,

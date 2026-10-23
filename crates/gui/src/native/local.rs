@@ -26,7 +26,11 @@ fn database_url() -> Result<String, String> {
 
 /// Opens the local board and starts serving it.
 pub fn start() -> Result<LocalServer, String> {
-    let url = database_url()?;
+    start_at(database_url()?)
+}
+
+/// Opens the board in the database at `url` and starts serving it.
+pub fn start_at(url: String) -> Result<LocalServer, String> {
     let secret = Uuid::new_v4().simple().to_string();
     let (stop, stopped) = oneshot::channel::<()>();
     let (ready, started) = mpsc::channel();

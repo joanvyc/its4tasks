@@ -32,4 +32,5 @@ web-sys = { workspace = true, features = ["Blob", "BlobPropertyBag", "console", 
 
 [dev-dependencies]
 its4tasks-server.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
